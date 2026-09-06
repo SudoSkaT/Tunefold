@@ -27,9 +27,27 @@ use crate::visualization::render as visualizer;
 
 use super::navigation::ListSelection;
 
+use crate::playback::queue::QueueItemOrigin;
+
 #[derive(Debug, Default)]
 pub struct RelatedState {
+    /// CONTENIDO MOSTRADO: la cola de autoplay (lo que realmente va a sonar).
+    /// Crece con dedupe en cada `BackendEvent::Related` y nunca se vacía al
+    /// cambiar de canción — la "buena lista" que el usuario construye persiste.
     pub tracks: Vec<Track>,
+    /// Origen de cada elemento de [`Self::tracks`] (paralelo, índice a índice):
+    /// etiqueta qué añadió el autoplay (`Recommendation`) y qué pidió el
+    /// usuario (`User`/`Search`/`Playlist`).
+    pub origins: Vec<QueueItemOrigin>,
+    /// Longitud de `tracks` ANTES del último `set_queue`: permite anunciar
+    /// cuántas recomendaciones nuevas entraron en la última carga.
+    pub previous_len: usize,
+    /// Conjunto de identificadores recién añadidos en la última carga
+    /// (`set_queue`): la vista los marca de verde como "nuevas".
+    pub new_ids: std::collections::HashSet<String>,
+    /// Recomendaciones FRESCAS de la canción en curso (sin dedupes ni fondo
+    /// acumulado): la acción `R` puede imponerlas como nueva cola.
+    pub fresh: Vec<Track>,
     /// Letra sincronizada (LRC, LRCLIB) para el modo karaoke: única fuente.
     pub synced: Option<SyncLyrics>,
     /// `true` cuando ya se intentó cargar la letra sincronizada y no existe:
@@ -44,6 +62,23 @@ pub struct RelatedState {
 impl RelatedState {
     pub fn has_tracks(&self) -> bool {
         !self.tracks.is_empty()
+    }
+
+    /// Actualiza la cola mostrada y su paralelo de orígenes, y marca las filas
+    /// recién añadidas (diferencia por identificador estable con la cola
+    /// anterior) como "nuevas" para el feedback contextual.
+    pub fn set_queue(&mut self, queue: Vec<Track>, origins: Vec<QueueItemOrigin>) {
+        let before: std::collections::HashSet<String> =
+            self.tracks.iter().map(|t| t.identifier()).collect();
+        self.previous_len = self.tracks.len();
+        self.tracks = queue;
+        self.origins = origins;
+        self.new_ids = self
+            .tracks
+            .iter()
+            .filter(|t| !before.contains(&t.identifier()))
+            .map(|t| t.identifier())
+            .collect();
     }
 
     /// Nueva canción: se descartan las letras anteriores y se vuelve al estado
@@ -150,6 +185,7 @@ pub fn render(
     position: Option<Duration>,
     finished: bool,
     mode: VisualContent,
+    current_key: Option<&str>,
     visual: &crate::visualization::VisualState,
     mouse: &Option<(u16, u16)>,
     click: &mut bool,
@@ -225,6 +261,7 @@ pub fn render(
         state,
         " Recomendaciones ".to_string(),
         "Sin recomendaciones todavía. Pulsa Enter en esta vista para pedirlas a YouTube.",
+        current_key,
         mouse,
         click,
         stats,
@@ -300,6 +337,9 @@ fn render_message_over_scene(frame: &mut Frame, area: Rect, title: &str, text: &
 /// La comparten la vista Related (lista completa) y el panel de la vista
 /// Now Playing. Acepta ratón para seleccionar la fila bajo el cursor; el
 /// scroll de la lista lo gestiona `ListState` automáticamente.
+///
+/// `current_key` identifica el track en curso (doblete contextual `▶`); el
+/// origen de cada fila y el juego de "nuevas" (green badge) viven en el estado.
 #[allow(clippy::too_many_arguments)] // ratón/estadísticas son datos del render
 pub fn render_tracks_list(
     frame: &mut Frame,
@@ -307,6 +347,7 @@ pub fn render_tracks_list(
     state: &mut RelatedState,
     title: String,
     empty: &str,
+    current_key: Option<&str>,
     mouse: &Option<(u16, u16)>,
     click: &mut bool,
     stats: &std::collections::HashMap<String, TrackListeningStats>,
@@ -338,7 +379,26 @@ pub fn render_tracks_list(
                 .map(super::widgets::format_duration)
                 .unwrap_or_else(|| "duración pendiente".to_string());
             let listened = stats.get(&t.identifier());
+            let is_current = current_key == Some(t.identifier().as_str());
+            let origin = state
+                .origins
+                .get(i)
+                .copied()
+                .unwrap_or(crate::playback::queue::QueueItemOrigin::Recommendation);
+            let is_new = state.new_ids.contains(&t.identifier());
+            // Doblete discreto: el track en curso lleva un `▶`; lo añadido por
+            // el autoplay se marca `↻` tenue; lo recién añadido, verde.
+            let marker = if is_current {
+                Span::styled("▶ ", Style::new().fg(Color::Green).add_modifier(Modifier::BOLD))
+            } else if is_new {
+                Span::styled("✚ ", Style::new().fg(Color::Green))
+            } else if origin.is_auto() {
+                Span::styled("↻ ", Style::new().fg(Color::DarkGray))
+            } else {
+                Span::styled("· ", Style::new().fg(Color::DarkGray))
+            };
             let line = Line::from(vec![
+                marker,
                 Span::styled(
                     format!("[{}] ", t.source.label()),
                     Style::new().fg(Color::Cyan),
@@ -413,6 +473,7 @@ mod tests {
                     Some(position),
                     finished,
                     mode,
+                    None,
                     &visual_with_palette(cover),
                     &None,
                     &mut false,
@@ -570,6 +631,7 @@ mod tests {
                     Some(Duration::from_secs(5)),
                     false,
                     VisualContent::Lyrics,
+                    None,
                     &visual_with_palette(None),
                     &None,
                     &mut false,

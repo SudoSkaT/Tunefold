@@ -21,6 +21,11 @@ use crate::domain::track::Track;
 /// inmediato en el autoplay/navegación (FASE bugfix anti-bucle).
 const RECENT_LIMIT: usize = 8;
 
+/// Tope total de canciones en la cola de autoplay: por encima de él
+/// `append_unique` deja de crecer (el usuario aún puede REEMPLAZARLA entera
+/// desde la vista de recomendaciones).
+const MAX_QUEUE: usize = 200;
+
 /// Comportamiento al llegar al extremo de la cola.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RepeatMode {
@@ -31,10 +36,51 @@ pub enum RepeatMode {
     Off,
 }
 
+/// De dónde vino cada elemento de la cola: permite a la UI distinguir la
+/// lista que el usuario construyó (fila a fila) del fondo que el motor de
+/// recomendaciones añade solo (autoplay), y etiquetar cada fila de forma
+/// contextual (spec §26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueItemOrigin {
+    /// Elección EXPLÍCITA del usuario (reproducir una canción concreta desde
+    /// Search/History/playlists).
+    User,
+    /// Añadido por el autoplay (la cola crece deduplicando las recomendaciones
+    /// de cada canción); es el origen por defecto de `set_tracks`/`append_unique`.
+    Recommendation,
+    /// Añadido desde una playlist.
+    Playlist,
+    /// Añadido desde resultados de búsqueda.
+    Search,
+}
+
+impl QueueItemOrigin {
+    /// Etiqueta para el baremo de la UI (todo el texto es ancho fijo).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::User => "tú",
+            Self::Recommendation => "auto",
+            Self::Playlist => "playlist",
+            Self::Search => "búsqueda",
+        }
+    }
+
+    /// ¿Pertenece al flujo automático (no elegido fila a fila por el usuario)?
+    /// El autoplay Y las recomendaciones frescas comparten el mismo origen: son
+    /// el mismo motor añadiendo el fondo que sonará si no se le adelanta.
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Recommendation)
+    }
+}
+
 /// Gestor de la cola de reproducción.
 #[derive(Debug)]
 pub struct QueueManager {
     tracks: Vec<Track>,
+    /// Origen de cada elemento de `tracks` (misma longitud, índice a índice).
+    /// Mantenerlo en paralelo evita duplicar cada `Track` y una segunda
+    /// estructura de lookup.
+    origins: Vec<QueueItemOrigin>,
     last_played: Option<String>,
     /// Historial FIFO de las últimas canciones reproducidas (identificadores):
     /// `pick` evita devolver de inmediato una canción recién escuchada.
@@ -57,6 +103,7 @@ impl QueueManager {
     pub fn with_seed(seed: u64) -> Self {
         Self {
             tracks: Vec::new(),
+            origins: Vec::new(),
             last_played: None,
             recent: VecDeque::new(),
             shuffle: false,
@@ -78,6 +125,16 @@ impl QueueManager {
 
     pub fn tracks(&self) -> &[Track] {
         &self.tracks
+    }
+
+    /// Orígenes de cada elemento, en paralelo a [`Self::tracks`].
+    pub fn origins(&self) -> &[QueueItemOrigin] {
+        &self.origins
+    }
+
+    /// Origen del track en el índice dado (`None` si el índice está fuera).
+    pub fn origin_at(&self, index: usize) -> Option<QueueItemOrigin> {
+        self.origins.get(index).copied()
     }
 
     pub fn last_played(&self) -> Option<&str> {
@@ -106,12 +163,66 @@ impl QueueManager {
 
     /// Reemplaza la cola. Conserva el ancla aunque el track ya no esté
     /// (navegará desde un extremo, como hoy). Regenera el shuffle si aplica.
+    /// Los elementos entran con el origen por defecto (Recomendación/autoplay);
+    /// usa [`Self::set_tracks_with_origin`] para etiquetar un reemplazo de otra
+    /// procedencia (p. ej. una playlist que el usuario impone como cola).
     pub fn set_tracks(&mut self, tracks: Vec<Track>) {
+        self.set_tracks_with_origin(tracks, QueueItemOrigin::Recommendation);
+    }
+
+    /// Igual que [`Self::set_tracks`] pero etiquetando el origen de cada
+    /// elemento recién añadido (paralelo 1:1 con `tracks`).
+    pub fn set_tracks_with_origin(&mut self, tracks: Vec<Track>, origin: QueueItemOrigin) {
+        let n = tracks.len();
         self.tracks = tracks;
+        self.origins = std::iter::repeat_n(origin, n).collect();
         if self.shuffle {
             let anchor = self.anchor_index(None);
             self.reshuffle(anchor);
         }
+    }
+
+    /// Añade al final los tracks que NO estén ya en la cola ni entre los
+    /// recientemente reproducidos. Devuelve cuántos se añadieron.
+    ///
+    /// Destinado al autoplay/recomendaciones: la cola CRECE con cada canción
+    /// (dedupe) en vez de reemplazarse, de modo que `pick` siempre tiene un
+    /// fondo que recorrer — sin el bucle de ~7 canciones que causaba reemplazar
+    /// la cola entera en cada cambio de canción. Nunca supera [`MAX_QUEUE`]
+    /// canciones para no crecer sin límite durante sesiones largas.
+    pub fn append_unique(&mut self, candidates: &[Track]) -> usize {
+        self.append_unique_with_origin(candidates, QueueItemOrigin::Recommendation)
+    }
+
+    /// Variante de [`Self::append_unique`] que etiqueta el origen de cada
+    /// elemento añadido.
+    pub fn append_unique_with_origin(
+        &mut self,
+        candidates: &[Track],
+        origin: QueueItemOrigin,
+    ) -> usize {
+        let mut existing: std::collections::HashSet<String> =
+            self.tracks.iter().map(|t| t.identifier()).collect();
+        let mut added = 0;
+        for t in candidates {
+            if self.tracks.len() + added >= MAX_QUEUE {
+                break;
+            }
+            let id = t.identifier();
+            if existing.contains(&id) || self.is_recent(&id) {
+                continue;
+            }
+            let t = t.clone();
+            existing.insert(id);
+            self.tracks.push(t);
+            self.origins.push(origin);
+            added += 1;
+        }
+        if added > 0 && self.shuffle {
+            let anchor = self.anchor_index(None);
+            self.reshuffle(anchor);
+        }
+        added
     }
 
     /// Activa/desactiva el shuffle. Al activarlo, el track actual queda
@@ -507,5 +618,100 @@ mod tests {
         // El inmediato anterior a "a" es "d" (reciente) si no hay salto; con
         // salto hacia atrás debería caer a un no reciente o al fallback.
         assert_ne!(t.identifier(), "a", "nunca devuelve lo que se acaba de oír");
+    }
+
+    // ---------------------------------------------------------------- append_unique
+
+    #[test]
+    fn append_unique_skips_duplicates_and_recent_tracks() {
+        let mut q = QueueManager::with_seed(7);
+        q.set_tracks(vec![track("a"), track("b")]);
+        q.mark_played("b"); // todavía en la cola, pero reciente
+
+        let candidates = vec![track("a"), track("b"), track("c")];
+        let added = q.append_unique(&candidates);
+        assert_eq!(added, 1, "solo entra c (a duplicado, b reciente)");
+        assert_eq!(q.tracks().len(), 3);
+    }
+
+    #[test]
+    fn append_unique_accumulates_and_does_not_replace_or_loop() {
+        // El corazón del fix: la cola CRECE por dedupe entre canciones en vez
+        // de reemplazarse cada vez. Re-hidratar el MISMO álbum (12 temas)
+        // repetidamente debe dejar los 12 en cola, no ~7 en bucle.
+        let album: Vec<Track> = (0..12).map(|i| track(&format!("a{i}"))).collect();
+        let mut q = QueueManager::with_seed(7);
+        // Primera canción: entra todo el fondo.
+        assert_eq!(q.append_unique(&album), 12);
+        // Segunda canción del mismo álbum: dedupe ⇒ nada nuevo.
+        assert_eq!(q.append_unique(&album), 0);
+        assert_eq!(q.tracks().len(), 12);
+
+        // `pick` recorre el fondo COMPLETO sin repetir recientes.
+        q.mark_played("a0");
+        let next = q.pick(true, Some("a0")).expect("cola no vacía");
+        assert_ne!(next.identifier(), "a0", "no se repite lo escuchado");
+    }
+
+    #[test]
+    fn append_unique_respects_total_queue_cap() {
+        let mut q = QueueManager::with_seed(7);
+        // Llenar hasta el tope MAX_QUEUE (200) con canciones exclusivas.
+        let mut serial = 0usize;
+        while q.tracks().len() < MAX_QUEUE {
+            let batch: Vec<Track> = (0..25)
+                .map(|_| {
+                    serial += 1;
+                    track(&format!("b{serial}"))
+                })
+                .collect();
+            q.append_unique(&batch);
+            assert!(q.tracks().len() <= MAX_QUEUE);
+        }
+        // Con la cola llena, append_unique no crece más.
+        let extra: Vec<Track> = (0..10)
+            .map(|_| {
+                serial += 1;
+                track(&format!("e{serial}"))
+            })
+            .collect();
+        assert_eq!(q.append_unique(&extra), 0, "cola en el tope: no crece");
+        assert_eq!(q.tracks().len(), MAX_QUEUE);
+    }
+
+    // ------------------------------------------------------------ orígenes
+
+    #[test]
+    fn origins_track_each_element_in_parallel() {
+        let mut q = QueueManager::with_seed(7);
+        // `set_tracks` (recomendaciones) etiqueta todo como autoplay.
+        q.set_tracks(vec![track("a"), track("b")]);
+        assert_eq!(
+            q.origins(),
+            &[QueueItemOrigin::Recommendation, QueueItemOrigin::Recommendation]
+        );
+        // `set_tracks_with_origin` permite imponer otro origen (p. ej. playlist).
+        q.set_tracks_with_origin(vec![track("x")], QueueItemOrigin::Playlist);
+        assert_eq!(q.origins(), &[QueueItemOrigin::Playlist]);
+        assert_eq!(q.origin_at(0), Some(QueueItemOrigin::Playlist));
+        assert_eq!(q.origin_at(5), None);
+        // `append_unique_with_origin` etiqueta SOLO lo que añade; lo existente
+        // no cambia de origen.
+        q.append_unique_with_origin(&[track("y")], QueueItemOrigin::User);
+        assert_eq!(
+            q.origins(),
+            &[QueueItemOrigin::Playlist, QueueItemOrigin::User]
+        );
+        // Compatibilidad: el accessor de solo tracks sigue intacto.
+        assert_eq!(q.tracks().len(), 2);
+    }
+
+    #[test]
+    fn origin_labels_and_auto_classification() {
+        assert_eq!(QueueItemOrigin::Recommendation.label(), "auto");
+        assert!(QueueItemOrigin::Recommendation.is_auto());
+        assert!(!QueueItemOrigin::User.is_auto());
+        assert!(!QueueItemOrigin::Playlist.is_auto());
+        assert!(!QueueItemOrigin::Search.is_auto());
     }
 }

@@ -116,20 +116,48 @@ fn karaoke_resume() {
     clock.update(Some("song-a"), Duration::from_secs(5), now);
 
     // Se pausa en 5s.
-    let paused = clock.snapshot(false, false, Some(Duration::from_secs(20)), now);
+    let paused = clock.snapshot(
+        false,
+        false,
+        Some(Duration::from_secs(20)),
+        now + Duration::from_secs(30),
+    );
     assert_eq!(paused, Duration::from_secs(5));
 
-    // Se reanuda: snapshot extrapola.
-    let later = now + Duration::from_secs(10);
-    let resumed = clock.snapshot(true, false, Some(Duration::from_secs(20)), later);
+    // Se reanuda: llega la muestra de reanudación (aniđo fresco) y la
+    // extrapolación dentro de la cadencia normal (< MAX_EXTRAPOLATION) avanza
+    // por delante de la última muestra.
+    let resume = now + Duration::from_secs(30);
+    clock.update(Some("song-a"), Duration::from_secs(5), resume);
+    let resumed = clock.snapshot(
+        true,
+        false,
+        Some(Duration::from_secs(20)),
+        resume + Duration::from_millis(250),
+    );
     assert!(
         resumed > Duration::from_secs(5),
         "al reanudar extrapola por delante de 5s"
     );
     assert_eq!(
         position_after(&lyrics, resumed),
-        2,
-        "reanudando → línea 2 (15s)"
+        0,
+        "reanudando → sigue en línea 0 (5s)"
+    );
+
+    // Un ancla vieja (> MAX_EXTRAPOLATION) NO se extrapola: el reloj congela en
+    // vez de inventar audio que la UI no pudo confirmar durante demasiado
+    // tiempo (las letras jamás corren por delante sin control).
+    let stale = clock.snapshot(
+        true,
+        false,
+        Some(Duration::from_secs(20)),
+        resume + Duration::from_secs(5),
+    );
+    assert_eq!(
+        stale,
+        Duration::from_secs(5),
+        "ancla vieja no extrapola segundos de audio"
     );
 }
 

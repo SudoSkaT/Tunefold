@@ -11,6 +11,7 @@ use crate::app::thumbnail::ThumbnailState;
 use crate::domain::{source::Source, track::Track};
 use crate::infrastructure::config::ConfigForm;
 use crate::infrastructure::storage::{HistoryEntry, PlaylistRow, TrackListeningStats};
+use crate::playback::queue::{QueueItemOrigin, RepeatMode};
 
 /// Eventos de entrada del terminal hacia el loop de la UI.
 #[derive(Debug)]
@@ -37,6 +38,12 @@ pub enum BackendEvent {
     Sources(Vec<Source>),
     Settings(ConfigForm),
     Playback(PlaybackStatus),
+    /// Recuperación en caliente del MISMO track (re-resolución del stream):
+    /// el motor reinició la canción desde el prefijo servible, así que la UI
+    /// debe rebobinar el reloj del karaoke con ella. Sin este evento el tick
+    /// vendría disfrazado de muestra normal y el guard monótono dejaría las
+    /// letras clavadas en la posición previa.
+    RecoveryResumed(PlaybackStatus),
     /// Inicio confirmado: la escucha ya fue persistida y sus estadísticas
     /// acompañan al snapshot para que todas las vistas se actualicen juntas.
     PlaybackStarted {
@@ -57,12 +64,30 @@ pub enum BackendEvent {
     StreamError(String),
     Related {
         track: Box<Track>,
+        /// Recomendaciones FRESCAS de la canción (las que "Reemplazar" puede
+        /// imponer como nueva cola).
         related: Vec<Track>,
+        /// Cola completa de autoplay YA actualizada con `related` (dedupe):
+        /// la vista de recomendaciones muestra lo que realmente va a sonar.
+        queue: Vec<Track>,
+        /// Origen de cada elemento de `queue` (paralelo, índice a índice):
+        /// la UI lo usa para etiquetar qué añadió el autoplay y qué pidió el
+        /// usuario, sin mantener la cola duplicada en el frontend.
+        origins: Vec<QueueItemOrigin>,
         /// Letra sincronizada en formato LRC (LRCLIB): única fuente del karaoke.
         synced: Option<String>,
         /// Generación de la sesión (devuelta por `BackendCommand::LoadRelated`):
         /// la UI solo aplica la respuesta si sigue siendo la carga en vuelo.
         generation: u64,
+    },
+    /// Estado global de la cola (shuffle/repeat/tamaño). Se emite cuando cambia
+    /// cualquiera de esos atributos (al alternar shuffle/repeat y al reemplazar
+    /// la cola) para que la UI refleje de inmediato los mandos, sin depender de
+    /// cuándo llega el siguiente tick.
+    QueueState {
+        shuffle: bool,
+        repeat: RepeatMode,
+        len: usize,
     },
     /// Miniatura resuelta de un track (`key` = identificador estable).
     /// El estado es `Loaded`/`Failed`/`None`; la UI muestra `Loading` desde

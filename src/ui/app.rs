@@ -134,6 +134,10 @@ pub struct App {
     /// Monótono por track, extrapolado entre muestras del motor, con seek
     /// pendiente hasta confirmación. Lógica extraída a `playback::PositionClock`.
     clock: crate::playback::PositionClock,
+    /// Shuffle de la cola (confirmado por el backend vía `QueueState`).
+    shuffle: bool,
+    /// Modo de repetición actual de la cola (Off/All).
+    repeat: crate::playback::queue::RepeatMode,
 }
 
 impl App {
@@ -171,6 +175,8 @@ impl App {
             features_at: None,
             frame: 0,
             clock: crate::playback::PositionClock::new(),
+            shuffle: false,
+            repeat: Default::default(),
         }
     }
 
@@ -312,7 +318,7 @@ impl App {
                     "Autoplay desactivado.".to_string()
                 });
             }
-            // Contenido de la banda superior (spec §16): Auto → letras si las
+                        // Contenido de la banda superior (spec §16): Auto → letras si las
             // hay, si no el visualizador; Letras y Visual fuerzan su modo. El
             // cambio es puro de presentación: no regenera recomendaciones, no
             // toca la reproducción y no destruye el estado del otro modo.
@@ -322,6 +328,40 @@ impl App {
                     "Contenido de la banda: {} (Auto: letras si las hay, si no el visual)",
                     self.visual_mode.label()
                 ));
+            }
+            // Mordos de la cola (spec §26): el backend mantiene la cola, esta
+            // UI refleja el estado optimista y lo confirma con `QueueState`.
+            // `f` alterna el shuffle (al activarlo el track actual queda
+            // primero); `t` cicla la repetición Off → Todas → Off.
+            KeyCode::Char('f') => {
+                let next = !self.shuffle;
+                self.shuffle = next;
+                let _ = self.backend_tx.send(BackendCommand::SetShuffle(next));
+                self.status = Some(if next {
+                    "Shuffle activado: siguiente/anterior se aleatorizan.".to_string()
+                } else {
+                    "Shuffle desactivado: cola en orden.".to_string()
+                });
+            }
+            KeyCode::Char('t') => {
+                let next = match self.repeat {
+                    crate::playback::queue::RepeatMode::Off => {
+                        crate::playback::queue::RepeatMode::All
+                    }
+                    crate::playback::queue::RepeatMode::All => {
+                        crate::playback::queue::RepeatMode::Off
+                    }
+                };
+                self.repeat = next;
+                let _ = self.backend_tx.send(BackendCommand::SetRepeat(next));
+                self.status = Some(match next {
+                    crate::playback::queue::RepeatMode::Off => {
+                        "Repetición desactivada: la cola se detiene en el extremo.".to_string()
+                    }
+                    crate::playback::queue::RepeatMode::All => {
+                        "Repetición activada: la cola gira (todas).".to_string()
+                    }
+                });
             }
             // Salto entre recomendaciones: Shift+D avanza a la siguiente de la
             // cola y Shift+A vuelve a la anterior. Llegan como mayúscula (con o
@@ -387,6 +427,22 @@ impl App {
                         self.reload_related();
                     }
                 }
+            }
+            // Gestión de la cola desde la vista de recomendaciones:
+            // - `r`: actualiza sin más — re-busca las recomendaciones de la
+            //   canción en curso y las añade a la cola (dedupe: la vista crece,
+            //   nunca pisa lo acumulado);
+            // - `R` (con Shift): REEMPLAZA toda la cola por las recomendaciones
+            //   frescas de la canción en curso.
+            KeyCode::Char('r')
+                if self.view == View::Related || self.view == View::NowPlaying =>
+            {
+                self.reload_related();
+            }
+            KeyCode::Char('R')
+                if self.view == View::Related || self.view == View::NowPlaying =>
+            {
+                self.replace_related_queue();
             }
             _ => {}
         }
@@ -470,15 +526,46 @@ impl App {
             .send(BackendCommand::LoadRelated(Box::new(track), generation));
     }
 
-    /// Recarga de recomendaciones EXPLÍCITA (Enter sobre una lista vacía).
-    /// A diferencia de `load_related`, descarta la sesión actual (cargada o en
-    /// vuelo) para que la nueva petición arranque con generación fresca.
+    // Recarga de recomendaciones EXPLÍCITA (tecla `r` / Enter sobre una lista
+    /// vacía). A diferencia de `load_related`, descarta la sesión actual
+    /// (cargada o en vuelo) para que la nueva petición arranque con generación
+    /// fresca y el backend VUELVA a buscar las recomendaciones de la canción
+    /// en curso y a añadirlas a la cola (dedupe): la "actualización sin más"
+    /// de lo que está en cola.
     fn reload_related(&mut self) {
         self.recs.reset();
-        self.related.tracks.clear();
-        self.related.list_state.select(None);
         self.related.clear_lyrics();
         self.load_related();
+    }
+
+    /// Acción explícita `R` (mayúscula): REEMPLAZA toda la cola de autoplay por
+    /// las recomendaciones frescas de la canción en curso. La vista pasa a
+    /// mostrar exactamente esa lista (la nueva cola). Es la única forma de
+    /// descartar lo acumulado y empezar de cero desde la lista actual.
+    fn replace_related_queue(&mut self) {
+        let fresh = self.related.fresh.clone();
+        if fresh.is_empty() {
+            self.status = Some("Sin recomendaciones frescas para reemplazar la cola.".to_string());
+            return;
+        }
+        let _ = self
+            .backend_tx
+            .send(BackendCommand::ReplaceQueue(fresh.clone()));
+        // La vista adopta la nueva cola al instante (eedback optimista); el
+        // backend la confirma con `QueueState` y `Related`. Las filas entran
+        // con origen autoplay (recomendaciones frescas).
+        let n = fresh.len();
+        let origins = std::iter::repeat_n(
+            crate::playback::queue::QueueItemOrigin::Recommendation,
+            n,
+        )
+        .collect();
+        self.related.set_queue(fresh, origins);
+        self.related.list_state.select(Some(0));
+        self.status = Some(format!(
+            "Cola reemplazada por {} recomendaciones de la canción en curso.",
+            self.related.tracks.len()
+        ));
     }
 
     /// Actualiza `now_playing` y dispara la carga de recomendaciones si el
@@ -490,11 +577,12 @@ impl App {
         let changed = self.now_playing.as_ref().map(|n| n.identifier()) != Some(id.clone());
         self.now_playing = Some(track);
         if changed {
-            // Las recomendaciones son propiedad de una canción concreta. No
-            // dejes que autoplay use la cola anterior mientras llega la nueva
-            // ni que una respuesta tardía pueda aparentar vigencia.
-            self.related.tracks.clear();
-            self.related.list_state.select(None);
+            // La COLA persiste entre canciones: la vista de recomendaciones
+            // muestra lo que va a sonar (ver `BackendEvent::Related`), así que
+            // no se vacía al cambiar de canción — eso eliminaba la "buena
+            // lista" que el usuario estaba construyendo en cada avance del
+            // autoplay. Solo se descartan las letras (pertenecen a la canción)
+            // y la sesión se reinicia para pedir recomendaciones frescas.
             self.related.clear_lyrics();
             self.recs.on_track_changed();
         }
@@ -688,6 +776,34 @@ impl App {
                 self.update_karaoke_clock(&status);
                 self.playback = status;
             }
+            BackendEvent::RecoveryResumed(mut status) => {
+                // La recuperación en caliente reinicia el MISMO track desde el
+                // prefijo servible del stream: la UI debe rebobinar el reloj y
+                // la ventana del karaoke con él. Si el usuario ya pidió otra
+                // canción mientras tanto, este evento es obsoleto y se ignora.
+                if self.pending_track.as_ref().is_some_and(|pending| {
+                    status
+                        .track
+                        .as_ref()
+                        .is_none_or(|track| track.identifier() != *pending)
+                }) {
+                    return;
+                }
+                if let Some(track) = status.track.as_mut().filter(|t| t.duration.is_none()) {
+                    track.duration = status.duration;
+                }
+                if let Some(track) = status.track.clone() {
+                    if self.pending_track.as_deref() == Some(track.identifier().as_str()) {
+                        self.pending_track = None;
+                    }
+                    self.related.scroll.reset();
+                    self.clock.restart_same_track();
+                    self.clock.cancel_pending_seek();
+                    self.on_new_now_playing(track);
+                }
+                self.update_karaoke_clock(&status);
+                self.playback = status;
+            }
             BackendEvent::PlaybackError(err) => {
                 // Si la reproducción pedida falló se abandona el estado
                 // optimista ("preparando"): la UI no debe quedar colgada. El
@@ -738,6 +854,8 @@ impl App {
             BackendEvent::Related {
                 track,
                 related,
+                queue,
+                origins,
                 synced,
                 generation,
             } => {
@@ -750,7 +868,10 @@ impl App {
                 if !self.recs.complete(&id, generation) {
                     return;
                 }
-                self.related.tracks = related;
+                // Lista FRESCA para la acción "R" (reemplazar la cola). La
+                // vista en sí muestra la COLA: lo que de verdad va a sonar.
+                self.related.fresh = related;
+                self.related.set_queue(queue, origins);
                 // LRCLIB ya devolvió el mejor resultado posible (o la caché
                 // local): `None` significa que no hay LRC para esta canción
                 // y se muestra el estado limpio, nunca la letra plana.
@@ -765,14 +886,34 @@ impl App {
                     }
                     _ => self.related.set_synced(None),
                 }
-                self.related.list_state.select(Some(0));
-                let _ = self.backend_tx.send(BackendCommand::SetAutoplayQueue(
-                    self.related.tracks.clone(),
-                ));
-                self.status = Some(format!(
-                    "{} recomendaciones. ↑/↓ o W/S selecciona, Enter reproduce.",
-                    self.related.tracks.len()
-                ));
+                // La cola crece con cada canción (nunca se vacía): se conserva
+                // la selección del usuario, solo se acota a la longitud nueva
+                // (en el primer llenado se parte desde el primer elemento).
+                let last = self.related.tracks.len().saturating_sub(1);
+                let idx = self.related.list_state.selected().unwrap_or(0).min(last);
+                self.related.list_state.select(Some(idx));
+                let added = self.related.tracks.len() - self.related.previous_len;
+                self.status = Some(
+                    if added > 0 {
+                        format!(
+                            "{} en cola (+{} nuevas). ↑/↓ selecciona, Enter reproduce, r actualiza, R reemplaza.",
+                            self.related.tracks.len(),
+                            added
+                        )
+                    } else {
+                        format!(
+                            "{} en cola. ↑/↓ o W/S selecciona, Enter reproduce, r actualiza, R reemplaza la cola.",
+                            self.related.tracks.len()
+                        )
+                    },
+                );
+            }
+            BackendEvent::QueueState { shuffle, repeat, len } => {
+                // El backend es la autoridad de la cola; la UI adopta el estado
+                // (útil si alguna otra acción lo cambió, p. ej. reemplazar).
+                self.shuffle = shuffle;
+                self.repeat = repeat;
+                let _ = len;
             }
             BackendEvent::Thumbnail { key, state } => {
                 self.thumbnails.insert(key, state);
@@ -863,6 +1004,13 @@ impl App {
     }
 
     fn render_view(&mut self, frame: &mut Frame, area: Rect) {
+        // FUENTE ÚNICA de la posición mostrada: antes de renderizar, la barra
+        // de progreso, el visual y cualquier consumidor adoptan el reloj
+        // maestro extrapolado (`karaoke_now`). Sin esto cada vista mostraría su
+        // propia lectura (barra con saltos de 2 Hz, karaoke liso) y la
+        // "posición" persistida en `self.playback` quedaría desfasada del
+        // karaoke en cada frame de animación.
+        self.playback.position = self.karaoke_now();
         match self.view {
             View::NowPlaying => {
                 // Frescura: sin datos recientes (pausa larga/fin) el visual
@@ -882,6 +1030,8 @@ impl App {
                     &self.playback,
                     &mut self.related,
                     self.autoplay,
+                    self.shuffle,
+                    self.repeat,
                     &self.mouse_pos,
                     &mut self.mouse_click,
                     &self.thumbnails,
@@ -911,6 +1061,10 @@ impl App {
                     // al superar la última línea del LRC.
                     self.playback.state == PlaybackState::Stopped,
                     self.visual_mode,
+                    self.now_playing
+                        .as_ref()
+                        .map(|t| t.identifier())
+                        .as_deref(),
                     &visual,
                     &self.mouse_pos,
                     &mut self.mouse_click,
@@ -981,6 +1135,15 @@ impl App {
             // las del track en curso.
             Some(crate::playback::ClockEvent::NewTrack) => {
                 self.related.clear_lyrics();
+            }
+            // Reinicio detectado por discontinuidad dentro del MISMO track
+            // (el motor volvió a un punto muy anterior): se re-ancla la
+            // posición y se rebobina la ventana del karaoke con la
+            // reproducción. La letra SIGUE siendo la del track en curso (su
+            // identidad no cambió), así que no se descarta: solo salta atrás
+            // (en tándem con `scroll.reset` de la primera muestra de la canción).
+            Some(crate::playback::ClockEvent::Restarted) => {
+                self.related.scroll.reset();
             }
             None => {}
         }
@@ -1298,7 +1461,6 @@ mod tests {
                 BackendCommand::LoadRelated(..) => found_related = true,
                 BackendCommand::LoadHistory => {}
                 BackendCommand::Thumbnail(_) => {}
-                BackendCommand::SetAutoplayQueue(queue) if queue.is_empty() => {}
                 other => panic!("comando inesperado {other:?}"),
             }
         }
@@ -1434,6 +1596,8 @@ mod tests {
         app.on_backend(BackendEvent::Related {
             track: Box::new(other),
             related: vec![sample_track()],
+            queue: vec![sample_track()],
+            origins: vec![crate::playback::QueueItemOrigin::Recommendation],
             synced: None,
             generation: 1,
         });
@@ -1451,6 +1615,8 @@ mod tests {
         app.on_backend(BackendEvent::Related {
             track: Box::new(sample_track()),
             related: vec![],
+            queue: vec![],
+            origins: vec![],
             synced: None,
             generation: 1,
         });
@@ -1471,6 +1637,8 @@ mod tests {
         app.on_backend(BackendEvent::Related {
             track: Box::new(sample_track()),
             related: vec![],
+            queue: vec![],
+            origins: vec![],
             synced: Some("[00:01.00] hola\n[00:05.00] mundo\n".to_string()),
             generation: 1,
         });
@@ -1491,6 +1659,8 @@ mod tests {
         app.on_backend(BackendEvent::Related {
             track: Box::new(sample_track()),
             related: vec![],
+            queue: vec![],
+            origins: vec![],
             synced: Some("   ".to_string()),
             generation: 1,
         });
@@ -1502,34 +1672,44 @@ mod tests {
     }
 
     #[test]
-    fn karaoke_clock_ignores_spurious_position_resets() {
+    fn karaoke_clock_ignores_small_blips_and_reanchors_on_real_restart() {
         let (tx, _rx) = unbounded_channel::<BackendCommand>();
         let mut app = App::new(tx);
 
         let track = rec_track("song-1");
-        let ev = |pos: u64| PlaybackStatus {
+        let ev = |pos_ms: u64| PlaybackStatus {
             track: Some(track.clone()),
             state: PlaybackState::Playing,
-            position: Duration::from_secs(pos),
+            position: Duration::from_millis(pos_ms),
             duration: Some(Duration::from_secs(200)),
             stalled: false,
         };
 
         app.on_backend(BackendEvent::PlaybackStarted {
-            status: ev(10),
+            status: ev(10_000),
             stats: vec![],
         });
         assert_eq!(app.clock.position(), Duration::from_secs(10));
 
-        // El motor reporta 0 de golpe (re-buffer del stream): no debe reiniciar.
-        app.on_backend(BackendEvent::Playback(ev(0)));
+        // Blip espurio pequeño (10s → 9.8s = 200ms < 500 ms): el reloj lo
+        // ignora (la letra no parpadea por un reset transitorio del decoder).
+        app.on_backend(BackendEvent::Playback(ev(9_800)));
         assert_eq!(
             app.clock.position(),
             Duration::from_secs(10),
-            "reinicio espurio ignorado"
+            "blip espurio ignorado"
         );
 
-        app.on_backend(BackendEvent::Playback(ev(15)));
+        // Reinicio REAL del mismo track: re-ancla y rebobina (el scroll se
+        // resetea junto con la posición).
+        app.on_backend(BackendEvent::Playback(ev(0)));
+        assert_eq!(
+            app.clock.position(),
+            Duration::ZERO,
+            "reinicio real re-anclado"
+        );
+
+        app.on_backend(BackendEvent::Playback(ev(15_000)));
         assert_eq!(app.clock.position(), Duration::from_secs(15));
     }
 
@@ -1601,6 +1781,8 @@ mod tests {
         app.on_backend(BackendEvent::Related {
             track: Box::new(rec_track("song-1")),
             related: vec![],
+            queue: vec![],
+            origins: vec![],
             synced: Some("[00:01.00] hola\n[00:02.00] mundo\n".to_string()),
             generation,
         });
@@ -1631,6 +1813,191 @@ mod tests {
             app.related.scroll.is_empty(),
             "la ventana del karaoke se rebobina al repetir la canción"
         );
+    }
+
+    #[test]
+    fn playback_recovery_rewinds_clock_and_karaoke_on_same_track() {
+        let (tx, _rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        let track = rec_track("song-1");
+        app.on_backend(BackendEvent::PlaybackStarted {
+            status: PlaybackStatus {
+                track: Some(track.clone()),
+                state: PlaybackState::Playing,
+                position: Duration::from_secs(200),
+                duration: Some(Duration::from_secs(300)),
+                stalled: false,
+            },
+            stats: vec![],
+        });
+        app.related
+            .set_synced(Some(crate::domain::lyrics::SyncLyrics::parse(
+                "[00:01.00] hola\n[00:02.00] mundo\n",
+            )));
+        // El reloj quedó en 200s y la ventana del karaoke avanzada.
+        app.related
+            .scroll
+            .advance(app.related.synced.as_ref().unwrap(), Some(1), false, 8);
+
+        // Corte de stream → recuperación en caliente: el motor reinicia el
+        // MISMO track desde el prefijo y reporta ~0. Sin este evento el tick
+        // normal lo descartaría por el guard monótono y las letras quedarían
+        // clavadas en 200s.
+        app.on_backend(BackendEvent::RecoveryResumed(PlaybackStatus {
+            track: Some(track),
+            state: PlaybackState::Playing,
+            position: Duration::from_secs(1),
+            duration: Some(Duration::from_secs(300)),
+            stalled: false,
+        }));
+        assert_eq!(
+            app.clock.position(),
+            Duration::from_secs(1),
+            "el reloj se rebobina con el reinicio del mismo track"
+        );
+        assert!(app.clock.pending_seek().is_none());
+        assert!(app.related.synced.is_some(), "la letra es de la MISMA canción");
+        assert!(
+            app.related.scroll.is_empty(),
+            "el karaoke se rebobina con la recuperación"
+        );
+        assert_eq!(app.playback.position, Duration::from_secs(1));
+
+        // La siguiente muestra del motor (posición real baja) mantiene el reloj.
+        app.on_backend(BackendEvent::Playback(PlaybackStatus {
+            track: Some(rec_track("song-1")),
+            state: PlaybackState::Playing,
+            position: Duration::from_secs(12),
+            duration: Some(Duration::from_secs(300)),
+            stalled: false,
+        }));
+        assert_eq!(app.clock.position(), Duration::from_secs(12));
+    }
+
+    #[test]
+    fn playback_recovery_ignored_when_user_requested_other_track() {
+        let (tx, _rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        app.on_backend(BackendEvent::PlaybackStarted {
+            status: PlaybackStatus {
+                track: Some(rec_track("song-1")),
+                state: PlaybackState::Playing,
+                position: Duration::from_secs(90),
+                duration: None,
+                stalled: false,
+            },
+            stats: vec![],
+        });
+        // El usuario ya pidió OTRA canción (pendiente): la recuperación de la
+        // anterior no debe pisar nada.
+        app.pending_track = Some("song-2".to_string());
+        app.on_backend(BackendEvent::RecoveryResumed(PlaybackStatus {
+            track: Some(rec_track("song-1")),
+            state: PlaybackState::Playing,
+            position: Duration::ZERO,
+            duration: None,
+            stalled: false,
+        }));
+        assert_eq!(
+            app.clock.position(),
+            Duration::from_secs(90),
+            "el reloj de song-1 no se toca si ya se pidió song-2"
+        );
+        assert_eq!(app.pending_track.as_deref(), Some("song-2"));
+    }
+
+    #[test]
+    fn queue_in_related_view_persists_across_track_changes() {
+        let (tx, _rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        app.now_playing = Some(rec_track("song-1"));
+        let _ = app.recs.request("song-1");
+        app.on_backend(BackendEvent::Related {
+            track: Box::new(rec_track("song-1")),
+            related: vec![rec_track("a"), rec_track("b"), rec_track("c")],
+            queue: vec![rec_track("a"), rec_track("b"), rec_track("c")],
+            origins: vec![crate::playback::QueueItemOrigin::Recommendation; 3],
+            synced: None,
+            generation: 1,
+        });
+        assert_eq!(app.related.tracks.len(), 3);
+
+        // Autoplay avanza a la canción 2: la COLA no se borra — es lo que la
+        // vista muestra ("lo que está en cola"). Antes se reemplazaba/limpiaba
+        // aquí y la "buena lista" desaparecía en cada cambio de canción.
+        app.on_backend(BackendEvent::PlaybackStarted {
+            status: PlaybackStatus {
+                track: Some(rec_track("song-2")),
+                state: PlaybackState::Playing,
+                position: Duration::from_secs(1),
+                duration: None,
+                stalled: false,
+            },
+            stats: vec![],
+        });
+        assert_eq!(
+            app.related.tracks.len(),
+            3,
+            "la cola mostrada persiste al cambiar de canción"
+        );
+        assert_eq!(
+            app.now_playing.as_ref().map(Track::identifier),
+            Some("song-2".to_string())
+        );
+        // Las letras sí se descartan: son de la canción anterior.
+        assert!(app.related.synced.is_none());
+    }
+
+    #[test]
+    fn r_key_refreshes_current_recommendations_into_the_queue() {
+        let (tx, mut rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        app.view = View::Related;
+        app.now_playing = Some(rec_track("song-1"));
+        app.related.tracks = vec![rec_track("a")];
+
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(
+            sent_skip(&mut rx, BackendCommand::LoadRelated(Box::new(rec_track("song-1")), 0)),
+            "«r» vuelve a pedir las recomendaciones de la canción en curso"
+        );
+        // No reemplaza la cola: solo re-fetch + append en el backend.
+        assert!(
+            !sent_skip(&mut rx, BackendCommand::ReplaceQueue(vec![])),
+            "«r» nunca reemplaza la cola"
+        );
+    }
+
+    #[test]
+    fn r_uppercase_replaces_queue_with_fresh_recommendations() {
+        let (tx, mut rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        app.view = View::Related;
+        app.now_playing = Some(rec_track("song-1"));
+        app.related.tracks = vec![rec_track("stale-1"), rec_track("stale-2")];
+        app.related.fresh = vec![rec_track("fresh-1"), rec_track("fresh-2")];
+
+        app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+
+        // Envía al backend el reemplazo y la VISTA pasa a mostrar la nueva cola.
+        let mut replaced = false;
+        while let Ok(c) = rx.try_recv() {
+            if let BackendCommand::ReplaceQueue(tracks) = c {
+                assert_eq!(tracks.len(), 2);
+                assert_eq!(tracks[0].identifier(), "fresh-1");
+                replaced = true;
+            }
+        }
+        assert!(replaced, "«R» debe enviar ReplaceQueue");
+        assert_eq!(app.related.tracks.len(), 2);
+        assert_eq!(app.related.tracks[0].identifier(), "fresh-1");
+        assert_eq!(app.related.list_state.selected(), Some(0));
+
+        // Sin recomendaciones frescas (p. ej. antes de la primera carga), «R»
+        // es un no-op: no pisa la cola.
+        app.related.fresh.clear();
+        app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        assert_eq!(app.related.tracks.len(), 2, "sin frescas no reemplaza");
     }
 
     #[test]
@@ -1725,14 +2092,15 @@ mod tests {
             "el seek sigue pendiente hasta que el motor refleje el salto"
         );
 
-        // El motor ya está en el objetivo: el seek termina y vuelve el guard.
+        // El motor ya está en el objetivo: el seek termina.
         app.on_backend(BackendEvent::Playback(ev(50)));
         assert_eq!(app.clock.position(), Duration::from_secs(50));
         assert!(app.clock.pending_seek().is_none(), "seek resuelto");
 
-        // Reinicio espurio tras el seek: ignorado de nuevo.
+        // Un reinicio real del MISMO track a ~0 tras el seek se re-ancla (la
+        // posición reportada es la verdad), no queda la letra clavada arriba.
         app.on_backend(BackendEvent::Playback(ev(0)));
-        assert_eq!(app.clock.position(), Duration::from_secs(50));
+        assert_eq!(app.clock.position(), Duration::ZERO);
     }
 
     #[test]
@@ -1950,6 +2318,8 @@ mod tests {
         app.on_backend(BackendEvent::Related {
             track: Box::new(old),
             related: vec![],
+            queue: vec![],
+            origins: vec![],
             synced: Some("[00:01] letra vieja\n".to_string()),
             generation: 1,
         });
@@ -2113,6 +2483,8 @@ mod tests {
         app.on_backend(BackendEvent::Related {
             track: Box::new(rec_track(&id)),
             related: vec![rec_track("stale")],
+            queue: vec![rec_track("stale")],
+            origins: vec![crate::playback::QueueItemOrigin::Recommendation],
             synced: None,
             generation: gen1,
         });
@@ -2122,15 +2494,24 @@ mod tests {
         );
         assert!(app.recs.is_loading(), "y la petición en curso sigue viva");
 
-        // La respuesta de la sesión en curso sí aplica.
+        // La respuesta de la sesión en curso sí aplica: la vista muestra la
+        // COLA (lo que va a sonar) y guarda aparte la lista fresca para la
+        // acción "reemplazar".
         app.on_backend(BackendEvent::Related {
             track: Box::new(rec_track(&id)),
             related: vec![rec_track("fresh")],
+            queue: vec![rec_track("queued-a"), rec_track("queued-b")],
+            origins: vec![
+                crate::playback::QueueItemOrigin::Recommendation,
+                crate::playback::QueueItemOrigin::Recommendation,
+            ],
             synced: None,
             generation: gen2,
         });
-        assert_eq!(app.related.tracks.len(), 1);
-        assert_eq!(app.related.tracks[0].identifier(), "fresh");
+        assert_eq!(app.related.tracks.len(), 2);
+        assert_eq!(app.related.tracks[0].identifier(), "queued-a");
+        assert_eq!(app.related.fresh.len(), 1);
+        assert_eq!(app.related.fresh[0].identifier(), "fresh");
         assert!(!app.recs.is_loading());
     }
 
@@ -2212,5 +2593,108 @@ mod tests {
         let history = db.recent_history(10).await.unwrap();
         assert_eq!(history.len(), 1, "debe registrarse la selección");
         assert_eq!(history[0].title, "Bohemian Rhapsody");
+    }
+
+    #[test]
+    fn f_and_t_toggle_shuffle_and_repeat_and_emit_queue_commands() {
+        let (tx, mut rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        assert!(!app.shuffle);
+        assert_eq!(app.repeat, Default::default());
+
+        // `f` activa el shuffle optimista y avisa al backend.
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(app.shuffle, "shuffle optimista ON");
+        assert!(sent_skip(&mut rx, BackendCommand::SetShuffle(true)));
+
+        // `f` de nuevo lo apaga.
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(!app.shuffle);
+        assert!(sent_skip(&mut rx, BackendCommand::SetShuffle(false)));
+
+        // `t` cicla All → Off → All (el valor inicial es el default del modo).
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.repeat, crate::playback::queue::RepeatMode::Off);
+        assert!(sent_skip(
+            &mut rx,
+            BackendCommand::SetRepeat(crate::playback::queue::RepeatMode::Off)
+        ));
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.repeat, crate::playback::queue::RepeatMode::All);
+    }
+
+    #[test]
+    fn queue_state_event_adopts_authoritative_backend_state() {
+        let (tx, _rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        // Un comando de refresh/replace del backend llegó: la UI adopta la
+        // autoridad (p. ej. si el shuffle se cambió desde otra acción).
+        app.on_backend(BackendEvent::QueueState {
+            shuffle: true,
+            repeat: crate::playback::queue::RepeatMode::All,
+            len: 4,
+        });
+        assert!(app.shuffle);
+        assert_eq!(app.repeat, crate::playback::queue::RepeatMode::All);
+    }
+
+    #[test]
+    fn related_new_items_are_marked_and_reported() {
+        let (tx, _rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        app.now_playing = Some(rec_track("song-1"));
+        let _ = app.recs.request("song-1");
+
+        // Primera carga: 2 nuevas (cola antes vacía).
+        app.on_backend(BackendEvent::Related {
+            track: Box::new(rec_track("song-1")),
+            related: vec![rec_track("a"), rec_track("b")],
+            queue: vec![rec_track("a"), rec_track("b")],
+            origins: vec![
+                crate::playback::QueueItemOrigin::Recommendation,
+                crate::playback::QueueItemOrigin::Recommendation,
+            ],
+            synced: None,
+            generation: 1,
+        });
+        assert_eq!(app.related.tracks.len(), 2);
+        assert_eq!(app.related.new_ids.len(), 2, "ambas son nuevas");
+        assert_eq!(
+            app.related.origins,
+            vec![
+                crate::playback::QueueItemOrigin::Recommendation,
+                crate::playback::QueueItemOrigin::Recommendation
+            ]
+        );
+        assert!(
+            app.status.as_deref().is_some_and(|s| s.contains("(+2 nuevas)")),
+            "anuncia las nuevas añadidas: {:?}",
+            app.status
+        );
+
+        // Segunda carga con un track conocido y uno nuevo: solo el nuevo se
+        // marca y el aviso dice (+1).
+        app.recs.on_track_changed();
+        let gen = app.recs.request("song-1").unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)); // limpiar estado previo no necesario
+        app.on_backend(BackendEvent::Related {
+            track: Box::new(rec_track("song-1")),
+            related: vec![rec_track("b"), rec_track("c")],
+            queue: vec![rec_track("a"), rec_track("b"), rec_track("c")],
+            origins: vec![
+                crate::playback::QueueItemOrigin::Recommendation,
+                crate::playback::QueueItemOrigin::Recommendation,
+                crate::playback::QueueItemOrigin::Recommendation,
+            ],
+            synced: None,
+            generation: gen,
+        });
+        assert!(app.related.new_ids.contains(&rec_track("c").identifier()));
+        assert!(!app.related.new_ids.contains(&rec_track("a").identifier()));
+        assert!(
+            app.status.as_deref().is_some_and(|s| s.contains("(+1 nuevas)")),
+            "solo anuncia la realmente nueva: {:?}",
+            app.status
+        );
     }
 }

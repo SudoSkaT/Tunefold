@@ -32,6 +32,8 @@ pub fn render(
     playback: &PlaybackStatus,
     related: &mut RelatedState,
     autoplay: bool,
+    shuffle: bool,
+    repeat: crate::playback::queue::RepeatMode,
     mouse: &Option<(u16, u16)>,
     click: &mut bool,
     thumbnails: &std::collections::HashMap<String, ThumbnailState>,
@@ -69,10 +71,13 @@ pub fn render(
     }
     progress_bar::render(frame, chunks[2], playback, frame_anim);
 
-    let title = format!(
-        " Recomendaciones · {} · a: autoplay {} ",
+    let queue_txt = format!(
+        "{} · a: autoplay {}",
         related.tracks.len(),
         if autoplay { "ON" } else { "OFF" }
+    );
+    let title = format!(
+        " Recomendaciones · {queue_txt} ",
     );
     crate::ui::related::render_tracks_list(
         frame,
@@ -80,12 +85,13 @@ pub fn render(
         related,
         title,
         "Sin recomendaciones todavía. Reproduce una canción o pulsa Enter.",
+        playback.track.as_ref().map(|t| t.identifier()).as_deref(),
         mouse,
         click,
         stats,
     );
 
-    render_controls(frame, chunks[4], playback, related, frame_anim);
+    render_controls(frame, chunks[4], playback, related, shuffle, repeat, frame_anim);
 }
 
 /// Panel de atajos y estado bajo el panel de recomendaciones.
@@ -94,6 +100,8 @@ fn render_controls(
     area: Rect,
     playback: &PlaybackStatus,
     related: &RelatedState,
+    shuffle: bool,
+    repeat: crate::playback::queue::RepeatMode,
     frame_anim: u64,
 ) {
     let state = match playback.state {
@@ -111,6 +119,15 @@ fn render_controls(
     } else {
         String::new()
     };
+    // Indicadores SIEMPRE visibles del modo de cola (Nivel 1): reflejan el
+    // estado real confirmado por el backend (y el optimista de la UI al
+    // teclear f/t). Sin estos no queda claro por qué el siguiente/anterior
+    // salta.
+    let shuffle_txt = if shuffle { "SHUFFLE" } else { "orden" };
+    let repeat_txt = match repeat {
+        crate::playback::queue::RepeatMode::All => "REPETIR todo",
+        crate::playback::queue::RepeatMode::Off => "repetir off",
+    };
     let lines = vec![
         Line::from(vec![
             Span::styled("Espacio", Style::new().fg(Color::Cyan)),
@@ -124,14 +141,16 @@ fn render_controls(
         ]),
         Line::from(vec![
             Span::styled("Shift+D/A", Style::new().fg(Color::Cyan)),
-            Span::raw(" siguiente/anterior en la cola · "),
+            Span::raw(" siguiente/anterior · "),
             Span::styled("a", Style::new().fg(Color::Cyan)),
-            Span::raw(" alterna autoplay · "),
-            Span::styled("Shift+2", Style::new().fg(Color::Cyan)),
-            Span::raw(" vista completa con letras"),
+            Span::raw(" autoplay · "),
+            Span::styled("f", Style::new().fg(Color::Cyan)),
+            Span::raw(" shuffle · "),
+            Span::styled("t", Style::new().fg(Color::Cyan)),
+            Span::raw(" repetir"),
         ]),
         Line::from(format!(
-            "{state}{stall} · {} recomendaciones cargadas",
+            "{state}{stall} · {shuffle_txt} · {repeat_txt} · {} en cola",
             related.tracks.len()
         )),
     ];

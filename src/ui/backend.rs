@@ -17,7 +17,7 @@ use crate::domain::track::Track;
 use crate::infrastructure::config::{Config, ConfigForm};
 use crate::infrastructure::db::Db;
 use crate::infrastructure::playback;
-use crate::playback::{decide_recovery, QueueManager, RecoveryAction, RecoveryBudget};
+use crate::playback::{decide_recovery, QueueManager, RecoveryAction, RecoveryBudget, RepeatMode};
 use crate::recommendation::acoustic_aggregator::AcousticAggregator;
 use crate::recommendation::signals::{PlayContext, SignalKind};
 use crate::recommendation::types::UserProfile;
@@ -59,8 +59,15 @@ pub enum BackendCommand {
     Thumbnail(Box<Track>),
     /// Activa/desactiva la reproducción automática de recomendaciones.
     SetAutoplay(bool),
-    /// Actualiza la cola de recomendaciones usada por el autoplay.
-    SetAutoplayQueue(Vec<Track>),
+    /// REEMPLAZA toda la cola por la lista dada (acción explícita del usuario
+    /// desde la vista de recomendaciones): a diferencia del crecimiento
+    /// automático, descarta lo acumulado y empieza de cero desde esta lista.
+    ReplaceQueue(Vec<Track>),
+    /// Activa/desactiva el shuffle de la cola (al activarlo, el track actual
+    /// queda primero en la permutación).
+    SetShuffle(bool),
+    /// Cambia el modo de repetición de la cola (Off/All).
+    SetRepeat(RepeatMode),
     /// Salta a la siguiente recomendación de la cola (Shift+D) y la reproduce.
     NextTrack,
     /// Salta a la anterior recomendación de la cola (Shift+A) y la reproduce.
@@ -373,16 +380,41 @@ impl Backend {
                 *self.autoplay.lock().await = enabled;
                 None
             }
-            BackendCommand::SetAutoplayQueue(tracks) => {
-                // La cola persiste entre canciones: una lista vacía (limpieza
-                // de la UI mientras llegan las recomendaciones de la canción
-                // nueva) no pisa la cola vigente, o los saltos y el autoplay
-                // se quedarían sin cola durante el buffering.
-                let mut queue = self.queue.lock().await;
-                if !tracks.is_empty() || queue.is_empty() {
-                    queue.set_tracks(tracks);
-                }
-                None
+            BackendCommand::ReplaceQueue(tracks) => {
+                let state = {
+                    let mut guard = self.queue.lock().await;
+                    guard.set_tracks(tracks);
+                    BackendEvent::QueueState {
+                        shuffle: guard.shuffle_active(),
+                        repeat: guard.repeat(),
+                        len: guard.len(),
+                    }
+                };
+                Some(state)
+            }
+            BackendCommand::SetShuffle(on) => {
+                let state = {
+                    let mut guard = self.queue.lock().await;
+                    guard.set_shuffle(on);
+                    BackendEvent::QueueState {
+                        shuffle: guard.shuffle_active(),
+                        repeat: guard.repeat(),
+                        len: guard.len(),
+                    }
+                };
+                Some(state)
+            }
+            BackendCommand::SetRepeat(mode) => {
+                let state = {
+                    let mut guard = self.queue.lock().await;
+                    guard.set_repeat(mode);
+                    BackendEvent::QueueState {
+                        shuffle: guard.shuffle_active(),
+                        repeat: guard.repeat(),
+                        len: guard.len(),
+                    }
+                };
+                Some(state)
             }
             // Comandos pesados: se procesan en tareas propias (ver `spawn_backend`).
             _ => unreachable!("comando pesado atendido por `handle_heavy`"),
@@ -485,9 +517,24 @@ impl Backend {
                 // usuario (FASE 9/10): lo que encaja con su perfil sube y lo
                 // que rechazó claramente baja o se descarta.
                 self.reorder_by_local_taste(&mut related).await;
+                // La cola de autoplay CRECE con las recomendaciones de cada
+                // canción (dedupe, sin reemplazar lo ya encolado): así nunca se
+                // pierde la lista que el usuario estaba construyendo y el
+                // autoplay avanza por todo el fondo acumulado en vez de dar
+                // vueltas sobre ~7 canciones.
+                let (queue, origins) = {
+                    let mut queue_guard = self.queue.lock().await;
+                    queue_guard.append_unique_with_origin(
+                        &related,
+                        crate::playback::QueueItemOrigin::Recommendation,
+                    );
+                    (queue_guard.tracks().to_vec(), queue_guard.origins().to_vec())
+                };
                 Some(BackendEvent::Related {
                     track: Box::new(track),
                     related,
+                    queue,
+                    origins,
                     synced,
                     generation,
                 })
@@ -901,10 +948,24 @@ pub fn spawn_backend(
                                 }
                             });
                         }
-                        Ok(PlaybackEvent::Error(msg)) => {                            // Errores en caliente: primero se intenta la
+                        Ok(PlaybackEvent::Error(msg)) => {
+                            // Errores en caliente: primero se intenta la
                             // recuperación acotada (UN refresco por track);
                             // si no procede o falla, queda el aviso ORIGINAL
                             // como pie discreto.
+                            //
+                            // ANTES de nada, se reenvía el estado REAL del
+                            // motor. Al llegar el error el router ya está
+                            // `Stopped` (el monitor fija el estado antes de
+                            // emitir), pero hasta aquí la UI seguía creyendo
+                            // que estaba `Playing` y su reloj de letras seguía
+                            // extrapolando indefinidamente (el ticker no
+                            // reenvía estados `Stopped`). Enviar el snapshot
+                            // cierra ese hueco: la UI se entera del corte
+                            // aunque el error resulte recuperable.
+                            let _ = event_tx.send(BackendEvent::Playback(
+                                router.status().await,
+                            ));
                             let event_for_decision = PlaybackEvent::Error(msg.clone());
                             let key = backend
                                 .current
@@ -936,7 +997,13 @@ pub fn spawn_backend(
                                             let _ = event_tx.send(BackendEvent::Message(
                                                 "stream renovado tras un fallo; seguimos donde estabas.".to_string(),
                                             ));
-                                            let _ = event_tx.send(BackendEvent::Playback(status));
+                                            // Evento DEDICADO: la UI debe tratar el
+                                            // reinicio como replay del mismo track
+                                            // (rebobinar el reloj de letras), jamás como
+                                            // un tick normal — el guard monótono del
+                                            // PositionClock lo dejaría clavado en la
+                                            // posición previa.
+                                            let _ = event_tx.send(BackendEvent::RecoveryResumed(status));
                                         }
                                         RecoveryOutcome::Failed(original) => {
                                             let _ = event_tx.send(BackendEvent::StreamError(original));
