@@ -13,7 +13,29 @@ use sqlx::{Row, Transaction};
 use crate::recommendation::signals::{PlayContext, PlaySignal, SignalKind};
 use crate::recommendation::types::TrackAcousticProfile;
 
+use crate::domain::playlist::{Playlist, PlaylistItem, PlaylistKind};
 use crate::domain::{album::Album, artist::Artist, genre::Genre, source::Source, track::Track};
+
+/// Convierte `"#rrggbb"` a `[r,g,b]` (fallback determinista si está corrupto).
+fn parse_hex(hex: String) -> [u8; 3] {
+    let bytes = hex.trim_start_matches('#').as_bytes();
+    let nib = |i: usize| bytes.get(i).and_then(|b| (*b as char).to_digit(16));
+    if let (Some(rh), Some(rl), Some(gh), Some(gl), Some(bh), Some(bl)) = (
+        nib(0),
+        nib(1),
+        nib(2),
+        nib(3),
+        nib(4),
+        nib(5),
+    ) {
+        return [
+            ((rh << 4) | rl) as u8,
+            ((gh << 4) | gl) as u8,
+            ((bh << 4) | bl) as u8,
+        ];
+    }
+    [20, 14, 26]
+}
 
 use super::db::Db;
 
@@ -49,6 +71,27 @@ pub struct PlaylistRow {
     pub name: String,
     pub created_at: String,
     pub track_count: i64,
+    /// Tipo de la playlist (User/System). L1K3D es `System` y está protegida.
+    pub kind: PlaylistKind,
+}
+
+/// Vínculo de pertenencia de un track: en qué playlists está y de qué tipo
+/// (para resolver el estado "liked" y pintar etiquetas sin N+1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistMembership {
+    pub playlist_id: i64,
+    pub playlist_name: String,
+    pub kind: PlaylistKind,
+    pub track_id: i64,
+}
+
+/// Paleta persistida de un track (tres colores dominantes del artwork).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtworkPalette {
+    pub track_id: i64,
+    pub primary: [u8; 3],
+    pub secondary: [u8; 3],
+    pub accent: [u8; 3],
 }
 
 impl Db {
@@ -438,10 +481,16 @@ impl Db {
         Ok(())
     }
 
-    /// Crea una playlist local. `Err` si ya existe un nombre igual.
+    /// Crea una playlist local. `Err` si ya existe un nombre igual (el nombre
+    /// reservado de L1K3D nunca se puede crear: desencadena el conflicto de
+    /// unicidad porque L1K3D ya existe).
     pub async fn create_playlist(&self, name: &str) -> Result<i64> {
+        if name.eq_ignore_ascii_case(Playlist::LIKED_NAME) {
+            anyhow::bail!("«{name}» es un nombre reservado de la app");
+        }
         let result = sqlx::query(
-            "INSERT INTO playlists (name) VALUES (?1) \
+            "INSERT INTO playlists (name, kind, created_at, updated_at) \
+             VALUES (?1, 0, datetime('now'), datetime('now')) \
              ON CONFLICT(name) DO NOTHING",
         )
         .bind(name)
@@ -453,8 +502,13 @@ impl Db {
         Ok(result.last_insert_rowid())
     }
 
+    /// La identidad de un playlist de sistema es inmutable (invariante del
+    /// dominio): renombrar L1K3D es un error, no un no-op silencioso.
     pub async fn rename_playlist(&self, id: i64, name: &str) -> Result<()> {
-        sqlx::query("UPDATE playlists SET name = ?2 WHERE id = ?1")
+        if self.is_system_playlist(id).await? {
+            anyhow::bail!("no se puede renombrar una playlist de sistema (L1K3D)");
+        }
+        sqlx::query("UPDATE playlists SET name = ?2, updated_at = datetime('now') WHERE id = ?1")
             .bind(id)
             .bind(name)
             .execute(self.pool())
@@ -463,6 +517,9 @@ impl Db {
     }
 
     pub async fn delete_playlist(&self, id: i64) -> Result<()> {
+        if self.is_system_playlist(id).await? {
+            anyhow::bail!("no se puede eliminar una playlist de sistema (L1K3D)");
+        }
         sqlx::query("DELETE FROM playlists WHERE id = ?1")
             .bind(id)
             .execute(self.pool())
@@ -470,12 +527,24 @@ impl Db {
         Ok(())
     }
 
+    /// `true` si la playlist es de sistema (L1K3D). Guarda de la capa de
+    /// aplicación; la BD la duplica con triggers `BEFORE DELETE/UPDATE`.
+    pub async fn is_system_playlist(&self, id: i64) -> Result<bool> {
+        let row = sqlx::query("SELECT kind FROM playlists WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(row
+            .map(|r| r.get::<i64, _>("kind") == 1)
+            .unwrap_or(false))
+    }
+
     pub async fn list_playlists(&self) -> Result<Vec<PlaylistRow>> {
         let rows = sqlx::query(
-            "SELECT p.id, p.name, p.created_at, \
+            "SELECT p.id, p.name, p.created_at, p.kind, p.updated_at, \
                     (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) AS track_count \
              FROM playlists p \
-             ORDER BY p.name",
+             ORDER BY p.kind DESC, p.name",
         )
         .fetch_all(self.pool())
         .await?;
@@ -486,8 +555,96 @@ impl Db {
                 name: r.get("name"),
                 created_at: r.get("created_at"),
                 track_count: r.get("track_count"),
+                kind: PlaylistKind::from_i64(r.get("kind")),
             })
             .collect())
+    }
+
+    /// Metadata completa de una playlist (incluida la de sistema).
+    pub async fn get_playlist(&self, playlist_id: i64) -> Result<Option<PlaylistRow>> {
+        let row = sqlx::query(
+            "SELECT p.id, p.name, p.created_at, p.kind, p.updated_at, \
+                    (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) AS track_count \
+             FROM playlists p WHERE p.id = ?1",
+        )
+        .bind(playlist_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|r| PlaylistRow {
+            id: r.get("id"),
+            name: r.get("name"),
+            created_at: r.get("created_at"),
+            track_count: r.get("track_count"),
+            kind: PlaylistKind::from_i64(r.get("kind")),
+        }))
+    }
+
+    /// Duración total de una playlist (suma de las duraciones conocidas), para
+    /// mostrar ", N canciones · h:mm:ss" en el listado.
+    pub async fn playlist_total_duration(&self, playlist_id: i64) -> Result<std::time::Duration> {
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(t.duration), 0) AS total FROM playlist_tracks pt \
+             JOIN tracks t ON t.id = pt.track_id WHERE pt.playlist_id = ?1",
+        )
+        .bind(playlist_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(std::time::Duration::from_millis(
+            row.get::<i64, _>("total").max(0) as u64,
+        ))
+    }
+
+    /// Ordena la membership de una playlist en orden explícito (`tracks` con
+    /// los `track_id` en el orden deseado). Se usa al reordenar desde la UI.
+    pub async fn reorder_playlist(&self, playlist_id: i64, order: &[i64]) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        // El track pedido DEBE estar en la playlist: se valida contra las filas
+        // existentes ANTES de reescribir (no se inventan posiciones nuevas).
+        let existing: Vec<i64> = sqlx::query_scalar(
+            "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1",
+        )
+        .bind(playlist_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let existing_set: std::collections::HashSet<i64> = existing.iter().copied().collect();
+        if order.iter().any(|t| !existing_set.contains(t)) {
+            anyhow::bail!("el reorden contiene tracks ajenos a la playlist");
+        }
+        for (pos, track_id) in order.iter().enumerate() {
+            sqlx::query(
+                "UPDATE playlist_tracks SET position = ?3 WHERE playlist_id = ?1 AND track_id = ?2",
+            )
+            .bind(playlist_id)
+            .bind(track_id)
+            .bind(pos as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Mueve UN track a otra posición (el resto se reordena consecutivamente).
+    /// Si `to` está fuera de rango, se satura al último.
+    pub async fn move_playlist_track(
+        &self,
+        playlist_id: i64,
+        track_id: i64,
+        to_position: usize,
+    ) -> Result<()> {
+        let mut current: Vec<i64> = sqlx::query_scalar(
+            "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position",
+        )
+        .bind(playlist_id)
+        .fetch_all(self.pool())
+        .await?;
+        let from = current.iter().position(|t| *t == track_id).ok_or_else(|| {
+            anyhow::anyhow!("el track no está en esta playlist")
+        })?;
+        let track = current.remove(from);
+        let to = to_position.min(current.len());
+        current.insert(to, track);
+        self.reorder_playlist(playlist_id, &current).await
     }
 
     pub async fn playlist_tracks(&self, playlist_id: i64) -> Result<Vec<Track>> {
@@ -509,11 +666,24 @@ impl Db {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
+    /// ¿Contiene la playlist este track? (lookup puntual, sin cargar la lista).
+    pub async fn playlist_contains(&self, playlist_id: i64, track_id: i64) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM playlist_tracks WHERE playlist_id = ?1 AND track_id = ?2",
+        )
+        .bind(playlist_id)
+        .bind(track_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.is_some())
+    }
+
     pub async fn add_to_playlist(&self, playlist_id: i64, track_id: i64) -> Result<()> {
         sqlx::query(
-            "INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) \
+            "INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position, added_at) \
              VALUES (?1, ?2, \
-                (SELECT COALESCE(MAX(position), 0) + 1 FROM playlist_tracks WHERE playlist_id = ?1))",
+                (SELECT COALESCE(MAX(position), 0) + 1 FROM playlist_tracks WHERE playlist_id = ?1), \
+                datetime('now'))",
         )
         .bind(playlist_id)
         .bind(track_id)
@@ -529,6 +699,171 @@ impl Db {
             .execute(self.pool())
             .await?;
         Ok(())
+    }
+
+    // ---------------------------------------------------------- L1K3D
+    // L1K3D es una playlist normal de sistema (no una excepción por track):
+    // "liked" == pertenece a L1K3D. Todo se resuelve con las operaciones de
+    // membership de arriba; estos helpers solo dan azúcar semántica.
+
+    fn l1k3d_query() -> &'static str {
+        "SELECT id FROM playlists WHERE kind = 1 LIMIT 1"
+    }
+
+    /// Id de la playlist de sistema L1K3D (creada por la migración 0009).
+    /// `None` si la base aún no migró (no debería ocurrir en producción).
+    pub async fn l1k3d_id(&self) -> Result<Option<i64>> {
+        let row = sqlx::query(Self::l1k3d_query())
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(row.map(|r| r.get("id")))
+    }
+
+    /// `true` si el track está en L1K3D.
+    pub async fn is_liked(&self, track_id: i64) -> Result<bool> {
+        let Some(id) = self.l1k3d_id().await? else {
+            return Ok(false);
+        };
+        self.playlist_contains(id, track_id).await
+    }
+
+    /// Marca al track como liked (`liked=true` añade a L1K3D; `false` quita).
+    /// La operación activa los triggers de touch (actualiza `updated_at`).
+    pub async fn set_liked(&self, track_id: i64, liked: bool) -> Result<()> {
+        let id = self.l1k3d_id().await?.ok_or_else(|| {
+            anyhow::anyhow!("L1K3D no existe: aplica la migración 0009")
+        })?;
+        if liked {
+            self.add_to_playlist(id, track_id).await
+        } else {
+            self.remove_from_playlist(id, track_id).await
+        }
+    }
+
+    /// Todos los `track_id` actualmente en L1K3D (estado "liked" de la app).
+    pub async fn liked_track_ids(&self) -> Result<Vec<i64>> {
+        let Some(id) = self.l1k3d_id().await? else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query_scalar(
+            "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position",
+        )
+        .bind(id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// Tracks completos de L1K3D (la propia playlist, editable como cualquiera
+    /// salvo identidad).
+    pub async fn liked_tracks(&self) -> Result<Vec<Track>> {
+        let Some(id) = self.l1k3d_id().await? else {
+            return Ok(Vec::new());
+        };
+        self.playlist_tracks(id).await
+    }
+
+    // ------------------------------------------------- membresía por track
+    /// Devuelve, de TODOS los tracks dados, en qué playlists están (y de qué
+    /// tipo). UNA consulta para `track_ids` enteros: evita el N+1 de preguntar
+    /// por cada canción si está en playlists al pintar listas.
+    pub async fn get_playlist_memberships(
+        &self,
+        track_ids: &[i64],
+    ) -> Result<Vec<PlaylistMembership>> {
+        if track_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SQLite limita bindings a 999: se trocea en lotes seguros.
+        const CHUNK: usize = 450;
+        let mut out = Vec::new();
+        for chunk in track_ids.chunks(CHUNK) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT pt.playlist_id AS pid, p.name AS pl_name, p.kind AS pl_kind, \
+                        pt.track_id AS tid \
+                 FROM playlist_tracks pt \
+                 JOIN playlists p ON p.id = pt.playlist_id \
+                 WHERE pt.track_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql);
+            for t in chunk {
+                q = q.bind(t);
+            }
+            let rows = q.fetch_all(self.pool()).await?;
+            for r in rows {
+                out.push(PlaylistMembership {
+                    playlist_id: r.get("pid"),
+                    playlist_name: r.get("pl_name"),
+                    kind: PlaylistKind::from_i64(r.get("pl_kind")),
+                    track_id: r.get("tid"),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------- membership ordenada
+    /// Elementos (track_id + added_at) de una playlist en orden explícito.
+    pub async fn playlist_items(&self, playlist_id: i64) -> Result<Vec<PlaylistItem>> {
+        let rows = sqlx::query(
+            "SELECT playlist_id, track_id, position, added_at \
+             FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position",
+        )
+        .bind(playlist_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| PlaylistItem {
+                playlist_id: r.get("playlist_id"),
+                track_id: r.get("track_id"),
+                position: r.get("position"),
+                added_at: r.get("added_at"),
+            })
+            .collect())
+    }
+
+    // ------------------------------------------------- artwork palette
+    /// Persiste la paleta de tres colores dominantes del artwork de un track.
+    /// Se escribe UNA vez al decodificar la miniatura (no durante el render).
+    pub async fn set_track_palette(
+        &self,
+        track_id: i64,
+        palette: [[u8; 3]; 3],
+    ) -> Result<()> {
+        let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+        sqlx::query(
+            "INSERT INTO artwork_palettes (track_id, primary_hex, secondary_hex, accent_hex, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, datetime('now')) \
+             ON CONFLICT(track_id) DO UPDATE SET primary_hex = excluded.primary_hex, \
+                secondary_hex = excluded.secondary_hex, accent_hex = excluded.accent_hex, \
+                updated_at = excluded.updated_at",
+        )
+        .bind(track_id)
+        .bind(hex(palette[0]))
+        .bind(hex(palette[1]))
+        .bind(hex(palette[2]))
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Paleta persistida de un track, si existe.
+    pub async fn get_track_palette(&self, track_id: i64) -> Result<Option<ArtworkPalette>> {
+        let row = sqlx::query(
+            "SELECT track_id, primary_hex, secondary_hex, accent_hex \
+             FROM artwork_palettes WHERE track_id = ?1",
+        )
+        .bind(track_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|r| ArtworkPalette {
+            track_id: r.get("track_id"),
+            primary: parse_hex(r.get::<String, _>("primary_hex")),
+            secondary: parse_hex(r.get::<String, _>("secondary_hex")),
+            accent: parse_hex(r.get::<String, _>("accent_hex")),
+        }))
     }
 
     // ------------------------------------------------------- portada override
@@ -1040,10 +1375,15 @@ mod tests {
         db.add_to_playlist(pl, id).await.unwrap();
         db.add_to_playlist(pl, id).await.unwrap(); // dedupe
 
+        // La migración 0009 siembra L1K3D: el listado empieza con la playlist
+        // de sistema (kind DESC, nombre) y la del usuario después.
         let pls = db.list_playlists().await.unwrap();
-        assert_eq!(pls.len(), 1);
-        assert_eq!(pls[0].track_count, 1);
-        assert_eq!(pls[0].name, "Mi lista");
+        assert_eq!(pls.len(), 2);
+        assert_eq!(pls[0].name, "L1K3D");
+        assert!(pls[0].kind.is_system());
+        assert_eq!(pls[1].name, "Mi lista");
+        assert!(pls[1].kind.is_user());
+        assert_eq!(pls[1].track_count, 1);
 
         let tracks = db.playlist_tracks(pl).await.unwrap();
         assert_eq!(tracks.len(), 1);
@@ -1051,6 +1391,13 @@ mod tests {
 
         db.remove_from_playlist(pl, id).await.unwrap();
         assert_eq!(db.playlist_tracks(pl).await.unwrap().len(), 0);
+
+        // Invariante: identidad de L1K3D protegida ante renombrado/eliminado y
+        // el nombre reservado no puede reutilizarse en playlists de usuario.
+        let l1k3d = db.l1k3d_id().await.unwrap().expect("L1K3D sembrada");
+        assert!(db.rename_playlist(l1k3d, "Otro").await.is_err());
+        assert!(db.delete_playlist(l1k3d).await.is_err());
+        assert!(db.create_playlist("L1K3D").await.is_err());
 
         db.set_artwork_override(id, "file:///tmp/c.jpeg")
             .await
@@ -1093,6 +1440,168 @@ mod tests {
             db.get_synced_lyrics(legacy_id).await.unwrap().is_none(),
             "la letra plana no se devuelve como sincronizada"
         );
+    }
+
+    #[tokio::test]
+    async fn like_is_l1k3d_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::connect(dir.path().join("music.db").to_str().unwrap())
+            .await
+            .unwrap();
+
+        let mut track = Track::new(
+            "Like".to_string(),
+            vec![Artist::new("X".to_string(), None, None, None)],
+            Source::YouTube,
+        );
+        track.external_id = Some("vid-like".to_string());
+        let id = db.upsert_track(&track, &HashMap::new()).await.unwrap();
+        let l1k3d = db.l1k3d_id().await.unwrap().expect("L1K3D sembrada");
+
+        assert!(!db.is_liked(id).await.unwrap());
+        db.set_liked(id, true).await.unwrap();
+        assert!(db.is_liked(id).await.unwrap());
+        assert!(db.playlist_contains(l1k3d, id).await.unwrap());
+        assert_eq!(db.liked_track_ids().await.unwrap(), vec![id]);
+        let liked = db.liked_tracks().await.unwrap();
+        assert_eq!(liked.len(), 1);
+        assert_eq!(liked[0].title, "Like");
+        // El like es idempotente (dedupe por PK) y respeta el orden de alta.
+        db.set_liked(id, true).await.unwrap();
+        assert_eq!(db.liked_track_ids().await.unwrap(), vec![id]);
+
+        db.set_liked(id, false).await.unwrap();
+        assert!(!db.is_liked(id).await.unwrap());
+        assert!(!db.playlist_contains(l1k3d, id).await.unwrap());
+        assert!(db.liked_track_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reorder_and_move_playlist_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::connect(dir.path().join("music.db").to_str().unwrap())
+            .await
+            .unwrap();
+
+        let mut ids = vec![];
+        for (i, vid) in ["v1", "v2", "v3"].iter().enumerate() {
+            let mut track = Track::new(
+                format!("T{i}"),
+                vec![Artist::new("X".to_string(), None, None, None)],
+                Source::YouTube,
+            );
+            track.external_id = Some(vid.to_string());
+            ids.push(db.upsert_track(&track, &HashMap::new()).await.unwrap());
+        }
+
+        let pl = db.create_playlist("Orden").await.unwrap();
+        for id in &ids {
+            db.add_to_playlist(pl, *id).await.unwrap();
+        }
+
+        let items = db.playlist_items(pl).await.unwrap();
+        let order: Vec<i64> = items.iter().map(|i| i.track_id).collect();
+        assert_eq!(order, ids);
+        // `add_to_playlist` encola con MAX(position)+1 (empieza en 1).
+        assert_eq!(
+            items.iter().map(|i| i.position).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        // Reordenar: [T2, T0, T1].
+        let new_order = vec![ids[2], ids[0], ids[1]];
+        db.reorder_playlist(pl, &new_order).await.unwrap();
+        let items = db.playlist_items(pl).await.unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.track_id).collect::<Vec<_>>(),
+            new_order
+        );
+        assert_eq!(
+            items.iter().map(|i| i.position).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        // Mover T0 a la posición final satura en el último índice.
+        db.move_playlist_track(pl, ids[0], 99).await.unwrap();
+        let items = db.playlist_items(pl).await.unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.track_id).collect::<Vec<_>>(),
+            vec![ids[2], ids[1], ids[0]]
+        );
+        // Un track ajeno a la playlist no la desordena (guard de validación).
+        let foreign = {
+            let mut t = Track::new(
+                "Foráneo".to_string(),
+                vec![Artist::new("Z".to_string(), None, None, None)],
+                Source::YouTube,
+            );
+            t.external_id = Some("v-for".to_string());
+            db.upsert_track(&t, &HashMap::new()).await.unwrap()
+        };
+        assert!(db.move_playlist_track(pl, foreign, 0).await.is_err());
+        assert_eq!(db.playlist_items(pl).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn playlist_membership_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::connect(dir.path().join("music.db").to_str().unwrap())
+            .await
+            .unwrap();
+
+        let mut track = Track::new(
+            "M".to_string(),
+            vec![Artist::new("X".to_string(), None, None, None)],
+            Source::YouTube,
+        );
+        track.external_id = Some("vid-m".to_string());
+        let tid = db.upsert_track(&track, &HashMap::new()).await.unwrap();
+
+        let a = db.create_playlist("A").await.unwrap();
+        let b = db.create_playlist("B").await.unwrap();
+        let l1k3d = db.l1k3d_id().await.unwrap().expect("L1K3D sembrada");
+        db.add_to_playlist(a, tid).await.unwrap();
+        db.add_to_playlist(b, tid).await.unwrap();
+
+        let memberships = db.get_playlist_memberships(&[tid]).await.unwrap();
+        assert_eq!(memberships.len(), 2);
+        assert!(memberships.iter().any(|m| m.playlist_id == a));
+        assert!(memberships.iter().any(|m| m.playlist_id == b));
+        assert!(!memberships.iter().any(|m| m.playlist_id == l1k3d));
+
+        let none = db.get_playlist_memberships(&[-1]).await.unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn artwork_palette_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::connect(dir.path().join("music.db").to_str().unwrap())
+            .await
+            .unwrap();
+
+        let mut track = Track::new(
+            "P".to_string(),
+            vec![Artist::new("X".to_string(), None, None, None)],
+            Source::YouTube,
+        );
+        track.external_id = Some("vid-p".to_string());
+        let id = db.upsert_track(&track, &HashMap::new()).await.unwrap();
+
+        assert!(db.get_track_palette(id).await.unwrap().is_none());
+        let palette = [[226, 120, 224], [96, 168, 252], [250, 176, 96]];
+        db.set_track_palette(id, palette).await.unwrap();
+        let got = db.get_track_palette(id).await.unwrap().unwrap();
+        assert_eq!(got.primary, palette[0]);
+        assert_eq!(got.secondary, palette[1]);
+        assert_eq!(got.accent, palette[2]);
+        // Re-escribir (nueva portada) sustituye, no acumula.
+        let palette2 = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+        db.set_track_palette(id, palette2).await.unwrap();
+        let got = db.get_track_palette(id).await.unwrap().unwrap();
+        assert_eq!(got.primary, palette2[0]);
+        assert_eq!(got.secondary, palette2[1]);
+        assert_eq!(got.accent, palette2[2]);
     }
 
     #[tokio::test]

@@ -24,6 +24,7 @@ use crate::visualization::{ParameterMapper, VisualEngine, VisualPalette};
 use super::backend::BackendCommand;
 use super::event::{BackendEvent, UiEvent};
 use super::navigation::ListSelection;
+use super::playlists::{self, PlaylistState};
 use super::search::SearchState;
 use super::settings::SettingsForm;
 use super::view::View;
@@ -94,6 +95,12 @@ pub struct App {
     sources: Vec<Source>,
     settings: Option<SettingsForm>,
     playlists: Vec<PlaylistRow>,
+    /// Sub-estado de la vista Playlists (listado/detalle).
+    playlist_view: PlaylistState,
+    /// Ids internos de los tracks "liked" (pertenencia a L1K3D). Se llena con
+    /// `BackendEvent::L1K3D` al arrancar y se mantiene con `L1K3DChanged`:
+    /// todas las vistas pintan el corazón a partir de este set (no de queries).
+    liked: std::collections::HashSet<i64>,
     // Estado del ratón: posición (columna, fila) del último evento y si ha
     // habido un click izquierdo pendiente. El render de una vista con lista
     // (Search, Related, Now Playing) lo consume para seleccionar la fila bajo
@@ -161,6 +168,8 @@ impl App {
             sources: Vec::new(),
             settings: None,
             playlists: Vec::new(),
+            playlist_view: PlaylistState::default(),
+            liked: std::collections::HashSet::new(),
             mouse_pos: None,
             mouse_click: false,
             status: None,
@@ -253,6 +262,7 @@ impl App {
         let _ = self.backend_tx.send(BackendCommand::LoadSources);
         let _ = self.backend_tx.send(BackendCommand::LoadSettings);
         let _ = self.backend_tx.send(BackendCommand::ListPlaylists);
+        let _ = self.backend_tx.send(BackendCommand::LoadLiked);
         let _ = self
             .backend_tx
             .send(BackendCommand::SetAutoplay(self.autoplay));
@@ -286,6 +296,7 @@ impl App {
         match self.view {
             View::Search => self.on_search_key(key),
             View::Settings => self.on_settings_key(key),
+            View::Playlists => self.on_playlists_key(key),
             _ => self.on_read_only_key(key),
         }
     }
@@ -329,10 +340,10 @@ impl App {
                     self.visual_mode.label()
                 ));
             }
-            // Mordos de la cola (spec §26): el backend mantiene la cola, esta
+            // Modos de la cola (spec §26): el backend mantiene la cola, esta
             // UI refleja el estado optimista y lo confirma con `QueueState`.
             // `f` alterna el shuffle (al activarlo el track actual queda
-            // primero); `t` cicla la repetición Off → Todas → Off.
+            // primero); `t` cicla la repetición Off → Todas → Una → Off.
             KeyCode::Char('f') => {
                 let next = !self.shuffle;
                 self.shuffle = next;
@@ -349,6 +360,9 @@ impl App {
                         crate::playback::queue::RepeatMode::All
                     }
                     crate::playback::queue::RepeatMode::All => {
+                        crate::playback::queue::RepeatMode::One
+                    }
+                    crate::playback::queue::RepeatMode::One => {
                         crate::playback::queue::RepeatMode::Off
                     }
                 };
@@ -360,6 +374,10 @@ impl App {
                     }
                     crate::playback::queue::RepeatMode::All => {
                         "Repetición activada: la cola gira (todas).".to_string()
+                    }
+                    crate::playback::queue::RepeatMode::One => {
+                        "Repetición activada: siguiente/anterior reinician la canción actual."
+                            .to_string()
                     }
                 });
             }
@@ -432,8 +450,10 @@ impl App {
             // - `r`: actualiza sin más — re-busca las recomendaciones de la
             //   canción en curso y las añade a la cola (dedupe: la vista crece,
             //   nunca pisa lo acumulado);
-            // - `R` (con Shift): REEMPLAZA toda la cola por las recomendaciones
-            //   frescas de la canción en curso.
+            // - `R` (con Shift): RENUEVA SOLO el autoplay de la cola — las
+            //   elecciones explícitas del usuario (current, play next, añadidas
+            //   desde búsqueda/playlist) sobreviven; solo se reemplaza el fondo
+            //   automático por las recomendaciones frescas.
             KeyCode::Char('r')
                 if self.view == View::Related || self.view == View::NowPlaying =>
             {
@@ -443,6 +463,18 @@ impl App {
                 if self.view == View::Related || self.view == View::NowPlaying =>
             {
                 self.replace_related_queue();
+            }
+            // Me gusta (L1K3D): `l` conmuta el corazón del track en curso, se
+            // envíe o no el dato al backend, la UI lo refleja al instante y el
+            // backend confirma con `L1K3DChanged` (fuente autoritativa).
+            KeyCode::Char('l') => {
+                let Some(track) = self.now_playing.clone() else {
+                    self.status = Some("Sin canción en curso para marcarla como me gusta.".to_string());
+                    return;
+                };
+                let _ = self
+                    .backend_tx
+                    .send(BackendCommand::ToggleLiked(Box::new(track)));
             }
             _ => {}
         }
@@ -505,6 +537,65 @@ impl App {
         }
     }
 
+    /// Teclas de la vista Playlists. Delega en `playlists::handle_key` (la
+    /// vista es presentación pura) y traduce la acción resultante en comandos
+    /// al backend o navegación.
+    fn on_playlists_key(&mut self, key: KeyEvent) {
+        // Salir con `q` funciona desde cualquier vista (incluso con el input de
+        // creación activo: el backend no pierde nada, la playlist simplemente
+        // no se crea).
+        if key.code == KeyCode::Char('q') {
+            self.should_quit = true;
+            return;
+        }
+        let action = playlists::handle_key(&mut self.playlist_view, key.code, &self.playlists);
+        match action {
+            playlists::PlaylistAction::None => {}
+            playlists::PlaylistAction::Open(id, name) => {
+                self.playlist_view.detail =
+                    Some(playlists::Detail::open(id, name.clone()));
+                let _ = self
+                    .backend_tx
+                    .send(BackendCommand::PlaylistTracks(id));
+                self.status = Some(format!("Cargando «{name}»..."));
+            }
+            playlists::PlaylistAction::Play(id) => {
+                let _ = self.backend_tx.send(BackendCommand::PlayPlaylist(id));
+                self.status = Some("Reproduciendo la playlist como cola...".to_string());
+            }
+            playlists::PlaylistAction::PlayTrack(track) => self.save_and_play(track),
+            playlists::PlaylistAction::Create(name) => {
+                let _ = self
+                    .backend_tx
+                    .send(BackendCommand::CreatePlaylist(name.clone()));
+                self.status = Some(format!("Creando playlist «{name}»..."));
+            }
+            playlists::PlaylistAction::Delete(id) => {
+                let _ = self.backend_tx.send(BackendCommand::DeletePlaylist(id));
+                self.status = Some("Borrando playlist...".to_string());
+            }
+            playlists::PlaylistAction::RemoveTrack(pid, tid) => {
+                let _ = self
+                    .backend_tx
+                    .send(BackendCommand::RemoveFromPlaylist(pid, tid));
+                self.status = Some("Quitando track de la playlist...".to_string());
+            }
+            playlists::PlaylistAction::MoveTrack(pid, tid, to) => {
+                let _ = self
+                    .backend_tx
+                    .send(BackendCommand::MovePlaylistTrack(pid, tid, to));
+                self.status = Some("Moviendo track...".to_string());
+            }
+            playlists::PlaylistAction::CloseDetail => {
+                self.playlist_view.detail = None;
+                self.status = None;
+            }
+            playlists::PlaylistAction::LeaveView => {
+                self.switch_view(View::NowPlaying);
+            }
+        }
+    }
+
     /// Pide recomendaciones + letra del track en curso al backend.
     ///
     /// La SESIÓN decide si hace falta pedir (spec §13): devuelve `None` (no
@@ -538,33 +629,25 @@ impl App {
         self.load_related();
     }
 
-    /// Acción explícita `R` (mayúscula): REEMPLAZA toda la cola de autoplay por
-    /// las recomendaciones frescas de la canción en curso. La vista pasa a
-    /// mostrar exactamente esa lista (la nueva cola). Es la única forma de
-    /// descartar lo acumulado y empezar de cero desde la lista actual.
+    /// Acción explícita `R` (mayúscula): renueva SOLO el segmento de autoplay de
+    /// la cola con las recomendaciones frescas de la canción en curso. Lo que
+    /// el usuario eligió explícitamente (current + play next + búsqueda +
+    /// playlist) sobrevive: no hay que re-encolarlo ni perderlo.
     fn replace_related_queue(&mut self) {
         let fresh = self.related.fresh.clone();
         if fresh.is_empty() {
-            self.status = Some("Sin recomendaciones frescas para reemplazar la cola.".to_string());
+            self.status = Some("Sin recomendaciones frescas para renovar el autoplay.".to_string());
             return;
         }
         let _ = self
             .backend_tx
-            .send(BackendCommand::ReplaceQueue(fresh.clone()));
-        // La vista adopta la nueva cola al instante (eedback optimista); el
-        // backend la confirma con `QueueState` y `Related`. Las filas entran
-        // con origen autoplay (recomendaciones frescas).
-        let n = fresh.len();
-        let origins = std::iter::repeat_n(
-            crate::playback::queue::QueueItemOrigin::Recommendation,
-            n,
-        )
-        .collect();
-        self.related.set_queue(fresh, origins);
-        self.related.list_state.select(Some(0));
+            .send(BackendCommand::ReplaceAutoplay(fresh.clone()));
+        // La vista adopta la cola resultante vía `BackendEvent::Queue` (el
+        // backend devuelve la fusión final explícito+autoplay, no una copia
+        // local que podría ignorar lo reencolado).
         self.status = Some(format!(
-            "Cola reemplazada por {} recomendaciones de la canción en curso.",
-            self.related.tracks.len()
+            "Autoplay renovado: {} recomendaciones frescas de la canción en curso.",
+            fresh.len()
         ));
     }
 
@@ -653,6 +736,12 @@ impl App {
             }
             View::Settings => {
                 let _ = self.backend_tx.send(BackendCommand::LoadSettings);
+            }
+            View::Playlists => {
+                // Entrar en Playlists siempre refresca el listado: así el
+                // contador de L1K3D y los reordenamientos hechos en detalle
+                // quedan al día aunque se haya salido de la vista.
+                let _ = self.backend_tx.send(BackendCommand::ListPlaylists);
             }
             // Cambiar a Related NO pide recomendaciones (spec §7/§18): solo
             // muestra las de la sesión actual (cargadas al empezar la canción).
@@ -924,8 +1013,57 @@ impl App {
                 self.features = Some(f);
                 self.features_at = Some(std::time::Instant::now());
             }
-            BackendEvent::Playlists(playlists) => self.playlists = playlists,
-            BackendEvent::PlaylistTracks { .. } => {}
+            BackendEvent::Playlists(playlists) => {
+                self.playlists = playlists;
+                // Al refrescar el listado (p. ej. tras crear/borrar), la
+                // selección del listado no debe apuntar fuera del Vec nuevo de
+                // `App`; el detalle abierto pudo cambiar de nombre/borrarse.
+                let max = self.playlists.len().saturating_sub(1);
+                if let Some(sel) = self.playlist_view.listing.selected() {
+                    self.playlist_view.listing.select(Some(sel.min(max)));
+                }
+            }
+            BackendEvent::PlaylistTracks { playlist_id, tracks } => {
+                let Some(detail) = self.playlist_view.detail.as_mut() else {
+                    return;
+                };
+                if detail.id != playlist_id {
+                    return;
+                }
+                // La lista del detalle entra con origen Playlist (mismas
+                // marcas/orígenes que el resto de listas de la app).
+                let n = tracks.len();
+                let origins = std::iter::repeat_n(
+                    crate::playback::queue::QueueItemOrigin::Playlist,
+                    n,
+                )
+                .collect();
+                detail.tracks.set_queue(tracks, origins);
+                if !detail.tracks.tracks.is_empty() {
+                    detail.tracks.list_state.select(Some(0));
+                }
+            }
+            BackendEvent::Queue { queue, origins } => {
+                // Cola adoptada desde el backend (p. ej. `R` tras renovar solo
+                // el autoplay): la vista Related se alinea con la fusión final
+                // sin inventar una copia local.
+                self.related.set_queue(queue, origins);
+            }
+            BackendEvent::L1K3D(track_ids) => {
+                self.liked = track_ids.into_iter().collect();
+            }
+            BackendEvent::L1K3DChanged { track, liked } => {
+                if liked {
+                    self.liked.insert(track.id);
+                } else {
+                    self.liked.remove(&track.id);
+                }
+                self.status = Some(if liked {
+                    format!("♥ «{}» añadida a L1K3D.", track.title)
+                } else {
+                    format!("Quitada de L1K3D: «{}».", track.title)
+                });
+            }
             BackendEvent::Message(msg) => self.status = Some(msg),
             BackendEvent::Error(err) => {
                 self.search.searching = false;
@@ -971,7 +1109,7 @@ impl App {
                 ),
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Line::from(format!("{shortcuts}    ·   1..7 sueltos no navegan")),
+            Line::from(format!("{shortcuts}    ·   1..8 sueltos no navegan")),
         ];
         frame.render_widget(
             Paragraph::new(text).block(Block::default().borders(Borders::BOTTOM)),
@@ -1024,6 +1162,11 @@ impl App {
                 // la anterior y la escena la expone ya mezclada al renderer.
                 let palette = VisualPalette::from_cover(self.cover_palette());
                 let state = self.visual.update(fresh.as_ref(), position, &palette);
+                let is_liked = self
+                    .now_playing
+                    .as_ref()
+                    .map(|t| self.liked.contains(&t.id))
+                    .unwrap_or(false);
                 dashboard::render(
                     frame,
                     area,
@@ -1038,6 +1181,7 @@ impl App {
                     self.frame,
                     &self.listening_stats,
                     &state,
+                    is_liked,
                 );
             }
             View::Related => {
@@ -1087,6 +1231,19 @@ impl App {
                     settings::render(frame, area, settings);
                 }
             }
+            View::Playlists => playlists::render(
+                frame,
+                area,
+                &mut self.playlist_view,
+                &self.playlists,
+                self.now_playing
+                    .as_ref()
+                    .map(|t| t.identifier())
+                    .as_deref(),
+                &self.mouse_pos,
+                &mut self.mouse_click,
+                &self.listening_stats,
+            ),
         }
     }
 
@@ -1969,7 +2126,7 @@ mod tests {
     }
 
     #[test]
-    fn r_uppercase_replaces_queue_with_fresh_recommendations() {
+    fn r_uppercase_renova_solo_el_autoplay_con_las_frescas() {
         let (tx, mut rx) = unbounded_channel::<BackendCommand>();
         let mut app = App::new(tx);
         app.view = View::Related;
@@ -1979,25 +2136,26 @@ mod tests {
 
         app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
 
-        // Envía al backend el reemplazo y la VISTA pasa a mostrar la nueva cola.
+        // `R` renueva SOLO el segmento autoplay: lo explícito del usuario
+        // (current, play next, búsqueda, playlist) sobrevive. El backend
+        // devuelve la fusión final vía `BackendEvent::Queue`.
         let mut replaced = false;
         while let Ok(c) = rx.try_recv() {
-            if let BackendCommand::ReplaceQueue(tracks) = c {
+            if let BackendCommand::ReplaceAutoplay(tracks) = c {
                 assert_eq!(tracks.len(), 2);
                 assert_eq!(tracks[0].identifier(), "fresh-1");
                 replaced = true;
             }
         }
-        assert!(replaced, "«R» debe enviar ReplaceQueue");
-        assert_eq!(app.related.tracks.len(), 2);
-        assert_eq!(app.related.tracks[0].identifier(), "fresh-1");
-        assert_eq!(app.related.list_state.selected(), Some(0));
+        assert!(replaced, "«R» debe enviar ReplaceAutoplay");
+        // Sin reemplazo optimista de la vista: la cola mostrada refleja el
+        // `Queue` confirmado por el backend (la vista explícita NO se pisa).
+        assert_eq!(app.related.tracks[0].identifier(), "stale-1");
 
-        // Sin recomendaciones frescas (p. ej. antes de la primera carga), «R»
-        // es un no-op: no pisa la cola.
+        // Sin recomendaciones frescas, «R» es un no-op: no toca la cola.
         app.related.fresh.clear();
         app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
-        assert_eq!(app.related.tracks.len(), 2, "sin frescas no reemplaza");
+        assert_eq!(app.related.tracks[0].identifier(), "stale-1");
     }
 
     #[test]
@@ -2612,15 +2770,19 @@ mod tests {
         assert!(!app.shuffle);
         assert!(sent_skip(&mut rx, BackendCommand::SetShuffle(false)));
 
-        // `t` cicla All → Off → All (el valor inicial es el default del modo).
+        // `t` cicla All → One → Off → All (el default de la cola es All).
         app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-        assert_eq!(app.repeat, crate::playback::queue::RepeatMode::Off);
+        assert_eq!(app.repeat, crate::playback::queue::RepeatMode::One);
         assert!(sent_skip(
             &mut rx,
-            BackendCommand::SetRepeat(crate::playback::queue::RepeatMode::Off)
+            BackendCommand::SetRepeat(crate::playback::queue::RepeatMode::One)
         ));
         app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-        assert_eq!(app.repeat, crate::playback::queue::RepeatMode::All);
+        assert_eq!(app.repeat, crate::playback::queue::RepeatMode::Off);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.repeat, crate::playback::queue::RepeatMode::All, "vuelve al inicio");
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.repeat, crate::playback::queue::RepeatMode::One);
     }
 
     #[test]

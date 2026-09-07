@@ -103,6 +103,21 @@ pub enum BackendEvent {
         playlist_id: i64,
         tracks: Vec<Track>,
     },
+    /// Estado L1K3D completo (todos los `track_id` actualmente "liked"). Se
+    /// envía al arrancar para pintar los corazones de cada vista.
+    L1K3D(Vec<i64>),
+    /// Una canción entró/salió de L1K3D (toggle inmediato: la UI ya puede
+    /// pintar el corazón lleno/vacío sin volver a consultar la playlist).
+    L1K3DChanged {
+        track: Box<Track>,
+        liked: bool,
+    },
+    /// Cola completa (tracks + orígenes en paralelo) tras una mutación que la
+    /// UI debe reflejar de inmediato (p. ej. `R` = reemplazar solo autoplay).
+    Queue {
+        queue: Vec<Track>,
+        origins: Vec<QueueItemOrigin>,
+    },
     Message(String),
     Error(String),
 }

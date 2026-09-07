@@ -12,6 +12,7 @@ use crate::app::thumbnail::ThumbnailState;
 
 use crate::ui::related::RelatedState;
 use crate::ui::widgets::{progress_bar, song_card, spinner_phase};
+use crate::visualization::palette::VisualPalette;
 use crate::visualization::render as visualizer;
 use crate::visualization::VisualState;
 
@@ -40,6 +41,7 @@ pub fn render(
     frame_anim: u64,
     stats: &std::collections::HashMap<String, crate::infrastructure::storage::TrackListeningStats>,
     visual: &VisualState,
+    liked: bool,
 ) {
     // Banda del visualizador: reservada cuando el terminal tiene altura; con
     // el análisis inactivo se pinta apagada (nunca salta el layout).
@@ -91,10 +93,21 @@ pub fn render(
         stats,
     );
 
-    render_controls(frame, chunks[4], playback, related, shuffle, repeat, frame_anim);
+    render_controls(
+        frame,
+        chunks[4],
+        playback,
+        related,
+        shuffle,
+        repeat,
+        frame_anim,
+        liked,
+        &visual.scene.palette,
+    );
 }
 
 /// Panel de atajos y estado bajo el panel de recomendaciones.
+#[allow(clippy::too_many_arguments)] // peak, estado, modo de cola y animación son datos del panel
 fn render_controls(
     frame: &mut Frame,
     area: Rect,
@@ -103,6 +116,8 @@ fn render_controls(
     shuffle: bool,
     repeat: crate::playback::queue::RepeatMode,
     frame_anim: u64,
+    liked: bool,
+    palette: &VisualPalette,
 ) {
     let state = match playback.state {
         PlaybackState::Playing => "▶ reproduciendo",
@@ -127,7 +142,26 @@ fn render_controls(
     let repeat_txt = match repeat {
         crate::playback::queue::RepeatMode::All => "REPETIR todo",
         crate::playback::queue::RepeatMode::Off => "repetir off",
+        crate::playback::queue::RepeatMode::One => "REPETIR una",
     };
+    // Corazón de L1K3D: coloreado con la paleta de la portada (primary con
+    // pulso mientras está "liked"; secondary/oscuro cuando no). El estado lo
+    // marca el App (set `liked`), alimentado por `L1K3D`/`L1K3DChanged`.
+    let pulse = (frame_anim / 12).is_multiple_of(2);
+    let heart_style = if liked {
+        Style::new().fg(Color::Rgb(
+            if pulse { palette.primary[0] } else { palette.accent[0] },
+            if pulse { palette.primary[1] } else { palette.accent[1] },
+            if pulse { palette.primary[2] } else { palette.accent[2] },
+        ))
+    } else {
+        Style::new().fg(Color::Rgb(
+            palette.secondary[0],
+            palette.secondary[1],
+            palette.secondary[2],
+        ))
+    };
+    let heart = Span::styled(if liked { "♥" } else { "♡" }, heart_style);
     let lines = vec![
         Line::from(vec![
             Span::styled("Espacio", Style::new().fg(Color::Cyan)),
@@ -147,7 +181,10 @@ fn render_controls(
             Span::styled("f", Style::new().fg(Color::Cyan)),
             Span::raw(" shuffle · "),
             Span::styled("t", Style::new().fg(Color::Cyan)),
-            Span::raw(" repetir"),
+            Span::raw(" repetir · "),
+            Span::styled("l", Style::new().fg(Color::Cyan)),
+            Span::raw(" L1K3D "),
+            heart,
         ]),
         Line::from(format!(
             "{state}{stall} · {shuffle_txt} · {repeat_txt} · {} en cola",

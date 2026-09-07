@@ -12,7 +12,7 @@ use crate::app::audio::{EventBus, PlaybackEvent, PlaybackState, PlaybackStatus};
 use crate::app::history::History;
 use crate::app::playback::PlaybackRouter;
 use crate::app::search::SearchEngine;
-use crate::app::thumbnail::ThumbnailService;
+use crate::app::thumbnail::{ThumbnailService, ThumbnailState};
 use crate::domain::track::Track;
 use crate::infrastructure::config::{Config, ConfigForm};
 use crate::infrastructure::db::Db;
@@ -63,10 +63,14 @@ pub enum BackendCommand {
     /// desde la vista de recomendaciones): a diferencia del crecimiento
     /// automático, descarta lo acumulado y empieza de cero desde esta lista.
     ReplaceQueue(Vec<Track>),
+    /// REEMPLAZA SOLO el segmento de autoplay de la cola (tecla `R`): las
+    /// elecciones explícitas del usuario (current, Play Next, Add to Queue,
+    /// playlist/search) sobreviven; solo se renueva el fondo automático.
+    ReplaceAutoplay(Vec<Track>),
     /// Activa/desactiva el shuffle de la cola (al activarlo, el track actual
     /// queda primero en la permutación).
     SetShuffle(bool),
-    /// Cambia el modo de repetición de la cola (Off/All).
+    /// Cambia el modo de repetición de la cola (Off/All/One).
     SetRepeat(RepeatMode),
     /// Salta a la siguiente recomendación de la cola (Shift+D) y la reproduce.
     NextTrack,
@@ -80,7 +84,17 @@ pub enum BackendCommand {
     PlaylistTracks(i64),
     AddToPlaylist(i64, i64),
     RemoveFromPlaylist(i64, i64),
+    MovePlaylistTrack(i64, i64, usize),
     SetArtworkOverride(i64, String),
+    // ------------------------------------------------------------- L1K3D
+    /// Pide el estado L1K3D completo (tracks "liked") para pintar corazones.
+    LoadLiked,
+    /// Conmuta "liked" de un track (añade/quita de L1K3D) y registra la señal
+    /// `Like`/`Unlike` correspondiente.
+    ToggleLiked(Box<Track>),
+    /// Reproduce una playlist COMPLETA como cola EXPLÍCITA (origen Playlist, no
+    /// autoplay): la lista queda encolada y arranca por su primera canción.
+    PlayPlaylist(i64),
 }
 
 /// Servicios de la capa de Aplicación usados por la TUI.
@@ -392,6 +406,17 @@ impl Backend {
                 };
                 Some(state)
             }
+            BackendCommand::ReplaceAutoplay(tracks) => {
+                // Tecla `R`: renueva SOLO el fondo autoplay. Las elecciones
+                // explícitas (current + Play Next + playlist/search) sobreviven
+                // y conservan su orden; solo se redibuja el segmento automático.
+                let (queue, origins) = {
+                    let mut guard = self.queue.lock().await;
+                    guard.replace_autoplay(&tracks);
+                    (guard.tracks().to_vec(), guard.origins().to_vec())
+                };
+                Some(BackendEvent::Queue { queue, origins })
+            }
             BackendCommand::SetShuffle(on) => {
                 let state = {
                     let mut guard = self.queue.lock().await;
@@ -424,22 +449,26 @@ impl Backend {
     /// Comandos pesados (red, caché de letras/miniaturas, playlists, `Play`):
     /// se ejecutan sobre un clon del backend, en una tarea propia, para no
     /// bloquear los controles de reproducción.
-    async fn handle_heavy(&self, cmd: BackendCommand) -> Option<BackendEvent> {
+    ///
+    /// Devuelve una lista de eventos (una mutación puede emitir varios, p. ej.
+    /// L1K3DChanged + refresco del listado): el loop de la UI los aplica en
+    /// orden sin necesitar re-consultas por cada efecto colateral.
+    async fn handle_heavy(&self, cmd: BackendCommand) -> Vec<BackendEvent> {
         match cmd {
             BackendCommand::Search(query) => {
                 if self.search.aggregator().is_empty() {
-                    Some(BackendEvent::Message(
+                    vec![BackendEvent::Message(
                         "No hay fuentes de catálogo activas (revisa los feature flags en .env)."
                             .to_string(),
-                    ))
+                    )]
                 } else {
                     let outcome = self.search.search_tracks(&query, 10).await;
                     match outcome {
-                        Ok(outcome) => Some(BackendEvent::SearchResults {
+                        Ok(outcome) => vec![BackendEvent::SearchResults {
                             query,
                             outcome: Box::new(outcome),
-                        }),
-                        Err(e) => Some(BackendEvent::Error(format!("búsqueda: {e}"))),
+                        }],
+                        Err(e) => vec![BackendEvent::Error(format!("búsqueda: {e}"))],
                     }
                 }
             }
@@ -450,11 +479,11 @@ impl Backend {
                     ids.insert(track.source, ext);
                 }
                 match self.search.save_track(&track, &ids).await {
-                    Ok(internal_id) => Some(BackendEvent::TrackSaved {
+                    Ok(internal_id) => vec![BackendEvent::TrackSaved {
                         track: Box::new(track),
                         internal_id,
-                    }),
-                    Err(e) => Some(BackendEvent::Error(format!("guardar: {e}"))),
+                    }],
+                    Err(e) => vec![BackendEvent::Error(format!("guardar: {e}"))],
                 }
             }
             BackendCommand::Play(track) => {
@@ -462,19 +491,19 @@ impl Backend {
                 // (Los contextos Queue/Autoplay salen de `skip_track` y
                 // `autoplay_next`.)
                 match self.start_and_record(*track, PlayContext::Manual).await {
-                    Ok((status, stats)) => Some(BackendEvent::PlaybackStarted { status, stats }),
-                    Err(e) => Some(BackendEvent::PlaybackError(e)),
+                    Ok((status, stats)) => vec![BackendEvent::PlaybackStarted { status, stats }],
+                    Err(e) => vec![BackendEvent::PlaybackError(e)],
                 }
             }
             BackendCommand::NextTrack => match self.skip_track(true).await {
-                Ok(Some((status, stats))) => Some(BackendEvent::PlaybackStarted { status, stats }),
-                Ok(None) => None,
-                Err(e) => Some(BackendEvent::Message(e)),
+                Ok(Some((status, stats))) => vec![BackendEvent::PlaybackStarted { status, stats }],
+                Ok(None) => Vec::new(),
+                Err(e) => vec![BackendEvent::Message(e)],
             },
             BackendCommand::PrevTrack => match self.skip_track(false).await {
-                Ok(Some((status, stats))) => Some(BackendEvent::PlaybackStarted { status, stats }),
-                Ok(None) => None,
-                Err(e) => Some(BackendEvent::Message(e)),
+                Ok(Some((status, stats))) => vec![BackendEvent::PlaybackStarted { status, stats }],
+                Ok(None) => Vec::new(),
+                Err(e) => vec![BackendEvent::Message(e)],
             },
             BackendCommand::LoadRelated(track, generation) => {
                 let track = *track;
@@ -530,20 +559,29 @@ impl Backend {
                     );
                     (queue_guard.tracks().to_vec(), queue_guard.origins().to_vec())
                 };
-                Some(BackendEvent::Related {
+                vec![BackendEvent::Related {
                     track: Box::new(track),
                     related,
                     queue,
                     origins,
                     synced,
                     generation,
-                })
+                }]
             }
             BackendCommand::Thumbnail(track) => {
                 let track = *track;
                 let key = track.identifier();
                 let state = self.thumbnails.prepare(&track).await;
-                Some(BackendEvent::Thumbnail { key, state })
+                // La paleta del artwork se persiste UNA vez, al decodificar
+                // (nunca durante el render): queda como caché reutilizable y
+                // el karaoke/visual pueden leerla aunque la miniatura aún no
+                // estuviera decodificada en memoria.
+                if let (ThumbnailState::Loaded(img), true) = (&state, track.id > 0) {
+                    if let Some(palette) = img.palette {
+                        let _ = self.db.set_track_palette(track.id, palette).await;
+                    }
+                }
+                vec![BackendEvent::Thumbnail { key, state }]
             }
             // `Seek` puede bloquear hasta que la región objetivo del stream
             // quede descargada (streams HTTP progresivos): fuera del loop para
@@ -555,55 +593,162 @@ impl Backend {
             BackendCommand::Seek(secs, for_track) => {
                 let stale = Self::seek_is_stale(self.current.lock().await.as_ref(), &for_track);
                 if stale {
-                    return None;
+                    return Vec::new();
                 }
                 match self.router.seek(Duration::from_secs(secs)).await {
-                    Ok(status) => Some(BackendEvent::Playback(status)),
-                    Err(e) => Some(BackendEvent::PlaybackError(e.to_string())),
+                    Ok(status) => vec![BackendEvent::Playback(status)],
+                    Err(e) => vec![BackendEvent::PlaybackError(e.to_string())],
                 }
             }
             // ------------------------------------------------------ playlists
             BackendCommand::ListPlaylists => match self.db.list_playlists().await {
-                Ok(pls) => Some(BackendEvent::Playlists(pls)),
-                Err(e) => Some(BackendEvent::Error(format!("playlists: {e}"))),
+                Ok(pls) => vec![BackendEvent::Playlists(pls)],
+                Err(e) => vec![BackendEvent::Error(format!("playlists: {e}"))],
             },
             BackendCommand::CreatePlaylist(name) => match self.db.create_playlist(&name).await {
-                Ok(_) => Some(self.ok_playlists()),
-                Err(e) => Some(BackendEvent::Error(format!("crear playlist: {e}"))),
+                Ok(_) => self.refresh_playlists().await,
+                Err(e) => vec![BackendEvent::Error(format!("crear playlist: {e}"))],
             },
             BackendCommand::RenamePlaylist(id, name) => {
                 match self.db.rename_playlist(id, &name).await {
-                    Ok(()) => Some(self.ok_playlists()),
-                    Err(e) => Some(BackendEvent::Error(format!("renombrar playlist: {e}"))),
+                    Ok(()) => self.refresh_playlists().await,
+                    Err(e) => vec![BackendEvent::Error(format!("renombrar playlist: {e}"))],
                 }
             }
             BackendCommand::DeletePlaylist(id) => match self.db.delete_playlist(id).await {
-                Ok(()) => Some(self.ok_playlists()),
-                Err(e) => Some(BackendEvent::Error(format!("borrar playlist: {e}"))),
+                Ok(()) => self.refresh_playlists().await,
+                Err(e) => vec![BackendEvent::Error(format!("borrar playlist: {e}"))],
             },
             BackendCommand::PlaylistTracks(id) => match self.db.playlist_tracks(id).await {
-                Ok(tracks) => Some(BackendEvent::PlaylistTracks {
+                Ok(tracks) => vec![BackendEvent::PlaylistTracks {
                     playlist_id: id,
                     tracks,
-                }),
-                Err(e) => Some(BackendEvent::Error(format!("tracks playlist: {e}"))),
+                }],
+                Err(e) => vec![BackendEvent::Error(format!("tracks playlist: {e}"))],
             },
             BackendCommand::AddToPlaylist(pid, tid) => {
                 match self.db.add_to_playlist(pid, tid).await {
-                    Ok(()) => Some(self.ok_playlists()),
-                    Err(e) => Some(BackendEvent::Error(format!("añadir: {e}"))),
+                    Ok(()) => self.refresh_playlists().await,
+                    Err(e) => vec![BackendEvent::Error(format!("añadir: {e}"))],
                 }
             }
             BackendCommand::RemoveFromPlaylist(pid, tid) => {
                 match self.db.remove_from_playlist(pid, tid).await {
-                    Ok(()) => Some(self.ok_playlists()),
-                    Err(e) => Some(BackendEvent::Error(format!("quitar: {e}"))),
+                    Ok(()) => self.refresh_playlists().await,
+                    Err(e) => vec![BackendEvent::Error(format!("quitar: {e}"))],
+                }
+            }
+            BackendCommand::MovePlaylistTrack(pid, tid, to) => {
+                match self.db.move_playlist_track(pid, tid, to).await {
+                    Ok(()) => match self.db.playlist_tracks(pid).await {
+                        Ok(tracks) => vec![
+                            BackendEvent::PlaylistTracks {
+                                playlist_id: pid,
+                                tracks,
+                            },
+                            BackendEvent::Message("Playlist reordenada.".to_string()),
+                        ],
+                        Err(e) => vec![BackendEvent::Error(format!("tracks playlist: {e}"))],
+                    },
+                    Err(e) => vec![BackendEvent::Error(format!("reordenar: {e}"))],
                 }
             }
             BackendCommand::SetArtworkOverride(tid, image) => {
                 match self.db.set_artwork_override(tid, &image).await {
-                    Ok(()) => Some(BackendEvent::Message("Portada actualizada.".to_string())),
-                    Err(e) => Some(BackendEvent::Error(format!("portada: {e}"))),
+                    Ok(()) => vec![BackendEvent::Message("Portada actualizada.".to_string())],
+                    Err(e) => vec![BackendEvent::Error(format!("portada: {e}"))],
+                }
+            }
+            // ------------------------------------------------------------- L1K3D
+            BackendCommand::LoadLiked => match self.db.liked_track_ids().await {
+                Ok(ids) => vec![BackendEvent::L1K3D(ids)],
+                Err(e) => vec![BackendEvent::Error(format!("L1K3D: {e}"))],
+            },
+            BackendCommand::ToggleLiked(track) => {
+                let track = *track;
+                // Primero se persiste el track (id interno canónico). La señal
+                // Like/Unlike queda ligada a ese id, igual que todo lo demás.
+                let mut ids = HashMap::new();
+                if let Some(ext) = track.external_id.clone() {
+                    ids.insert(track.source, ext);
+                }
+                let internal_id = match self.search.save_track(&track, &ids).await {
+                    Ok(id) => id,
+                    Err(e) => return vec![BackendEvent::Error(format!("guardar: {e}"))],
+                };
+                let liked = match self.db.is_liked(internal_id).await {
+                    Ok(l) => l,
+                    Err(e) => return vec![BackendEvent::Error(format!("L1K3D: {e}"))],
+                };
+                let toggled_on = !liked;
+                if let Err(e) = self.db.set_liked(internal_id, toggled_on).await {
+                    return vec![BackendEvent::Error(format!("L1K3D: {e}"))];
+                }
+                // Señal de interacción real del usuario: `Like`/`Unlike` (jamás
+                // `PlaylistAdd` — me gusta ≠ meter en una lista normal).
+                let _ = self
+                    .db
+                    .record_signal(
+                        internal_id,
+                        if toggled_on { SignalKind::Like } else { SignalKind::Unlike },
+                        PlayContext::Manual,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                let mut ev = vec![BackendEvent::L1K3DChanged {
+                    track: Box::new(track),
+                    liked: toggled_on,
+                }];
+                // El contador de L1K3D en el listado debe reflejar el cambio.
+                ev.extend(self.refresh_playlists().await);
+                ev
+            }
+            BackendCommand::PlayPlaylist(playlist_id) => {
+                match self.db.playlist_tracks(playlist_id).await {
+                    Ok(playlist_tracks) if !playlist_tracks.is_empty() => {
+                        // La playlist se impone como COLA EXPLÍCITA (origen
+                        // Playlist, no autoplay): reproduce justo lo que el
+                        // usuario eligió, en su orden persistente.
+                        let (len, shuffle, repeat) = {
+                            let mut queue_guard = self.queue.lock().await;
+                            queue_guard.set_tracks_with_origin(
+                                playlist_tracks.clone(),
+                                crate::playback::QueueItemOrigin::Playlist,
+                            );
+                            (
+                                queue_guard.len(),
+                                queue_guard.shuffle_active(),
+                                queue_guard.repeat(),
+                            )
+                        };
+                        let order = {
+                            let q = self.queue.lock().await;
+                            (q.tracks().to_vec(), q.origins().to_vec())
+                        };
+                        let mut ev = vec![
+                            BackendEvent::Queue {
+                                queue: order.0,
+                                origins: order.1,
+                            },
+                            BackendEvent::QueueState {
+                                shuffle,
+                                repeat,
+                                len,
+                            },
+                        ];
+                        let first = playlist_tracks[0].clone();
+                        match self.start_and_record(first, PlayContext::Manual).await {
+                            Ok((status, stats)) => {
+                                ev.push(BackendEvent::PlaybackStarted { status, stats })
+                            }
+                            Err(e) => ev.push(BackendEvent::PlaybackError(e)),
+                        }
+                        ev
+                    }
+                    Ok(_) => vec![BackendEvent::Message("La playlist no tiene canciones.".to_string())],
+                    Err(e) => vec![BackendEvent::Error(format!("playlist: {e}"))],
                 }
             }
             // Comandos ligeros: se procesan en línea en `handle`.
@@ -611,9 +756,14 @@ impl Backend {
         }
     }
 
-    fn ok_playlists(&self) -> BackendEvent {
-        // Respuesta silenciosa para mutaciones: refresca el listado.
-        BackendEvent::Message("Playlists actualizadas".to_string())
+    /// Eventos de refresco tras una mutación de playlists: el listado y —si la
+    /// mutación tocó L1K3D— el estado de "likes" se re-emiten para que la UI
+    /// nunca se quede con contadores o corazones obsoletos.
+    async fn refresh_playlists(&self) -> Vec<BackendEvent> {
+        match self.db.list_playlists().await {
+            Ok(pls) => vec![BackendEvent::Playlists(pls)],
+            Err(e) => vec![BackendEvent::Error(format!("playlists: {e}"))],
+        }
     }
 
     /// Track de la cola en la dirección pedida, relativo al último reproducido
@@ -881,7 +1031,7 @@ pub fn spawn_backend(
                                 let backend = backend.clone();
                                 let event_tx = event_tx.clone();
                                 tokio::spawn(async move {
-                                    if let Some(event) = backend.handle_heavy(cmd).await {
+                                    for event in backend.handle_heavy(cmd).await {
                                         let _ = event_tx.send(event);
                                     }
                                 });
@@ -1105,7 +1255,11 @@ fn is_heavy(cmd: &BackendCommand) -> bool {
             | BackendCommand::PlaylistTracks(_)
             | BackendCommand::AddToPlaylist(..)
             | BackendCommand::RemoveFromPlaylist(..)
+            | BackendCommand::MovePlaylistTrack(..)
             | BackendCommand::SetArtworkOverride(..)
+            | BackendCommand::LoadLiked
+            | BackendCommand::ToggleLiked(_)
+            | BackendCommand::PlayPlaylist(_)
     )
 }
 

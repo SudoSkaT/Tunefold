@@ -34,6 +34,14 @@ pub enum RepeatMode {
     All,
     /// Se detiene en el extremo (`None`).
     Off,
+    /// Reinicia la canción actual al avanzar (por extremo o manualmente).
+    ///
+    /// Preparado de forma estable (FASE "repeat one"): con `One` activo,
+    /// `pick` devuelve SIEMPRE el track ancla (repetir la actual) mientras el
+    /// ancla exista; sin ancla (cola recién creada) se comporta como `All`.
+    /// Es deliberadamente conservador: no altera las semánticas de `Off`/`All`
+    /// ni del shuffle, y el anti-bucle de "recientes" sigue intacto.
+    One,
 }
 
 /// De dónde vino cada elemento de la cola: permite a la UI distinguir la
@@ -205,7 +213,7 @@ impl QueueManager {
             self.tracks.iter().map(|t| t.identifier()).collect();
         let mut added = 0;
         for t in candidates {
-            if self.tracks.len() + added >= MAX_QUEUE {
+            if self.tracks.len() >= MAX_QUEUE {
                 break;
             }
             let id = t.identifier();
@@ -219,6 +227,44 @@ impl QueueManager {
             added += 1;
         }
         if added > 0 && self.shuffle {
+            let anchor = self.anchor_index(None);
+            self.reshuffle(anchor);
+        }
+        added
+    }
+
+    /// Reemplaza SOLO el segmento de autoplay de la cola (los elementos de
+    /// origen [`QueueItemOrigin::Recommendation`]).
+    ///
+    /// Cola temporal / autoplay (FASE arquitectura de colas): las elecciones
+    /// EXPLÍCITAS del usuario — `User` (reproducir canción concreta), `Search`
+    /// (añadidos desde búsqueda) y `Playlist` (que impone una playlist como
+    /// cola) — NO se destruyen. La acción "R" de la vista de recomendaciones
+    /// refresca únicamente el fondo automático; lo que el usuario añadió fila a
+    /// fila sobrevive y el orden explícito se conserva.
+    ///
+    /// Devuelve cuántos candidatos entraron como autoplay nuevo (dedupe contra
+    /// lo explícito superviviente + recientes). Nunca supera [`MAX_QUEUE`].
+    pub fn replace_autoplay(&mut self, candidates: &[Track]) -> usize {
+        // 1) El autoplay viejo sale (solo origen automático).
+        let mut kept_tracks = Vec::with_capacity(self.tracks.len());
+        let mut kept_origins = Vec::with_capacity(self.origins.len());
+        for (t, o) in self.tracks.drain(..).zip(self.origins.drain(..)) {
+            if o.is_auto() {
+                continue;
+            }
+            kept_tracks.push(t);
+            kept_origins.push(o);
+        }
+        self.tracks = kept_tracks;
+        self.origins = kept_origins;
+        self.order.clear();
+
+        // 2) El autoplay fresco entra después de lo explícito, con dedupe.
+        let added = self.append_unique_with_origin(candidates, QueueItemOrigin::Recommendation);
+
+        // 3) El shuffle se re-ancla al track actual (si sigue en la cola).
+        if self.shuffle {
             let anchor = self.anchor_index(None);
             self.reshuffle(anchor);
         }
@@ -260,6 +306,14 @@ impl QueueManager {
         if self.tracks.is_empty() {
             return None;
         }
+        if self.repeat == RepeatMode::One {
+            // Repeat One: siguiente/anterior reinician la canción actual
+            // mientras exista el ancla (sin ancla, la cola nueva se comporta
+            // como All). Conservador por diseño: no afecta Off/All ni shuffle.
+            if let Some(idx) = self.anchor_index(anchor) {
+                return Some(self.tracks[idx].clone());
+            }
+        }
         if self.shuffle {
             return self.pick_shuffled(forward, anchor);
         }
@@ -275,10 +329,14 @@ impl QueueManager {
                         return None;
                     }
                 }
+                // Con ancla, `pick` ya devolvió el track actual (early-return).
+                // Sin ancla cae en el caso null; aquí solo por exhaustividad.
+                RepeatMode::One => (i + 1) % n,
             },
             (Some(i), false) => match self.repeat {
                 RepeatMode::All => (i + n - 1) % n,
                 RepeatMode::Off => i.checked_sub(1)?,
+                RepeatMode::One => (i + n - 1) % n,
             },
             // Ancla desconocida: primero (hacia adelante) o último (atrás),
             // como la cola histórica.
@@ -308,10 +366,12 @@ impl QueueManager {
                         return None;
                     }
                 }
+                RepeatMode::One => (p + 1) % n,
             },
             (Some(p), false) => match self.repeat {
                 RepeatMode::All => (p + n - 1) % n,
                 RepeatMode::Off => p.checked_sub(1)?,
+                RepeatMode::One => (p + n - 1) % n,
             },
             (None, true) => 0,
             (None, false) => n - 1,
@@ -713,5 +773,127 @@ mod tests {
         assert!(!QueueItemOrigin::User.is_auto());
         assert!(!QueueItemOrigin::Playlist.is_auto());
         assert!(!QueueItemOrigin::Search.is_auto());
+    }
+
+    // ------------------------------------------------- repeat one (FASE)
+    // "Repeat One" se prepara de forma ESTABLE: reinicia la canción actual sin
+    // tocar las semánticas de Off/All, del shuffle ni del anti-bucle.
+
+    #[test]
+    fn repeat_one_replays_the_anchor_track() {
+        let mut q = queue(&["a", "b", "c"]);
+        q.mark_played("b");
+        q.set_repeat(RepeatMode::One);
+        assert_eq!(id(&q.pick(true, None)), "b", "avance: repite la actual");
+        assert_eq!(id(&q.pick(false, None)), "b", "retroceso: repite la actual");
+    }
+
+    #[test]
+    fn repeat_one_falls_back_to_all_without_an_anchor() {
+        // Cola recién creada (sin último reproducido): se comporta como All.
+        let mut q = queue(&["a", "b"]);
+        q.set_repeat(RepeatMode::One);
+        assert_eq!(id(&q.pick(true, None)), "a", "sin ancla: desde el primero");
+        q.mark_played("a");
+        assert_eq!(id(&q.pick(true, None)), "a", "con ancla ya repite");
+    }
+
+    #[test]
+    fn repeat_one_does_not_break_shuffle_setup() {
+        let mut q = queue(&["a", "b", "c", "d"]);
+        q.mark_played("a");
+        q.set_shuffle(true);
+        q.set_repeat(RepeatMode::One);
+        // La permutación sigue bien formada y anclada; One repite la actual.
+        assert_eq!(id(&q.pick(true, None)), "a");
+        assert_eq!(q.len(), 4);
+    }
+
+    #[test]
+    fn repeat_one_still_replays_when_anchor_unknown_track_removed() {
+        // Si el ancla desapareció de la cola, One cae al primer candidato
+        // (sin colgarse ni devolver un track ajeno).
+        let mut q = queue(&["a", "b"]);
+        q.mark_played("zz");
+        q.set_repeat(RepeatMode::One);
+        assert_eq!(id(&q.pick(true, None)), "a");
+    }
+
+    // ------------------------------------------------- replace autoplay (FASE)
+    // Semántica "R": reemplaza SOLO el autoplay; lo explícito del usuario
+    // sobrevive.
+
+    #[test]
+    fn replace_autoplay_keeps_explicit_items_and_drops_autoplay() {
+        let mut q = QueueManager::with_seed(7);
+        // Usuario reproduce una canción desde búsqueda (explícita) y después
+        // el autoplay añade fondo.
+        q.set_tracks_with_origin(vec![track("user-a")], QueueItemOrigin::User);
+        q.append_unique_with_origin(&[track("auto-1"), track("auto-2")], QueueItemOrigin::Recommendation);
+
+        let added = q.replace_autoplay(&[track("fresh-1"), track("fresh-2"), track("fresh-3")]);
+        assert_eq!(added, 3);
+        // El explícito sigue PRIMERO y con su origen intacto.
+        assert_eq!(q.tracks()[0].identifier(), "user-a");
+        assert_eq!(q.origin_at(0), Some(QueueItemOrigin::User));
+        // Los autos viejos se fueron; entraron los frescos.
+        assert!(q.tracks().iter().all(|t| t.identifier() != "auto-1"));
+        assert_eq!(q.tracks().len(), 4);
+        assert!(q.tracks().iter().all(|t| {
+            let pos = q.tracks().iter().position(|x| x.identifier() == t.identifier()).unwrap();
+            if t.identifier() == "user-a" {
+                q.origin_at(pos) == Some(QueueItemOrigin::User)
+            } else {
+                q.origin_at(pos) == Some(QueueItemOrigin::Recommendation)
+            }
+        }));
+    }
+
+    #[test]
+    fn replace_autoplay_dedupes_against_explicit_and_recent() {
+        let mut q = QueueManager::with_seed(7);
+        q.set_tracks_with_origin(vec![track("shared")], QueueItemOrigin::Playlist);
+        q.mark_played("shared");
+        q.append_unique_with_origin(&[track("old-auto")], QueueItemOrigin::Recommendation);
+
+        // "shared" está en lo explícito (y es reciente): no se añade como auto.
+        let added = q.replace_autoplay(&[track("shared"), track("new-auto")]);
+        assert_eq!(added, 1, "solo entra new-auto (shared es explícito+reciente)");
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.origin_at(0), Some(QueueItemOrigin::Playlist));
+        assert_eq!(q.origin_at(1), Some(QueueItemOrigin::Recommendation));
+    }
+
+    #[test]
+    fn replace_autoplay_with_no_explicit_just_refreshes_background() {
+        let mut q = QueueManager::with_seed(7);
+        q.append_unique(&[track("x"), track("y")]);
+        let added = q.replace_autoplay(&[track("p"), track("q")]);
+        assert_eq!(added, 2);
+        assert_eq!(q.tracks().len(), 2, "el autoplay viejo se descartó del todo");
+        assert_eq!(id(&q.pick(true, None)), "p");
+    }
+
+    #[test]
+    fn replace_autoplay_stays_within_cap_and_keeps_explicit_under_shuffle() {
+        let mut q = QueueManager::with_seed(7);
+        q.set_tracks_with_origin(vec![track("keep")], QueueItemOrigin::User);
+        q.set_shuffle(true);
+        let mut serial = 0usize;
+        let chunk: Vec<Track> = (0..MAX_QUEUE + 50)
+            .map(|_| {
+                serial += 1;
+                track(&format!("f{serial}"))
+            })
+            .collect();
+        let added = q.replace_autoplay(&chunk);
+        assert!(added <= MAX_QUEUE - 1, "el tope reserva el explícito");
+        assert!(q.len() <= MAX_QUEUE);
+        assert!(q.len() >= MAX_QUEUE, "el fondo crece hasta el tope");
+        assert_eq!(
+            q.origin_at(0),
+            Some(QueueItemOrigin::User),
+            "lo explícito sigue primero bajo shuffle"
+        );
     }
 }

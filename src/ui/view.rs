@@ -1,4 +1,4 @@
-//! Vistas de la TUI y su mapeo a atajos de teclado (Shift+1..Shift+7).
+//! Vistas de la TUI y su mapeo a atajos de teclado (Shift+1..Shift+8).
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -11,10 +11,11 @@ pub enum View {
     Metadata,
     History,
     Settings,
+    Playlists,
 }
 
 impl View {
-    pub const ALL: [View; 7] = [
+    pub const ALL: [View; 8] = [
         View::NowPlaying,
         View::Related,
         View::Search,
@@ -22,10 +23,11 @@ impl View {
         View::Metadata,
         View::History,
         View::Settings,
+        View::Playlists,
     ];
 
     /// Atajo de vista. Recibe el `KeyCode` (sin modificadores) y devuelve la
-    /// vista asociada al dígito. Se usa desde `Shift+1..Shift+7` (navegación
+    /// vista asociada al dígito. Se usa desde `Shift+1..Shift+8` (navegación
     /// global) tanto en la UI como en los tests.
     pub fn from_shortcut(key: KeyCode) -> Option<View> {
         match key {
@@ -36,6 +38,7 @@ impl View {
             KeyCode::Char('5') => Some(View::Metadata),
             KeyCode::Char('6') => Some(View::History),
             KeyCode::Char('7') => Some(View::Settings),
+            KeyCode::Char('8') => Some(View::Playlists),
             _ => None,
         }
     }
@@ -44,15 +47,15 @@ impl View {
     /// modificador `SHIFT` junto al dígito: por eso se aceptan las dos formas
     /// en las que puede llegar la tecla:
     ///
-    /// - `Char('1'..'7')` + `SHIFT` (protocolo kitty / CSI-u), independiente
+    /// - `Char('1'..'8')` + `SHIFT` (protocolo kitty / CSI-u), independiente
     ///   del layout del teclado.
     /// - El símbolo que produce el desplazamiento según el layout. Con el
     ///   protocolo kitty y "alternate keys", o en terminales sin ese
     ///   protocolo, llega el carácter desplazado (p. ej. `@` en US, `"` en
     ///   latam) y crossterm puede limpiar el modificador SHIFT.
     ///
-    /// Se cubren los símbolos de `Shift+1..Shift+7` de los layouts US
-    /// (`!@#$%^&`), latam (`!"#$%&/`) y español (`!"·$%&/`). `&` es ambiguo
+    /// Se cubren los símbolos de `Shift+1..Shift+8` de los layouts US
+    /// (`!@#$%^&*`) y latam (`!"#$%&/()`). `&` es ambiguo
     /// (US: Shift+7 · latam/es: Shift+6) y se resuelve hacia latam/es.
     ///
     /// Un dígito suelto (sin `SHIFT`) devuelve `None`.
@@ -77,10 +80,11 @@ impl View {
             View::Metadata => "Metadata",
             View::History => "History",
             View::Settings => "Settings",
+            View::Playlists => "Playlists",
         }
     }
 
-    /// Dígito del atajo (1..7).
+    /// Dígito del atajo (1..8).
     pub fn shortcut_digit(self) -> &'static str {
         match self {
             View::NowPlaying => "1",
@@ -90,11 +94,12 @@ impl View {
             View::Metadata => "5",
             View::History => "6",
             View::Settings => "7",
+            View::Playlists => "8",
         }
     }
 }
 
-/// Símbolo `Shift+dígito` → dígito (1..7), cubriendo los layouts US, latam y
+/// Símbolo `Shift+dígito` → dígito (1..8), cubriendo los layouts US, latam y
 /// español. `&` es ambiguo entre Shift+6 (latam/es) y Shift+7 (US); se elige
 /// latam/es por ser el entorno habitual de esta TUI.
 fn symbol_to_digit(c: char) -> Option<u32> {
@@ -106,6 +111,7 @@ fn symbol_to_digit(c: char) -> Option<u32> {
         '%' => Some(5),
         '^' | '&' => Some(6),
         '/' => Some(7),
+        '*' | '(' => Some(8),
         _ => None,
     }
 }
@@ -131,14 +137,16 @@ mod tests {
         expect_symbol_maps_to_view('$', View::Sources);
         expect_symbol_maps_to_view('%', View::Metadata);
         expect_symbol_maps_to_view('^', View::History);
+        expect_symbol_maps_to_view('*', View::Playlists);
     }
 
     #[test]
     fn latam_layout_shift_symbols_navigate() {
-        // latam: Shift+2 = " (Related), Shift+6 = & (History), Shift+7 = / (Settings).
+        // latam: Shift+2 = " (Related), Shift+6 = & (History), Shift+7 = / (Settings), Shift+8 = ).
         expect_symbol_maps_to_view('"', View::Related);
         expect_symbol_maps_to_view('&', View::History);
         expect_symbol_maps_to_view('/', View::Settings);
+        expect_symbol_maps_to_view('(', View::Playlists);
     }
 
     #[test]
@@ -150,7 +158,7 @@ mod tests {
     #[test]
     fn unrelated_symbols_do_not_navigate() {
         assert_eq!(
-            View::from_shift_key(KeyCode::Char('*'), KeyModifiers::NONE),
+            View::from_shift_key(KeyCode::Char('?'), KeyModifiers::NONE),
             None
         );
         assert_eq!(
