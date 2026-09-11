@@ -1,4 +1,4 @@
-# Tunefold
+# Tunefold (PlayFusion)
 
 Reproductor de música en TUI con motor de análisis y recomendación. Busca
 canciones, resuelve streams de audio, reproduce con rodio/symphonia (análisis
