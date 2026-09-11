@@ -74,7 +74,12 @@ pub async fn run() -> Result<()> {
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
 
     let result = async {
-        let db = Db::connect("data/music.db").await?;
+        let db = Db::connect(
+            crate::infrastructure::dirs::db_path()
+                .to_str()
+                .unwrap_or("data/music.db"),
+        )
+        .await?;
         let backend = Backend::new(db, crate::infrastructure::config::Config::load());
         let (backend_tx, backend_rx) = spawn_backend(backend);
 

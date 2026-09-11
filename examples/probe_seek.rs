@@ -4,12 +4,12 @@
 //!
 //! Uso: cargo run --release --example probe_seek
 
-use playfusion::app::audio::{EventBus, PlaybackEvent};
-use playfusion::app::playback::PlaybackRouter;
-use playfusion::catalog::CatalogProvider;
-use playfusion::domain::stream::MediaSource;
-use playfusion::domain::track::Track;
 use std::time::{Duration, Instant};
+use tunefold::app::audio::{EventBus, PlaybackEvent};
+use tunefold::app::playback::PlaybackRouter;
+use tunefold::catalog::CatalogProvider;
+use tunefold::domain::stream::MediaSource;
+use tunefold::domain::track::Track;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,20 +26,20 @@ async fn main() -> anyhow::Result<()> {
     let track = results.first().cloned().unwrap_or_else(|| {
         Track::new(
             "I Want To Break Free".to_string(),
-            vec![playfusion::domain::artist::Artist::new(
+            vec![tunefold::domain::artist::Artist::new(
                 "Queen".to_string(),
                 None,
                 None,
                 None,
             )],
-            playfusion::domain::source::Source::YouTube,
+            tunefold::domain::source::Source::YouTube,
         )
     });
     println!("pista: {} ({})", track.title, track.identifier());
 
     let (bus, joined) = EventBus::channel();
-    let (engine_config, _features) = playfusion::infrastructure::playback::build_engines(
-        &playfusion::infrastructure::config::Config::default(),
+    let (engine_config, _features) = tunefold::infrastructure::playback::build_engines(
+        &tunefold::infrastructure::config::Config::default(),
         bus,
         reqwest::Client::new(),
     );
@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         .resolve_audio_url(&track)
         .await?
         .expect("stream resoluble");
-    let source = MediaSource::Remote(playfusion::domain::stream::RemoteStream {
+    let source = MediaSource::Remote(tunefold::domain::stream::RemoteStream {
         url,
         headers: context_headers(),
     });
@@ -102,4 +102,4 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-use playfusion::providers::youtube::{context_headers, YouTubeAdapter};
+use tunefold::providers::youtube::{context_headers, YouTubeAdapter};

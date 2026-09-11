@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn media_source_carries_uri_and_headers() {
         let mut r = StreamResolution::new(Source::YouTube, "https://cdn/stream");
-        r.headers = vec![("User-Agent".into(), "PlayFusion".into())];
+        r.headers = vec![("User-Agent".into(), "Tunefold".into())];
         let Some(MediaSource::Remote(stream)) = r.media_source() else {
             panic!("una URI https produce fuente remota");
         };

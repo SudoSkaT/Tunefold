@@ -22,7 +22,7 @@ use crate::recommendation::{
 /// - `meta` (0.25): la similitud de metadata (artista, género, álbum, año) es
 ///   la forma más robusta de descubrir contenido parecido si faltan perfiles
 ///   acústicos.
-/// - `acoustic` (0.20): la similitud acústica real (features que PlayFusion ya
+/// - `acoustic` (0.20): la similitud acústica real (features que Tunefold ya
 ///   analiza) refina el resultado, pero pesa menos que la afinidad porque el
 ///   perfil acústico del usuario y de los tracks puede estar incompleto.
 /// - `recency` (0.15): favorece lo escuchado hace poco (interés vigente) sobre

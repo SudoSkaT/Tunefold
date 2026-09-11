@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    name: clippy (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "--features youtube"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
+
+  test:
+    name: test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "--features youtube"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --lib ${{ matrix.features }}
+
+  licenses:
+    name: license allowlist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install --locked cargo-license
+      - name: Check licenses allowlist
+        run: |
+          set -euo pipefail
+          # Verdes/MIT/Apache/MPL permitidas + GPL solo para rustypipe (vendored).
+          cargo license --all-features --avoid-dev-deps | sort -u > /tmp/licenses.txt
+          if rg -i "GPL" /tmp/licenses.txt | rg -v "General Public License (v2|v3)" ; then
+            echo "Licencia GPL inesperada en /tmp/licenses.txt"; grep -i gpl /tmp/licenses.txt; exit 1
+          fi
+          # MPL permitida (symphonia); nada de AGPL/LGPL/CC-BY-SA no permitidas.
+          if rg -i "AGPL|CC-BY|proprietary|UNLICENSED" /tmp/licenses.txt; then
+            exit 1
+          fi
+          echo "Licencias OK:"; cat /tmp/licenses.txt

@@ -18,16 +18,18 @@ use async_trait::async_trait;
 use rustypipe::client::{ClientType, RustyPipe};
 use rustypipe::model::{MusicAlbum, MusicArtist};
 
-use super::lyrics::fetch_lrclib_lyrics;
 use super::mapper::{best_thumbnail, map_track, THUMB_FALLBACK};
 use crate::catalog::{CatalogError as ProviderError, CatalogProvider};
 use crate::domain::source::Source;
 use crate::domain::{album::Album, artist::Artist, track::Track};
 use crate::media::FailureCategory;
+use crate::providers::lyrics::fetch_lrclib_lyrics;
 
 /// Directorio donde rustypipe guarda su caché (`rustypipe_cache.json`,
-/// `bg_snapshot.bin` y reportes) para no persistir en la raíz del proyecto.
-const CACHE_DIR: &str = "data/youtube";
+/// `bg_snapshot.bin` y reportes): `~/.cache/tunefold/rustypipe` (XDG).
+fn cache_dir() -> std::path::PathBuf {
+    crate::infrastructure::dirs::cache_dir().join("rustypipe")
+}
 
 /// Número máximo de intentos de resolución de stream. Cada intento fuerza un
 /// visitor_data nuevo (YouTube marca como bloqueado el del pool cacheado y sus
@@ -131,9 +133,10 @@ impl YoutubeProvider {
     /// Construye el proveedor con opciones (política de proxy).
     pub fn with_options(options: YoutubeOptions) -> Self {
         // Asegura el directorio de caché de rustypipe (usage en write).
-        let _ = std::fs::create_dir_all(CACHE_DIR);
+        let cache_dir = cache_dir();
+        let _ = std::fs::create_dir_all(&cache_dir);
         let client = RustyPipe::builder()
-            .storage_dir(CACHE_DIR)
+            .storage_dir(cache_dir.to_str().unwrap_or("data/youtube"))
             .build()
             .expect("cliente rustypipe válido");
         let apply_proxy = |b: reqwest::ClientBuilder| {

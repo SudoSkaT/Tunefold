@@ -1,4 +1,4 @@
-//! PlayFusion: reproductor de música en TUI con arquitectura de media engine
+//! Tunefold: reproductor de música en TUI con arquitectura de media engine
 //! donde YouTube es solamente una posible fuente (spec §45).
 //!
 //! Capas:

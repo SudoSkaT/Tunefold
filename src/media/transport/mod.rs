@@ -61,14 +61,17 @@ impl Default for RangePolicy {
 }
 
 impl RangePolicy {
-    /// Política leída del entorno: `PLAYFUSION_RANGE_WINDOW_KIB` ajusta el
-    /// tamaño de ventana (clampado 32–4096 KiB). El resto queda por defecto.
+    /// Política leída del entorno: `TUNEFOLD_RANGE_WINDOW_KIB` ajusta el
+    /// tamaño de ventana (clampado 32–4096 KiB). Se acepta el nombre legacy
+    /// `PLAYFUSION_RANGE_WINDOW_KIB` como alias. El resto queda por defecto.
     pub fn from_env() -> Self {
         let mut p = Self::default();
-        if let Some(kib) = std::env::var("PLAYFUSION_RANGE_WINDOW_KIB")
+        let cur = std::env::var("PLAYFUSION_RANGE_WINDOW_KIB").ok();
+        let kib = std::env::var("TUNEFOLD_RANGE_WINDOW_KIB")
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        {
+            .or(cur)
+            .and_then(|v| v.parse::<u64>().ok());
+        if let Some(kib) = kib {
             p.window_size = kib.clamp(32, 4096) * 1024;
         }
         p

@@ -329,7 +329,7 @@ impl App {
                     "Autoplay desactivado.".to_string()
                 });
             }
-                        // Contenido de la banda superior (spec §16): Auto → letras si las
+            // Contenido de la banda superior (spec §16): Auto → letras si las
             // hay, si no el visualizador; Letras y Visual fuerzan su modo. El
             // cambio es puro de presentación: no regenera recomendaciones, no
             // toca la reproducción y no destruye el estado del otro modo.
@@ -454,14 +454,10 @@ impl App {
             //   elecciones explícitas del usuario (current, play next, añadidas
             //   desde búsqueda/playlist) sobreviven; solo se reemplaza el fondo
             //   automático por las recomendaciones frescas.
-            KeyCode::Char('r')
-                if self.view == View::Related || self.view == View::NowPlaying =>
-            {
+            KeyCode::Char('r') if self.view == View::Related || self.view == View::NowPlaying => {
                 self.reload_related();
             }
-            KeyCode::Char('R')
-                if self.view == View::Related || self.view == View::NowPlaying =>
-            {
+            KeyCode::Char('R') if self.view == View::Related || self.view == View::NowPlaying => {
                 self.replace_related_queue();
             }
             // Me gusta (L1K3D): `l` conmuta el corazón del track en curso, se
@@ -469,7 +465,8 @@ impl App {
             // backend confirma con `L1K3DChanged` (fuente autoritativa).
             KeyCode::Char('l') => {
                 let Some(track) = self.now_playing.clone() else {
-                    self.status = Some("Sin canción en curso para marcarla como me gusta.".to_string());
+                    self.status =
+                        Some("Sin canción en curso para marcarla como me gusta.".to_string());
                     return;
                 };
                 let _ = self
@@ -552,11 +549,8 @@ impl App {
         match action {
             playlists::PlaylistAction::None => {}
             playlists::PlaylistAction::Open(id, name) => {
-                self.playlist_view.detail =
-                    Some(playlists::Detail::open(id, name.clone()));
-                let _ = self
-                    .backend_tx
-                    .send(BackendCommand::PlaylistTracks(id));
+                self.playlist_view.detail = Some(playlists::Detail::open(id, name.clone()));
+                let _ = self.backend_tx.send(BackendCommand::PlaylistTracks(id));
                 self.status = Some(format!("Cargando «{name}»..."));
             }
             playlists::PlaylistAction::Play(id) => {
@@ -982,22 +976,24 @@ impl App {
                 let idx = self.related.list_state.selected().unwrap_or(0).min(last);
                 self.related.list_state.select(Some(idx));
                 let added = self.related.tracks.len() - self.related.previous_len;
-                self.status = Some(
-                    if added > 0 {
-                        format!(
+                self.status = Some(if added > 0 {
+                    format!(
                             "{} en cola (+{} nuevas). ↑/↓ selecciona, Enter reproduce, r actualiza, R reemplaza.",
                             self.related.tracks.len(),
                             added
                         )
-                    } else {
-                        format!(
+                } else {
+                    format!(
                             "{} en cola. ↑/↓ o W/S selecciona, Enter reproduce, r actualiza, R reemplaza la cola.",
                             self.related.tracks.len()
                         )
-                    },
-                );
+                });
             }
-            BackendEvent::QueueState { shuffle, repeat, len } => {
+            BackendEvent::QueueState {
+                shuffle,
+                repeat,
+                len,
+            } => {
                 // El backend es la autoridad de la cola; la UI adopta el estado
                 // (útil si alguna otra acción lo cambió, p. ej. reemplazar).
                 self.shuffle = shuffle;
@@ -1023,7 +1019,10 @@ impl App {
                     self.playlist_view.listing.select(Some(sel.min(max)));
                 }
             }
-            BackendEvent::PlaylistTracks { playlist_id, tracks } => {
+            BackendEvent::PlaylistTracks {
+                playlist_id,
+                tracks,
+            } => {
                 let Some(detail) = self.playlist_view.detail.as_mut() else {
                     return;
                 };
@@ -1033,11 +1032,9 @@ impl App {
                 // La lista del detalle entra con origen Playlist (mismas
                 // marcas/orígenes que el resto de listas de la app).
                 let n = tracks.len();
-                let origins = std::iter::repeat_n(
-                    crate::playback::queue::QueueItemOrigin::Playlist,
-                    n,
-                )
-                .collect();
+                let origins =
+                    std::iter::repeat_n(crate::playback::queue::QueueItemOrigin::Playlist, n)
+                        .collect();
                 detail.tracks.set_queue(tracks, origins);
                 if !detail.tracks.tracks.is_empty() {
                     detail.tracks.list_state.select(Some(0));
@@ -1103,7 +1100,7 @@ impl App {
         let text = vec![
             Line::styled(
                 format!(
-                    " PlayFusion — {} · {}",
+                    " Tunefold — {} · {}",
                     self.view.label(),
                     self.playback_line()
                 ),
@@ -1205,10 +1202,7 @@ impl App {
                     // al superar la última línea del LRC.
                     self.playback.state == PlaybackState::Stopped,
                     self.visual_mode,
-                    self.now_playing
-                        .as_ref()
-                        .map(|t| t.identifier())
-                        .as_deref(),
+                    self.now_playing.as_ref().map(|t| t.identifier()).as_deref(),
                     &visual,
                     &self.mouse_pos,
                     &mut self.mouse_click,
@@ -1236,10 +1230,7 @@ impl App {
                 area,
                 &mut self.playlist_view,
                 &self.playlists,
-                self.now_playing
-                    .as_ref()
-                    .map(|t| t.identifier())
-                    .as_deref(),
+                self.now_playing.as_ref().map(|t| t.identifier()).as_deref(),
                 &self.mouse_pos,
                 &mut self.mouse_click,
                 &self.listening_stats,
@@ -2013,7 +2004,10 @@ mod tests {
             "el reloj se rebobina con el reinicio del mismo track"
         );
         assert!(app.clock.pending_seek().is_none());
-        assert!(app.related.synced.is_some(), "la letra es de la MISMA canción");
+        assert!(
+            app.related.synced.is_some(),
+            "la letra es de la MISMA canción"
+        );
         assert!(
             app.related.scroll.is_empty(),
             "el karaoke se rebobina con la recuperación"
@@ -2115,7 +2109,10 @@ mod tests {
 
         app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         assert!(
-            sent_skip(&mut rx, BackendCommand::LoadRelated(Box::new(rec_track("song-1")), 0)),
+            sent_skip(
+                &mut rx,
+                BackendCommand::LoadRelated(Box::new(rec_track("song-1")), 0)
+            ),
             "«r» vuelve a pedir las recomendaciones de la canción en curso"
         );
         // No reemplaza la cola: solo re-fetch + append en el backend.
@@ -2780,7 +2777,11 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         assert_eq!(app.repeat, crate::playback::queue::RepeatMode::Off);
         app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-        assert_eq!(app.repeat, crate::playback::queue::RepeatMode::All, "vuelve al inicio");
+        assert_eq!(
+            app.repeat,
+            crate::playback::queue::RepeatMode::All,
+            "vuelve al inicio"
+        );
         app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         assert_eq!(app.repeat, crate::playback::queue::RepeatMode::One);
     }
@@ -2829,7 +2830,9 @@ mod tests {
             ]
         );
         assert!(
-            app.status.as_deref().is_some_and(|s| s.contains("(+2 nuevas)")),
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("(+2 nuevas)")),
             "anuncia las nuevas añadidas: {:?}",
             app.status
         );
@@ -2854,7 +2857,9 @@ mod tests {
         assert!(app.related.new_ids.contains(&rec_track("c").identifier()));
         assert!(!app.related.new_ids.contains(&rec_track("a").identifier()));
         assert!(
-            app.status.as_deref().is_some_and(|s| s.contains("(+1 nuevas)")),
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("(+1 nuevas)")),
             "solo anuncia la realmente nueva: {:?}",
             app.status
         );

@@ -11,7 +11,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use playfusion::analysis::{
+use tunefold::analysis::{
     bands::band_ratios,
     beat::BpmEstimator,
     features::AudioFeatures,
@@ -21,9 +21,9 @@ use playfusion::analysis::{
     smoother::FeatureSmoother,
     AnalysisConfig, AnalysisRuntime, StreamMeta,
 };
-use playfusion::domain::source::Source;
-use playfusion::domain::track::Track;
-use playfusion::visualization::{ParameterMapper, VisualEngine};
+use tunefold::domain::source::Source;
+use tunefold::domain::track::Track;
+use tunefold::visualization::{ParameterMapper, VisualEngine};
 
 const SR: f32 = 44_100.0;
 const FFT: usize = 2048;
@@ -136,7 +136,7 @@ fn main() {
 
     let mut engine = VisualEngine::new(ParameterMapper::default());
     let mut pos_ms = 0u64;
-    let palette = playfusion::visualization::VisualPalette::from_cover(Some([
+    let palette = tunefold::visualization::VisualPalette::from_cover(Some([
         [220, 60, 120],
         [60, 160, 240],
         [240, 180, 90],
@@ -151,7 +151,7 @@ fn main() {
         let backend = ratatui::backend::TestBackend::new(80, 5);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| {
-            playfusion::visualization::render::render(f, f.area(), black_box(&state), 42.0)
+            tunefold::visualization::render::render(f, f.area(), black_box(&state), 42.0)
         })
         .unwrap();
     });

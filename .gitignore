@@ -15,4 +15,3 @@ vendor/**/target/
 .vscode/
 *.swp
 .DS_Store
-docs/

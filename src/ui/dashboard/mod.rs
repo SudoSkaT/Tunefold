@@ -78,9 +78,7 @@ pub fn render(
         related.tracks.len(),
         if autoplay { "ON" } else { "OFF" }
     );
-    let title = format!(
-        " Recomendaciones · {queue_txt} ",
-    );
+    let title = format!(" Recomendaciones · {queue_txt} ",);
     crate::ui::related::render_tracks_list(
         frame,
         chunks[3],
@@ -150,9 +148,21 @@ fn render_controls(
     let pulse = (frame_anim / 12).is_multiple_of(2);
     let heart_style = if liked {
         Style::new().fg(Color::Rgb(
-            if pulse { palette.primary[0] } else { palette.accent[0] },
-            if pulse { palette.primary[1] } else { palette.accent[1] },
-            if pulse { palette.primary[2] } else { palette.accent[2] },
+            if pulse {
+                palette.primary[0]
+            } else {
+                palette.accent[0]
+            },
+            if pulse {
+                palette.primary[1]
+            } else {
+                palette.accent[1]
+            },
+            if pulse {
+                palette.primary[2]
+            } else {
+                palette.accent[2]
+            },
         ))
     } else {
         Style::new().fg(Color::Rgb(

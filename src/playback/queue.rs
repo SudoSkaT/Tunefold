@@ -748,7 +748,10 @@ mod tests {
         q.set_tracks(vec![track("a"), track("b")]);
         assert_eq!(
             q.origins(),
-            &[QueueItemOrigin::Recommendation, QueueItemOrigin::Recommendation]
+            &[
+                QueueItemOrigin::Recommendation,
+                QueueItemOrigin::Recommendation
+            ]
         );
         // `set_tracks_with_origin` permite imponer otro origen (p. ej. playlist).
         q.set_tracks_with_origin(vec![track("x")], QueueItemOrigin::Playlist);
@@ -829,7 +832,10 @@ mod tests {
         // Usuario reproduce una canción desde búsqueda (explícita) y después
         // el autoplay añade fondo.
         q.set_tracks_with_origin(vec![track("user-a")], QueueItemOrigin::User);
-        q.append_unique_with_origin(&[track("auto-1"), track("auto-2")], QueueItemOrigin::Recommendation);
+        q.append_unique_with_origin(
+            &[track("auto-1"), track("auto-2")],
+            QueueItemOrigin::Recommendation,
+        );
 
         let added = q.replace_autoplay(&[track("fresh-1"), track("fresh-2"), track("fresh-3")]);
         assert_eq!(added, 3);
@@ -840,7 +846,11 @@ mod tests {
         assert!(q.tracks().iter().all(|t| t.identifier() != "auto-1"));
         assert_eq!(q.tracks().len(), 4);
         assert!(q.tracks().iter().all(|t| {
-            let pos = q.tracks().iter().position(|x| x.identifier() == t.identifier()).unwrap();
+            let pos = q
+                .tracks()
+                .iter()
+                .position(|x| x.identifier() == t.identifier())
+                .unwrap();
             if t.identifier() == "user-a" {
                 q.origin_at(pos) == Some(QueueItemOrigin::User)
             } else {
@@ -858,7 +868,10 @@ mod tests {
 
         // "shared" está en lo explícito (y es reciente): no se añade como auto.
         let added = q.replace_autoplay(&[track("shared"), track("new-auto")]);
-        assert_eq!(added, 1, "solo entra new-auto (shared es explícito+reciente)");
+        assert_eq!(
+            added, 1,
+            "solo entra new-auto (shared es explícito+reciente)"
+        );
         assert_eq!(q.len(), 2);
         assert_eq!(q.origin_at(0), Some(QueueItemOrigin::Playlist));
         assert_eq!(q.origin_at(1), Some(QueueItemOrigin::Recommendation));
@@ -870,7 +883,11 @@ mod tests {
         q.append_unique(&[track("x"), track("y")]);
         let added = q.replace_autoplay(&[track("p"), track("q")]);
         assert_eq!(added, 2);
-        assert_eq!(q.tracks().len(), 2, "el autoplay viejo se descartó del todo");
+        assert_eq!(
+            q.tracks().len(),
+            2,
+            "el autoplay viejo se descartó del todo"
+        );
         assert_eq!(id(&q.pick(true, None)), "p");
     }
 
@@ -887,7 +904,7 @@ mod tests {
             })
             .collect();
         let added = q.replace_autoplay(&chunk);
-        assert!(added <= MAX_QUEUE - 1, "el tope reserva el explícito");
+        assert!(added < MAX_QUEUE, "el tope reserva el explícito");
         assert!(q.len() <= MAX_QUEUE);
         assert!(q.len() >= MAX_QUEUE, "el fondo crece hasta el tope");
         assert_eq!(

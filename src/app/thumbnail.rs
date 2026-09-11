@@ -359,13 +359,12 @@ fn rgb_dist_sq(a: [u8; 3], b: [u8; 3]) -> u64 {
     (dr * dr + dg * dg + db * db) as u64
 }
 
-/// `~/.cache/playfusion/thumbnails` (XDG) o `data/thumbnails` como respaldo.
+/// `~/.cache/tunefold/thumbnails` (XDG) o `data/thumbnails` como respaldo.
 fn cache_dir() -> PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .map(|base| base.join("playfusion").join("thumbnails"))
-        .unwrap_or_else(|| PathBuf::from("data").join("thumbnails"))
+    crate::infrastructure::dirs::cache_dir()
+        .join("thumbnails")
+        .into_os_string()
+        .into()
 }
 
 /// Hash estable (FNV-1a) para claves cuando no hay `video_id`.

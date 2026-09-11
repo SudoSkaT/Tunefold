@@ -164,7 +164,7 @@ impl Backend {
         let http = config
             .apply_proxy_policy(
                 reqwest::Client::builder()
-                    .user_agent("PlayFusion/0.1.0")
+                    .user_agent("Tunefold/1.5.3")
                     .timeout(Duration::from_secs(30)),
             )
             .build()
@@ -557,7 +557,10 @@ impl Backend {
                         &related,
                         crate::playback::QueueItemOrigin::Recommendation,
                     );
-                    (queue_guard.tracks().to_vec(), queue_guard.origins().to_vec())
+                    (
+                        queue_guard.tracks().to_vec(),
+                        queue_guard.origins().to_vec(),
+                    )
                 };
                 vec![BackendEvent::Related {
                     track: Box::new(track),
@@ -690,7 +693,11 @@ impl Backend {
                     .db
                     .record_signal(
                         internal_id,
-                        if toggled_on { SignalKind::Like } else { SignalKind::Unlike },
+                        if toggled_on {
+                            SignalKind::Like
+                        } else {
+                            SignalKind::Unlike
+                        },
                         PlayContext::Manual,
                         None,
                         None,
@@ -747,7 +754,9 @@ impl Backend {
                         }
                         ev
                     }
-                    Ok(_) => vec![BackendEvent::Message("La playlist no tiene canciones.".to_string())],
+                    Ok(_) => vec![BackendEvent::Message(
+                        "La playlist no tiene canciones.".to_string(),
+                    )],
                     Err(e) => vec![BackendEvent::Error(format!("playlist: {e}"))],
                 }
             }

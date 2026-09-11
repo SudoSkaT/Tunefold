@@ -20,14 +20,9 @@ use crate::domain::{album::Album, artist::Artist, genre::Genre, source::Source, 
 fn parse_hex(hex: String) -> [u8; 3] {
     let bytes = hex.trim_start_matches('#').as_bytes();
     let nib = |i: usize| bytes.get(i).and_then(|b| (*b as char).to_digit(16));
-    if let (Some(rh), Some(rl), Some(gh), Some(gl), Some(bh), Some(bl)) = (
-        nib(0),
-        nib(1),
-        nib(2),
-        nib(3),
-        nib(4),
-        nib(5),
-    ) {
+    if let (Some(rh), Some(rl), Some(gh), Some(gl), Some(bh), Some(bl)) =
+        (nib(0), nib(1), nib(2), nib(3), nib(4), nib(5))
+    {
         return [
             ((rh << 4) | rl) as u8,
             ((gh << 4) | gl) as u8,
@@ -534,9 +529,7 @@ impl Db {
             .bind(id)
             .fetch_optional(self.pool())
             .await?;
-        Ok(row
-            .map(|r| r.get::<i64, _>("kind") == 1)
-            .unwrap_or(false))
+        Ok(row.map(|r| r.get::<i64, _>("kind") == 1).unwrap_or(false))
     }
 
     pub async fn list_playlists(&self) -> Result<Vec<PlaylistRow>> {
@@ -600,12 +593,11 @@ impl Db {
         let mut tx = self.pool().begin().await?;
         // El track pedido DEBE estar en la playlist: se valida contra las filas
         // existentes ANTES de reescribir (no se inventan posiciones nuevas).
-        let existing: Vec<i64> = sqlx::query_scalar(
-            "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1",
-        )
-        .bind(playlist_id)
-        .fetch_all(&mut *tx)
-        .await?;
+        let existing: Vec<i64> =
+            sqlx::query_scalar("SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1")
+                .bind(playlist_id)
+                .fetch_all(&mut *tx)
+                .await?;
         let existing_set: std::collections::HashSet<i64> = existing.iter().copied().collect();
         if order.iter().any(|t| !existing_set.contains(t)) {
             anyhow::bail!("el reorden contiene tracks ajenos a la playlist");
@@ -638,9 +630,10 @@ impl Db {
         .bind(playlist_id)
         .fetch_all(self.pool())
         .await?;
-        let from = current.iter().position(|t| *t == track_id).ok_or_else(|| {
-            anyhow::anyhow!("el track no está en esta playlist")
-        })?;
+        let from = current
+            .iter()
+            .position(|t| *t == track_id)
+            .ok_or_else(|| anyhow::anyhow!("el track no está en esta playlist"))?;
         let track = current.remove(from);
         let to = to_position.min(current.len());
         current.insert(to, track);
@@ -668,13 +661,12 @@ impl Db {
 
     /// ¿Contiene la playlist este track? (lookup puntual, sin cargar la lista).
     pub async fn playlist_contains(&self, playlist_id: i64, track_id: i64) -> Result<bool> {
-        let row = sqlx::query(
-            "SELECT 1 FROM playlist_tracks WHERE playlist_id = ?1 AND track_id = ?2",
-        )
-        .bind(playlist_id)
-        .bind(track_id)
-        .fetch_optional(self.pool())
-        .await?;
+        let row =
+            sqlx::query("SELECT 1 FROM playlist_tracks WHERE playlist_id = ?1 AND track_id = ?2")
+                .bind(playlist_id)
+                .bind(track_id)
+                .fetch_optional(self.pool())
+                .await?;
         Ok(row.is_some())
     }
 
@@ -730,9 +722,10 @@ impl Db {
     /// Marca al track como liked (`liked=true` añade a L1K3D; `false` quita).
     /// La operación activa los triggers de touch (actualiza `updated_at`).
     pub async fn set_liked(&self, track_id: i64, liked: bool) -> Result<()> {
-        let id = self.l1k3d_id().await?.ok_or_else(|| {
-            anyhow::anyhow!("L1K3D no existe: aplica la migración 0009")
-        })?;
+        let id = self
+            .l1k3d_id()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("L1K3D no existe: aplica la migración 0009"))?;
         if liked {
             self.add_to_playlist(id, track_id).await
         } else {
@@ -827,11 +820,7 @@ impl Db {
     // ------------------------------------------------- artwork palette
     /// Persiste la paleta de tres colores dominantes del artwork de un track.
     /// Se escribe UNA vez al decodificar la miniatura (no durante el render).
-    pub async fn set_track_palette(
-        &self,
-        track_id: i64,
-        palette: [[u8; 3]; 3],
-    ) -> Result<()> {
+    pub async fn set_track_palette(&self, track_id: i64, palette: [[u8; 3]; 3]) -> Result<()> {
         let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
         sqlx::query(
             "INSERT INTO artwork_palettes (track_id, primary_hex, secondary_hex, accent_hex, updated_at) \

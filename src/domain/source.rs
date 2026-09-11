@@ -1,6 +1,6 @@
 //! Fuente de origen de una canción.
 //!
-//! PlayFusion usa exclusivamente YouTube / YouTube Music como fuente de datos
+//! Tunefold usa exclusivamente YouTube / YouTube Music como fuente de datos
 //! (metadata, portadas, letras, recomendados y reproducstrm). Este enum sirve
 //! como marcador estable del único origen soportado y de etiqueta en la BD.
 

@@ -68,7 +68,9 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    let rp = RustyPipe::builder().storage_dir("data/youtube").build()?;
+    let rp = RustyPipe::builder()
+        .storage_dir(tunefold::infrastructure::dirs::cache_dir().join("rustypipe"))
+        .build()?;
     let video_id = "kM0Fpbz0W8U";
 
     let http = reqwest::Client::builder()

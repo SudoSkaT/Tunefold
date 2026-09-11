@@ -10,3 +10,4 @@ pub mod history;
 pub mod playback;
 pub mod search;
 pub mod thumbnail;
+pub mod updater;

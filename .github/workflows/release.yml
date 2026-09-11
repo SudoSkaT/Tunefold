@@ -1,0 +1,81 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build official binary (no youtube)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build full binary (with youtube)
+        run: cargo build --release --locked --features youtube --target ${{ matrix.target }}
+
+      - name: Package binary (linux/mac)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/tunefold dist/ 2>/dev/null || true
+          # El binario oficial es el sin-youtube; el completo lleva sufijo -yt.
+          cp target/${{ matrix.target }}/release/tunefold "dist/tunefold-${{ matrix.target }}-yt"
+          chmod +x dist/* || true
+
+      - name: Package binary (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/tunefold.exe dist/tunefold-${{ matrix.target }}.exe
+          cp target/${{ matrix.target }}/release/tunefold.exe dist/tunefold-${{ matrix.target }}-yt.exe
+
+      - name: Archive binary
+        shell: bash
+        run: |
+          cd dist
+          tar -czf tunefold-${{ matrix.target }}.tar.gz tunefold 2>/dev/null || tar -czf tunefold-${{ matrix.target }}.tar.gz tunefold-${{ matrix.target }}*
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.exe
+            LICENSE
+            THIRD_PARTY.md
+            NOTICE
+          fail_on_unmatched_files: false

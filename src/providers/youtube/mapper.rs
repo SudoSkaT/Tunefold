@@ -1,4 +1,4 @@
-//! Mapeo de modelos de rustypipe → dominio PlayFusion.
+//! Mapeo de modelos de rustypipe → dominio Tunefold.
 //!
 //! Frontera anti-filtración: los tipos `TrackItem`/`MusicArtist`/`MusicAlbum`
 //! de rustypipe NO salen de este módulo; hacia dentro solo llegan modelos de

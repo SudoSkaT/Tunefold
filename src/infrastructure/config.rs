@@ -1,4 +1,4 @@
-//! Configuración de PlayFusion.
+//! Configuración de Tunefold.
 //!
 //! Con YouTube como única fuente no hay credenciales que configurar
 //! (`rustypipe` no requiere API key); el único ajuste editable es la política
@@ -101,8 +101,12 @@ pub struct Config {
 }
 
 impl Config {
-    /// Lee la configuración desde el entorno y un `.env` si existe.
+    /// Lee la configuración desde el entorno y el `.env` canónico
+    /// (`~/.config/tunefold/.env`), con fallback al `.env` legacy del
+    /// directorio de trabajo. `dotenvy` no pisa variables ya definidas: el
+    /// `.env` canónico (cargado primero) tiene prioridad sobre el legacy.
     pub fn load() -> Self {
+        let _ = dotenvy::from_path(super::dirs::env_path());
         let _ = dotenvy::dotenv();
         Self::from_env()
     }
@@ -173,13 +177,15 @@ impl Config {
             };
     }
 
-    /// Persiste un formulario a `.env` (en la raíz del proyecto) sin aplicar cambios.
+    /// Persiste un formulario al `.env` canónico (`~/.config/tunefold/.env`)
+    /// sin aplicar cambios.
     ///
     /// Los feature flags NO se persisten aquí: su superficie de control es el
     /// entorno/`.env` manual (apagable sin recompilar y sin tocar ajustes UI).
     pub fn persist(form: &ConfigForm) -> anyhow::Result<()> {
         let updates: [(&str, Option<&str>); 1] = [kv("PLAYBACK_POLICY", &form.playback_policy)];
-        upsert_env_file(".env", &updates)?;
+        let path = super::dirs::env_path();
+        upsert_env_file(path.to_str().unwrap_or(".env"), &updates)?;
         Ok(())
     }
 }

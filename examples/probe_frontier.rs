@@ -13,9 +13,9 @@
 
 use std::time::Duration;
 
-use playfusion::catalog::CatalogProvider;
-use playfusion::domain::track::Track;
-use playfusion::providers::youtube::{context_headers, YouTubeAdapter};
+use tunefold::catalog::CatalogProvider;
+use tunefold::domain::track::Track;
+use tunefold::providers::youtube::{context_headers, YouTubeAdapter};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;

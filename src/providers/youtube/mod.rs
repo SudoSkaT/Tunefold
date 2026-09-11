@@ -1,6 +1,6 @@
 //! Adaptador de **YouTube / YouTube Music** para las capas catálogo y media.
 //!
-//! Este módulo es la ÚNICA frontera entre PlayFusion y YouTube: implementa
+//! Este módulo es la ÚNICA frontera entre Tunefold y YouTube: implementa
 //! [`StreamProvider`], [`StreamValidator`] y [`CatalogProvider`] delegando en
 //! el cliente de [`provider`] (rustypipe) con mapeo de [`mapper`]. Si YouTube
 //! deja de funcionar, se apaga aquí — el resto del sistema ni se entera.
@@ -19,7 +19,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 
-pub mod lyrics;
 pub mod mapper;
 pub mod provider;
 

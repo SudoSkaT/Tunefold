@@ -19,11 +19,18 @@ pub struct SearchOutcome<T> {
 #[derive(Debug)]
 pub struct MetadataAggregator {
     providers: CatalogRegistry,
+    /// Cliente HTTP dedicado a LRCLIB (letras), independiente de los
+    /// proveedores de streaming: disponible siempre, incluso en binarios sin
+    /// la feature YouTube.
+    lrclib: reqwest::Client,
 }
 
 impl MetadataAggregator {
     pub fn new(providers: CatalogRegistry) -> Self {
-        Self { providers }
+        Self {
+            providers,
+            lrclib: crate::providers::lyrics::lrclib_client(),
+        }
     }
 
     pub fn providers(&self) -> &CatalogRegistry {
@@ -90,11 +97,16 @@ impl MetadataAggregator {
         }
     }
 
-    /// Letra sincronizada (LRC) del track, si el proveedor la tiene. Es la
-    /// única fuente del karaoke.
+    /// Letra sincronizada (LRC) del track: primero el proveedor de la fuente
+    /// (si lo hay); si no ofrece letras, LRCLIB como cliente propio
+    /// independiente. Es la única fuente del karaoke.
     pub async fn synced_lyrics(&self, track: &Track) -> Option<String> {
-        let provider = self.providers.get(track.source)?;
-        provider.synced_lyrics(track).await.ok().flatten()
+        if let Some(provider) = self.providers.get(track.source) {
+            if let Some(lyrics) = provider.synced_lyrics(track).await.ok().flatten() {
+                return Some(lyrics);
+            }
+        }
+        crate::providers::lyrics::fetch_lrclib_lyrics(&self.lrclib, track).await
     }
 
     /// URLs candidatas de miniatura para un track, según la estrategia del

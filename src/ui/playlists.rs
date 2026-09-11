@@ -135,20 +135,14 @@ fn handle_listing_key(
             PlaylistAction::None
         }
         KeyCode::Char('w') | KeyCode::Up => {
-            let next = super::navigation::step_selection(
-                playlists.len(),
-                state.listing.selected(),
-                false,
-            );
+            let next =
+                super::navigation::step_selection(playlists.len(), state.listing.selected(), false);
             state.listing.select(next);
             PlaylistAction::None
         }
         KeyCode::Char('s') | KeyCode::Down => {
-            let next = super::navigation::step_selection(
-                playlists.len(),
-                state.listing.selected(),
-                true,
-            );
+            let next =
+                super::navigation::step_selection(playlists.len(), state.listing.selected(), true);
             state.listing.select(next);
             PlaylistAction::None
         }
@@ -199,15 +193,11 @@ fn handle_detail_key(detail: &mut Detail, key: KeyCode) -> PlaylistAction {
             _ => PlaylistAction::None,
         },
         KeyCode::Char('u') => match detail.tracks.selected() {
-            Some(t) if t.id > 0 => {
-                PlaylistAction::MoveTrack(detail.id, t.id, move_to(detail, -1))
-            }
+            Some(t) if t.id > 0 => PlaylistAction::MoveTrack(detail.id, t.id, move_to(detail, -1)),
             _ => PlaylistAction::None,
         },
         KeyCode::Char('D') => match detail.tracks.selected() {
-            Some(t) if t.id > 0 => {
-                PlaylistAction::MoveTrack(detail.id, t.id, move_to(detail, 1))
-            }
+            Some(t) if t.id > 0 => PlaylistAction::MoveTrack(detail.id, t.id, move_to(detail, 1)),
             _ => PlaylistAction::None,
         },
         KeyCode::Esc => PlaylistAction::CloseDetail,
@@ -291,7 +281,12 @@ pub fn render(
     render_listing(frame, area, state, playlists);
 }
 
-fn render_listing(frame: &mut Frame, area: Rect, state: &mut PlaylistState, playlists: &[PlaylistRow]) {
+fn render_listing(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut PlaylistState,
+    playlists: &[PlaylistRow],
+) {
     let items: Vec<ListItem> = playlists
         .iter()
         .map(|pl| {
@@ -315,7 +310,11 @@ fn render_listing(frame: &mut Frame, area: Rect, state: &mut PlaylistState, play
                 ),
                 Span::styled(
                     format!("  ·  {}", pl.kind.label()),
-                    Style::new().fg(if system { Color::Yellow } else { Color::DarkGray }),
+                    Style::new().fg(if system {
+                        Color::Yellow
+                    } else {
+                        Color::DarkGray
+                    }),
                 ),
                 if system {
                     Span::styled("  (protegida)", Style::new().fg(Color::DarkGray))
@@ -334,7 +333,11 @@ fn render_listing(frame: &mut Frame, area: Rect, state: &mut PlaylistState, play
         .title_bottom(Line::from(hint).right_aligned());
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::new()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("> ");
 
     frame.render_stateful_widget(list, area, &mut state.listing);

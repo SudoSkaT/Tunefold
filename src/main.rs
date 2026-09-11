@@ -2,28 +2,44 @@
 
 use std::collections::HashMap;
 
-use playfusion::app::aggregator::MetadataAggregator;
-use playfusion::infrastructure::config::Config;
-use playfusion::infrastructure::db::Db;
-
-const DB_PATH: &str = "data/music.db";
+use tunefold::app::aggregator::MetadataAggregator;
+use tunefold::infrastructure::config::Config;
+use tunefold::infrastructure::db::Db;
+use tunefold::infrastructure::dirs;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    if matches!(
+        args.get(1).map(String::as_str),
+        Some("--version") | Some("-V")
+    ) {
+        println!("tunefold {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let config = Config::load();
-    let db = Db::connect(DB_PATH).await?;
+    // Migración no destructiva: si existía `data/music.db`, se copia a
+    // `~/.local/share/tunefold/music.db` y se mantiene el original.
+    dirs::migrate_legacy_data();
+    let db = Db::connect(dirs::db_path().to_str().unwrap()).await?;
 
     // El CLI respeta el flag del provider: con YouTube apagado el agregador
     // queda vacío y los comandos responden "sin resultados" sin tocar red.
     let aggregator = MetadataAggregator::new(if config.flags.youtube_provider {
-        playfusion::api::build_providers()
+        tunefold::api::build_providers()
     } else {
         Default::default()
     });
 
     match args.get(1).map(String::as_str) {
+        Some("--update") => {
+            tunefold::app::updater::run(false).await?;
+        }
+        Some("--update-check") => {
+            tunefold::app::updater::run(true).await?;
+        }
         Some("--search") => {
             let query = args
                 .get(2)
@@ -41,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Fuentes activas: {sources}");
         }
         Some("--history") => {
-            let history = playfusion::app::history::History::new(db);
+            let history = tunefold::app::history::History::new(db);
             let entries = history.recent(20).await?;
             for e in entries {
                 let artist = e.artist_name.unwrap_or_else(|| "?".to_string());
@@ -52,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some("--tui") | None => {
-            playfusion::ui::run().await?;
+            tunefold::ui::run().await?;
         }
         _ => print_help(),
     }
@@ -101,12 +117,22 @@ async fn search_and_save(
 }
 
 fn print_help() {
-    println!("PlayFusion — cliente TUI de YouTube / YouTube Music (vía rustypipe).");
+    println!("Tunefold — cliente TUI de YouTube / YouTube Music (vía rustypipe).");
     println!();
-    println!("  playfusion [--tui]              Lanza la interfaz de terminal");
-    println!("  playfusion --search <consulta>  Busca en YouTube Music y guarda en {DB_PATH}");
-    println!("  playfusion --sources            Lista las fuentes activas");
-    println!("  playfusion --history            Muestra las últimas reproducciones");
+    println!("  tunefold [--tui]              Lanza la interfaz de terminal");
+    println!(
+        "  tunefold --search <consulta>  Busca en YouTube Music y guarda en {}",
+        dirs::db_path().display()
+    );
+    println!("  tunefold --sources            Lista las fuentes activas");
+    println!("  tunefold --history            Muestra las últimas reproducciones");
+    println!("  tunefold --update             Actualiza a la última release oficial");
+    println!("  tunefold --update-check       Solo informa si hay release más nueva");
+    println!("  tunefold --version            Muestra la versión");
     println!();
-    println!("Configuración en .env: PLAYBACK_POLICY (auto | rodio).");
+    println!(
+        "Configuración en {} (o .env legacy).",
+        dirs::env_path().display()
+    );
+    println!("Variables: PLAYBACK_POLICY (auto | rodio), YOUTUBE_PROVIDER_ENABLED, PROXY_ENABLED.");
 }

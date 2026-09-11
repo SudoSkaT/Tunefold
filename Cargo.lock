@@ -1831,33 +1831,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
-name = "playfusion"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "crossterm",
- "dotenvy",
- "futures-util",
- "image",
- "ratatui",
- "reqwest",
- "rodio",
- "rustfft",
- "rustypipe",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "unicode-normalization",
-]
-
-[[package]]
 name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3481,6 +3454,34 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "tunefold"
+version = "1.5.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "crossterm",
+ "dotenvy",
+ "futures-util",
+ "image",
+ "ratatui",
+ "reqwest",
+ "rodio",
+ "rustfft",
+ "rustypipe",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-normalization",
+]
 
 [[package]]
 name = "typenum"

@@ -1,9 +1,9 @@
 //! Probe de desarrollo: pipeline real YouTube vía rustypipe (stream, letras,
 //! recomendados). Ejecutar con: `cargo run --example probe_youtube`
 
-use playfusion::catalog::CatalogProvider;
-use playfusion::domain::source::Source;
-use playfusion::providers::youtube::{context_headers, YouTubeAdapter};
+use tunefold::catalog::CatalogProvider;
+use tunefold::domain::source::Source;
+use tunefold::providers::youtube::{context_headers, YouTubeAdapter};
 
 /// Descarga el inicio de un stream y devuelve (status, content_length).
 async fn download_status(url: String, ua: bool) -> anyhow::Result<(u16, u64)> {
@@ -13,7 +13,7 @@ async fn download_status(url: String, ua: bool) -> anyhow::Result<(u16, u64)> {
         .build()?;
     let mut req = client.get(&url);
     if ua {
-        req = req.header("User-Agent", "PlayFusion/0.1.0");
+        req = req.header("User-Agent", "Tunefold/1.5.3");
     }
     let resp = req.send().await?;
     Ok((resp.status().as_u16(), resp.content_length().unwrap_or(0)))
@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "rustypipe=debug,playfusion=debug".into()),
+                .unwrap_or_else(|_| "rustypipe=debug,tunefold=debug".into()),
         )
         .with_target(false)
         .init();
@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
     let resolved = provider.inner().resolve_audio_url(track).await;
     match resolved {
         Ok(Some(url)) => {
-            let stream = playfusion::domain::stream::RemoteStream {
+            let stream = tunefold::domain::stream::RemoteStream {
                 url,
                 headers: context_headers(),
             };
@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
     {
         use rustypipe::client::{ClientType, RustyPipe};
         let rp = RustyPipe::builder()
-            .storage_dir("data/youtube")
+            .storage_dir(tunefold::infrastructure::dirs::cache_dir().join("rustypipe"))
             .build()
             .expect("cliente válido");
         let vd = rp.query().get_visitor_data(true).await?;

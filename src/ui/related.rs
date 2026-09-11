@@ -389,7 +389,10 @@ pub fn render_tracks_list(
             // Doblete discreto: el track en curso lleva un `▶`; lo añadido por
             // el autoplay se marca `↻` tenue; lo recién añadido, verde.
             let marker = if is_current {
-                Span::styled("▶ ", Style::new().fg(Color::Green).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    "▶ ",
+                    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                )
             } else if is_new {
                 Span::styled("✚ ", Style::new().fg(Color::Green))
             } else if origin.is_auto() {

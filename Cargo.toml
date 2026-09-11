@@ -1,8 +1,25 @@
 [package]
-name = "playfusion"
-version = "0.1.0"
+name = "tunefold"
+version = "1.5.3"
 edition = "2021"
-description = "TUI music player that uses YouTube / YouTube Music (via rustypipe) as its only source"
+description = "TUI music player and recommendation engine. The YouTube/YouTube Music provider is an optional, GPL-3.0 component built with `--features youtube`."
+license = "GPL-3.0"
+repository = "https://github.com/SudoSkaT/PlayFusion"
+
+[lib]
+name = "tunefold"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tunefold"
+path = "src/main.rs"
+
+[features]
+default = []
+# Proveedor YouTube/YouTube Music (rustypipe, GPL-3.0). Se EXCLUYE del binario
+# oficial por los términos de servicio de YouTube; quienes lo compilen asumen
+# esas restricciones. Ver README §Licencias.
+youtube = ["dep:rustypipe"]
 
 [dependencies]
 ratatui = "0.29"
@@ -11,7 +28,7 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 futures-util = "0.3"
 rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-all"] }
-rustypipe = { version = "0.11.4", default-features = false, features = ["rustls-tls-webpki-roots"] }
+rustypipe = { version = "0.11.4", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
@@ -24,18 +41,63 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 unicode-normalization = "0.1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["test-util"] }
 
-# rustypipe vendored con parche local:
+# rustypipe vendored con parche local (GPL-3.0; el código modificado vive en
+# vendor/rustypipe y se ofrece como fuente bajo los términos de la GPL):
 # - cliente Android sin deofuscación (necesaria porque la player.js actual no
 #   se puede extraer con 0.11.4);
 # - PO tokens también en Android/iOS (YouTube los exige desde 2026; sin ellos
 #   los streams responden 403 Forbidden);
 # - cliente VISIONOS (id 101): sus URLs NO tienen el techo posicional (~1 MiB)
-#   que googlevideo aplica a ANDROID_VR/iOS; es el primario del provider.
+#   que googlevideo aplica a ANDROID_VR/iOS; es el primario del provider;
+# - fix `mismatched_lifetime_syntaxes` (elisión de lifetime en Frameset::urls):
+#   cambio puramente sintáctico para poder mantener `clippy -D warnings`.
 [patch.crates-io]
 rustypipe = { path = "vendor/rustypipe" }
+
+# Los probes de YouTube dependen de la feature `youtube` (excluida del binario
+# oficial); bench_hotpaths es independiente del proveedor.
+[[example]]
+name = "bench_hotpaths"
+path = "examples/bench_hotpaths.rs"
+
+[[example]]
+name = "probe_range"
+path = "examples/probe_range.rs"
+required-features = ["youtube"]
+
+[[example]]
+name = "probe_boundary"
+path = "examples/probe_boundary.rs"
+required-features = ["youtube"]
+
+[[example]]
+name = "probe_frontier"
+path = "examples/probe_frontier.rs"
+required-features = ["youtube"]
+
+[[example]]
+name = "probe_clients"
+path = "examples/probe_clients.rs"
+required-features = ["youtube"]
+
+[[example]]
+name = "probe_seek"
+path = "examples/probe_seek.rs"
+required-features = ["youtube"]
+
+[[example]]
+name = "probe_transport"
+path = "examples/probe_transport.rs"
+required-features = ["youtube"]
+
+[[example]]
+name = "probe_youtube"
+path = "examples/probe_youtube.rs"
+required-features = ["youtube"]

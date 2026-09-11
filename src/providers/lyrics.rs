@@ -1,8 +1,16 @@
 //! Cliente de LRCLIB: letras sincronizadas (LRC) del karaoke.
 //!
-//! Única fuente legítima del karaoke; la letra plana NUNCA se mezcla como
-//! alternativa. La búsqueda puntúa por normalización de título/artista y
-//! cercanía de duración, descartando instrumentales y falsos positivos.
+//! Servicio legítimo (sin API key) e independiente de cualquier proveedor de
+//! streaming: vive fuera de `providers::youtube` para que el karaoke siga
+//! funcionando en los binarios SIN feature YouTube. La letra plana NUNCA se
+//! mezcla como alternativa. La búsqueda puntúa por normalización de
+//! título/artista y cercanía de duración, descartando instrumentales y falsos
+//! positivos.
+//!
+//! LRCLIB pide identificar la app en cada petición: [`lrclib_client`] fija el
+//! User-Agent `Tunefold/<versión>` (contacto: repositorio GitHub).
+
+use std::time::Duration;
 
 use crate::domain::track::Track;
 
@@ -10,6 +18,16 @@ use crate::domain::track::Track;
 /// se hace por búsqueda de firma del track (título + artista); la duración
 /// solo desempata entre registros.
 const LRCLIB_API: &str = "https://lrclib.net/api/search";
+
+/// Cliente HTTP dedicado a LRCLIB, con el User-Agent identificativo que pide
+/// el servicio y un timeout prudente por petición.
+pub(crate) fn lrclib_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(format!("Tunefold/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(8))
+        .build()
+        .expect("cliente reqwest válido")
+}
 
 /// Consulta LRCLIB por búsqueda (`GET /api/search`) y devuelve la letra
 /// **sincronizada** (LRC) del mejor registro, si existe.

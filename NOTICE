@@ -1,0 +1,22 @@
+Tunefold
+Copyright (C) 2026 The Tunefold Authors (ver CONTRIBUTORS)
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version, as stated in the LICENSE file.
+
+This product includes software developed as part of the Symphonia audio
+decoding suite (see THIRD_PARTY.md). Symphonia component crates are licensed
+under the Mozilla Public License 2.0.
+
+The YouTube/YouTube Music provider component is derived from rustypipe 0.11.4
+(GPL-3.0), vendored and modified locally under vendor/rustypipe. The source
+code of that modified component is available in this repository, per GPL-3.0
+section 6:
+
+    https://github.com/SudoSkaT/PlayFusion/tree/main/vendor/rustypipe
+
+All other parts of this program are original works. This NOTICE is served with
+the program to satisfy the Section 5(d) requirement of the GNU General Public
+License, version 3.

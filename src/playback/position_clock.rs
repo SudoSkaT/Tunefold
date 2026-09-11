@@ -300,17 +300,11 @@ mod tests {
             Some(ClockEvent::NewTrack)
         );
         // Blip espurio pequeño (< 500 ms): se ignora, la letra no parpadea.
-        assert_eq!(
-            c.update(Some("a"), Duration::from_millis(9_600), now),
-            None
-        );
+        assert_eq!(c.update(Some("a"), Duration::from_millis(9_600), now), None);
         assert_eq!(c.position(), Duration::from_secs(10));
         // Drift moderado hacia atrás (0.5s..10s): re-anclaje suave a la muestra
         // (el motor es la fuente de verdad), sin avisar como reinicio.
-        assert_eq!(
-            c.update(Some("a"), Duration::from_secs(8), now),
-            None
-        );
+        assert_eq!(c.update(Some("a"), Duration::from_secs(8), now), None);
         assert_eq!(c.position(), Duration::from_secs(8));
         // Y avanza normal después.
         c.update(Some("a"), Duration::from_secs(15), now);
@@ -384,7 +378,10 @@ mod tests {
         c.update(Some("a"), Duration::from_millis(49_800), now);
         assert_eq!(c.position(), Duration::from_secs(50));
         // Un reinicio grande del MISMO track (a ~0) se re-ancla y avisa.
-        assert_eq!(c.update(Some("a"), Duration::ZERO, now), Some(ClockEvent::Restarted));
+        assert_eq!(
+            c.update(Some("a"), Duration::ZERO, now),
+            Some(ClockEvent::Restarted)
+        );
         assert_eq!(c.position(), Duration::ZERO);
     }
 
@@ -633,8 +630,12 @@ mod tests {
         // Se reanuda el flujo: el reloj se re-ancla a la muestra nueva.
         now += Duration::from_millis(500);
         c.update(Some("song"), Duration::from_secs(1), now);
-        let after_resume =
-            c.snapshot(true, false, Some(Duration::from_secs(300)), now + Duration::from_millis(400));
+        let after_resume = c.snapshot(
+            true,
+            false,
+            Some(Duration::from_secs(300)),
+            now + Duration::from_millis(400),
+        );
         assert!(
             after_resume <= Duration::from_secs(2),
             "tras reanudar no se aleja del audio: {after_resume:?}"

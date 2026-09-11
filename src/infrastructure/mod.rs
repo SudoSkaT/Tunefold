@@ -2,5 +2,6 @@
 
 pub mod config;
 pub mod db;
+pub mod dirs;
 pub mod playback;
 pub mod storage;

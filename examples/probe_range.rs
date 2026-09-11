@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 
-use playfusion::catalog::CatalogProvider;
-use playfusion::domain::track::Track;
-use playfusion::providers::youtube::{context_headers, YouTubeAdapter};
+use tunefold::catalog::CatalogProvider;
+use tunefold::domain::track::Track;
+use tunefold::providers::youtube::{context_headers, YouTubeAdapter};
 
 const MIB: u64 = 1024 * 1024;
 
