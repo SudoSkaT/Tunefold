@@ -194,26 +194,20 @@ pub fn render(
     liked: &Liked,
 ) {
     let has_lyrics = state.synced.as_ref().filter(|s| !s.is_empty()).is_some();
-    // El visual necesita al menos un poco de altura; si el terminal es bajo se
-    // prescinde de la banda superior y todo el espacio va a la lista.
-    let can_visual = area.height >= 24;
-    // La banda superior se reserva si hay letras (karaoke), el visual puede
-    // ocupar su lugar, o hay que avisar de que las letras no están disponibles.
-    let reserve_band = has_lyrics || can_visual || state.synced_unavailable;
+    // La banda superior es una sección permanente de la vista (relacionadas,
+    // letras o visual) y se conserva en TODO perfil: solo cambia su altura
+    // (`layout::related_band_height`), nunca su presencia. En perfiles bajos
+    // se reduce hasta 3 filas y el resto del espacio va a la lista.
+    let profile = super::layout::TerminalProfile::from_rect(area);
+    let band_height = super::layout::related_band_height(area.height, profile);
 
-    let mut chunks = vec![];
-    if reserve_band {
-        let band_height = area.height.saturating_sub(7).clamp(6, 18);
-        chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(band_height), Constraint::Min(0)])
-            .split(area)
-            .to_vec();
-    } else {
-        chunks = vec![area];
-    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(band_height), Constraint::Min(0)])
+        .split(area)
+        .to_vec();
 
-    if reserve_band {
+    {
         let top_area = chunks[0];
         match BandContent::resolve(mode, has_lyrics, state.synced_unavailable) {
             BandContent::Visual => {
@@ -390,19 +384,22 @@ pub fn render_tracks_list(
                 .copied()
                 .unwrap_or(crate::playback::queue::QueueItemOrigin::Recommendation);
             let is_new = state.new_ids.contains(&t.identifier());
-            // Doblete discreto: el track en curso lleva un `▶`; lo añadido por
-            // el autoplay se marca `↻` tenue; lo recién añadido, verde.
+            // Doblete funcional discreto: el track en curso lleva su marcador;
+            // lo añadido por el autoplay se marca tenue; lo recién añadido,
+            // verde. Los glifos vienen del sistema centralizado (con respaldo
+            // ASCII).
+            let g = &crate::ui::glyphs::GLYPHS;
             let marker = if is_current {
                 Span::styled(
-                    "▶ ",
+                    g.current(),
                     Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
                 )
             } else if is_new {
-                Span::styled("✚ ", Style::new().fg(Color::Green))
+                Span::styled(g.newly_added(), Style::new().fg(Color::Green))
             } else if origin.is_auto() {
-                Span::styled("↻ ", Style::new().fg(Color::DarkGray))
+                Span::styled(g.auto(), Style::new().fg(Color::DarkGray))
             } else {
-                Span::styled("· ", Style::new().fg(Color::DarkGray))
+                Span::styled(g.explicit(), Style::new().fg(Color::DarkGray))
             };
             let line = Line::from(vec![
                 marker,
@@ -416,7 +413,7 @@ pub fn render_tracks_list(
                 // lista de la app, no solo en la playlist propia).
                 if liked.contains(t) {
                     Span::styled(
-                        "   ♥",
+                        format!("   {}", g.heart_liked()),
                         Style::new()
                             .fg(Color::LightRed)
                             .add_modifier(Modifier::BOLD),
@@ -429,9 +426,9 @@ pub fn render_tracks_list(
                     .map(|s| {
                         Span::styled(
                             if s.recently_played {
-                                format!("  ● reciente · {}×", s.play_count)
+                                format!("  {} reciente · {}×", g.recent(), s.play_count)
                             } else {
-                                format!("  ↻ {}×", s.play_count)
+                                format!("  {} {}×", g.listens(), s.play_count)
                             },
                             Style::new().fg(Color::Green),
                         )

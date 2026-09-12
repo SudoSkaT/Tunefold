@@ -9,7 +9,13 @@ use crate::app::audio::PlaybackStatus;
 use crate::ui::widgets::{format_duration, spinner_phase};
 
 pub fn render(frame: &mut Frame, area: Rect, playback: &PlaybackStatus, frame_anim: u64) {
-    let block = Block::default().borders(Borders::ALL).title(" Visualizer ");
+    // En alturas reducidas (perfil Tiny) se dibuja la barra desnuda, sin
+    // decoración, para no robarla de filas al resto de secciones.
+    let block = if area.height >= 3 {
+        Block::default().borders(Borders::ALL).title(" Progreso ")
+    } else {
+        Block::default()
+    };
 
     let position = playback.position;
     let duration = playback.duration.unwrap_or_default();

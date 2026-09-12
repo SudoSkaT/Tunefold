@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -97,10 +97,14 @@ pub struct App {
     playlists: Vec<PlaylistRow>,
     /// Sub-estado de la vista Playlists (listado/detalle).
     playlist_view: PlaylistState,
-    /// Tabla de atajos abierta (Shift+H): cubre toda la pantalla y se cierra
-    /// con cualquier tecla. Pide Shift+H porque Shift+h en ciertos teclados
-    /// llega en minúscula con SHIFT (normalizado en `on_key`).
+    /// Tabla de atajos abierta (Shift+H): se cierra con casi cualquier tecla
+    /// (excepto la navegación interna de desplazamiento). Pide Shift+H porque
+    /// Shift+h en ciertos teclados llega en minúscula con SHIFT (normalizado
+    /// en `on_key`).
     show_help: bool,
+    /// Desplazamiento de la tabla de atajos: en terminales estrechos cabe con
+    /// scroll interno (la tabla deja de caber en una pantalla).
+    help_scroll: usize,
     /// Ids internos de los tracks "liked" (pertenencia a L1K3D). Se llena con
     /// `BackendEvent::L1K3D` al arrancar y se mantiene con `L1K3DChanged`:
     /// todas las vistas pintan el corazón a partir de este estado (no de
@@ -176,6 +180,7 @@ impl App {
             playlists: Vec::new(),
             playlist_view: PlaylistState::default(),
             show_help: false,
+            help_scroll: 0,
             liked: super::liked::Liked::default(),
             mouse_pos: None,
             mouse_click: false,
@@ -298,12 +303,24 @@ impl App {
             return;
         }
 
-        // Tabla de atajos (Shift+H): una vez abierta, CUALQUIER tecla (incluida
-        // la propia Shift+H y los atajos de vista) la cierra. Así las pantallas
-        // pequeñas pueden consultar los comandos y cerrarla sin rocas de
-        // coordinación con el resto de atajos.
+        // Tabla de atajos (Shift+H): una vez abierta, casi cualquier tecla la
+        // cierra. Solo las de desplazamiento (↑/↓, PgUp/PgDn, w/s/k/j) se
+        // reservan para moverse dentro de la ayuda si el contenido no cabe en
+        // pantalla; el resto (incluida la propia Shift+H y los atajos de
+        // vista) la cierra. Así las pantallas pequeñas pueden consultar los
+        // comandos sin filtros de coordinación con el resto de atajos.
         if self.show_help {
-            self.show_help = false;
+            match key.code {
+                KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
+                    self.scroll_help(-1);
+                }
+                KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('j') => {
+                    self.scroll_help(1);
+                }
+                KeyCode::PageUp => self.scroll_help(-8),
+                KeyCode::PageDown => self.scroll_help(8),
+                _ => self.show_help = false,
+            }
             return;
         }
         // Se acepta `h` y `H` con o sin modificador SHIFT: la mayoría de
@@ -349,6 +366,16 @@ impl App {
             }
         }
         key
+    }
+
+    /// Desplaza la tabla de atajos abierta. El límite superior se ajusta en el
+    /// render (depende del tamaño del terminal); aquí solo se mueve el índice.
+    fn scroll_help(&mut self, delta: isize) {
+        if delta < 0 {
+            self.help_scroll = self.help_scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.help_scroll = self.help_scroll.saturating_add(delta as usize);
+        }
     }
 
     /// `true` si la vista está recibiendo texto de teclado: búsqueda con
@@ -720,16 +747,19 @@ impl App {
             self.related.clear_lyrics();
             self.recs.on_track_changed();
         }
-        // La cola se mueve con la reproducción: cada vez que cambia la canción
-        // en curso, el cursor de la lista se sitúa sobre ella para que el
-        // usuario sepa siempre en qué punto de la cola está sonando.
-        if let Some(i) = self
-            .related
-            .tracks
-            .iter()
-            .position(|t| t.identifier() == id)
-        {
-            self.related.list_state.select(Some(i));
+        // La cola se mueve con la reproducción: el cursor de la lista se sitúa
+        // sobre la canción en curso SOLO cuando esta cambia. El motor reporta
+        // estado cada ~500 ms y no puede robarle al usuario la selección con la
+        // que navega/nombra la lista entre canciones.
+        if changed {
+            if let Some(i) = self
+                .related
+                .tracks
+                .iter()
+                .position(|t| t.identifier() == id)
+            {
+                self.related.list_state.select(Some(i));
+            }
         }
         // La sesión decide: sin cambio de canción y con recomendaciones ya
         // cargadas/en vuelo para esta canción, `load_related` no envía nada.
@@ -1124,7 +1154,11 @@ impl App {
                     self.liked.remove(&track);
                 }
                 self.status = Some(if liked {
-                    format!("♥ «{}» añadida a L1K3D.", track.title)
+                    format!(
+                        "{} «{}» añadida a L1K3D.",
+                        crate::ui::glyphs::GLYPHS.heart_liked(),
+                        track.title
+                    )
                 } else {
                     format!("Quitada de L1K3D: «{}».", track.title)
                 });
@@ -1145,29 +1179,61 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        let profile = crate::ui::layout::TerminalProfile::from_rect(area);
+        let (header_h, status_h) = profile.shell_heights();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
+                Constraint::Length(header_h),
                 Constraint::Min(1),
-                Constraint::Length(1),
+                Constraint::Length(status_h),
             ])
             .split(area);
 
-        self.render_header(frame, chunks[0]);
+        self.render_header(frame, chunks[0], profile);
         self.render_view(frame, chunks[1]);
         self.render_status(frame, chunks[2]);
         if self.show_help {
-            self.render_help(frame, area);
+            let (scroll, _) = crate::ui::help::render_help(
+                frame,
+                area,
+                self.help_scroll,
+                profile,
+                *crate::ui::glyphs::GLYPHS,
+            );
+            self.help_scroll = scroll;
         }
     }
 
-    fn render_header(&self, frame: &mut Frame, area: Rect) {
+    fn render_header(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        profile: crate::ui::layout::TerminalProfile,
+    ) {
         let shortcuts = View::ALL
             .iter()
             .map(|v| format!("Shift+{} {}", v.shortcut_digit(), v.label()))
             .collect::<Vec<_>>()
             .join("  ");
+        // Perfil Tiny: el pie de atajos reside en la MISMÍSIMA línea del título
+        // para no robar tres filas al contenido de una ventana diminuta.
+        if profile == crate::ui::layout::TerminalProfile::Tiny {
+            frame.render_widget(
+                Paragraph::new(vec![Line::styled(
+                    format!(
+                        " Tunefold — {} · {}    [{}    · Shift+H Ayuda]",
+                        self.view.label(),
+                        self.playback_line(),
+                        shortcuts
+                    ),
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )])
+                .block(Block::default().borders(Borders::BOTTOM)),
+                area,
+            );
+            return;
+        }
         let text = vec![
             Line::styled(
                 format!(
@@ -1187,67 +1253,19 @@ impl App {
         );
     }
 
-    /// Tabla completa de atajos (Shift+H). Cubre toda la pantalla para que
-    /// quepa y se use bien en ventanas pequeñas. Ordenada por sección.
-    fn render_help(&self, frame: &mut Frame, area: Rect) {
-        let lines = [
-            Line::styled(
-                " Global ",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Line::from("  Shift+1·2·3·4·5·6·7  cambiar de vista   ·    Esc  volver a Now Playing"),
-            Line::from("  q  salir   ·   Ctrl+C  salir forzado   ·   Shift+H  esta ayuda"),
-            Line::styled(
-                " Now Playing / Related ",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Line::from("  Espacio  pausa/reanuda   ·   a  autoplay   ·   v  letras/visual   ·   f  shuffle   ·   t  repetición"),
-            Line::from("  w/s o ↑/↓  mover selección   ·   Enter  reproducir   ·   r  recargar recomendaciones   ·   Shift+R  renovar cola"),
-            Line::from("  Shift+D  siguiente   ·   Shift+A  anterior   ·   l  L1K3D   ·   ←/→  saltar -10s/+10s"),
-            Line::styled(
-                " Búsqueda ",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Line::from("  Enter  buscar   ·   ↑/↓  navegar resultados   ·   ←/→  mover cursor   ·   Esc  volver"),
-            Line::from("  Enter sobre un resultado  reproducir   ·   l  L1K3D del sonando"),
-            Line::styled(
-                " Playlists ",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Line::from("  n  crear   ·   Enter  abrir   ·   p  reproducir cola   ·   d  borrar (solo personales)   ·   Esc  volver"),
-            Line::from("  En una playlist:  Enter  reproducir track   ·   x  quitar   ·   u / Shift+D  mover   ·   Esc  atrás"),
-            Line::styled(
-                " Ajustes / Historial / Metadatos ",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Line::from("  Ajustes:  Enter  guardar   ·   ↑/↓ o Tab  campo   ·   Esc  volver"),
-            Line::from("  Historial/Metadatos:  Shift+5/Shift+6  ver   ·   l  L1K3D"),
-            Line::styled(
-                " Cualquier tecla cierra esta ayuda. ",
-                Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-            ),
-        ];
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(lines.to_vec())
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::new().fg(Color::Cyan))
-                        .title(" Atajos — cualquier tecla cierra "),
-                )
-                .style(Style::new().fg(Color::White)),
-            area,
-        );
-    }
-
+    /// Tabla de atajos (Shift+H). La definición de atajos vive en
+    /// [`crate::ui::help::BINDINGS`] (fuente única) y el popup aquí se delega
+    /// íntegramente a [`crate::ui::help::render_help`]: responsive en columnas,
+    /// con scroll en terminales bajos y cualquier tecla (salvo las de
+    /// desplazamiento) para cerrarla.
     fn playback_line(&self) -> String {
+        let g = &crate::ui::glyphs::GLYPHS;
         let state = match self.playback.state {
-            PlaybackState::Playing => "▶ reproduciendo",
-            PlaybackState::Paused => "⏸ pausado",
-            PlaybackState::Stopped => "⏹ detenido",
-            PlaybackState::Buffering => "⏳ preparando",
-            PlaybackState::Seeking => "🎚 buscando",
+            PlaybackState::Playing => format!("{} reproduciendo", g.play()),
+            PlaybackState::Paused => format!("{} pausado", g.pause()),
+            PlaybackState::Stopped => format!("{} detenido", g.stop()),
+            PlaybackState::Buffering => format!("{} preparando", g.spinner(self.frame)),
+            PlaybackState::Seeking => format!("{} buscando", g.seeking()),
         };
         let track = self
             .playback
@@ -1258,7 +1276,7 @@ impl App {
         if self.playback.stalled {
             format!(
                 "[{state} {} stream lento · rellenando…] {track}",
-                crate::ui::widgets::spinner_phase(self.frame)
+                g.spinner(self.frame)
             )
         } else {
             format!("[{state}] {track}")
@@ -1440,7 +1458,10 @@ impl App {
             .unwrap_or("q: salir · Shift+1..7: cambiar vista");
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("› ", Style::new().fg(Color::Green)),
+                Span::styled(
+                    crate::ui::glyphs::GLYPHS.status(),
+                    Style::new().fg(Color::Green),
+                ),
                 Span::raw(msg),
             ]))
             .style(Style::new().fg(Color::Gray)),
@@ -1455,7 +1476,7 @@ impl App {
         if !notice.is_empty() {
             frame.render_widget(
                 Paragraph::new(Line::from(vec![Span::styled(
-                    format!("☈ {notice} "),
+                    format!("{} {notice} ", crate::ui::glyphs::GLYPHS.notice()),
                     Style::new().fg(Color::DarkGray),
                 )]))
                 .alignment(Alignment::Right)
@@ -2705,6 +2726,98 @@ mod tests {
         );
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.related.list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn queue_cursor_follows_only_on_track_change() {
+        let (tx, _rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        app.view = View::NowPlaying;
+        app.related.tracks = vec![rec_track("a"), rec_track("b"), rec_track("c")];
+        app.now_playing = Some(rec_track("a"));
+
+        // La canción en curso NO cambia: un tick del motor (llega cada
+        // ~500 ms) no debe mover la selección por su cuenta.
+        app.on_new_now_playing(rec_track("a"));
+        assert_eq!(
+            app.related.list_state.selected(),
+            None,
+            "el tick del mismo track no siembra el cursor"
+        );
+
+        // El usuario selecciona otra fila para inspeccionarla; los ticks
+        // siguientes (mismo track) no deben robársela.
+        app.related.list_state.select(Some(2));
+        app.on_new_now_playing(rec_track("a"));
+        assert_eq!(
+            app.related.list_state.selected(),
+            Some(2),
+            "los ticks no secuestran la selección del usuario"
+        );
+
+        // SOLO cuando el track en curso cambia, la lista se alinea en su fila.
+        app.on_new_now_playing(rec_track("b"));
+        assert_eq!(
+            app.related.list_state.selected(),
+            Some(1),
+            "al cambiar de canción el cursor sigue la cola"
+        );
+    }
+
+    /// Renderiza TODAS las vistas en los cinco tamaños objetivo (y con la
+    /// ayuda abierta). Sin pánico y con las secciones esenciales conservadas:
+    /// el sistema adaptativo nunca esconde información por tamaño.
+    #[test]
+    fn renders_every_view_keeps_sections_at_every_terminal_size() {
+        let (tx, _rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        app.now_playing = Some(sample_track());
+        app.playback = PlaybackStatus {
+            track: Some(sample_track()),
+            state: PlaybackState::Playing,
+            position: Duration::from_secs(90),
+            duration: Some(Duration::from_secs(354)),
+            stalled: false,
+        };
+        app.related.tracks = vec![rec_track("a"), rec_track("b"), rec_track("c")];
+
+        for (w, h) in [(120, 40), (100, 30), (80, 24), (70, 20), (60, 15)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+            for view in View::ALL {
+                app.view = view;
+                terminal
+                    .draw(|f| app.render(f))
+                    .unwrap_or_else(|_| panic!("render {view:?} a {w}x{h}"));
+            }
+
+            // Ayuda abierta: el popup también debe dibujarse en cada tamaño.
+            app.show_help = true;
+            terminal
+                .draw(|f| app.render(f))
+                .unwrap_or_else(|_| panic!("ayuda a {w}x{h}"));
+            app.show_help = false;
+            app.help_scroll = 0;
+
+            // La vista Now Playing conserva su sección de recomendaciones en
+            // cualquier perfil (recs >= 3 con título de bloque).
+            app.view = View::NowPlaying;
+            let buffer = {
+                let mut t = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| app.render(f)).unwrap();
+                let buf = t.backend().buffer().clone();
+                buf.content().iter().map(|c| c.symbol()).collect::<String>()
+            };
+            assert!(
+                buffer.contains("Recomendaciones"),
+                "ahora playing a {w}x{h} conserva el panel de recomendaciones"
+            );
+            assert!(
+                buffer.contains("Progreso") || buffer.contains("reproduciendo"),
+                "ahora playing a {w}x{h} conserva la barra de progreso y el estado"
+            );
+        }
     }
 
     #[test]

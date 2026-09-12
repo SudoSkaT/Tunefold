@@ -16,7 +16,10 @@ pub fn render(frame: &mut Frame, area: Rect, sources: &[Source]) {
             .iter()
             .map(|s| {
                 ListItem::new(Line::from(vec![
-                    Span::styled("● ", Style::new().fg(Color::Green)),
+                    Span::styled(
+                        crate::ui::glyphs::GLYPHS.active_source(),
+                        Style::new().fg(Color::Green),
+                    ),
                     Span::raw(s.label()),
                 ]))
             })

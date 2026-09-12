@@ -294,9 +294,14 @@ fn render_listing(
         .iter()
         .map(|pl| {
             let system = pl.kind.is_system();
+            let g = &crate::ui::glyphs::GLYPHS;
             let line = Line::from(vec![
                 Span::styled(
-                    if system { "♥ " } else { "♪ " },
+                    if system {
+                        g.playlist_system()
+                    } else {
+                        g.playlist_user()
+                    },
                     Style::new()
                         .fg(if system { Color::Magenta } else { Color::Cyan })
                         .add_modifier(Modifier::BOLD),
@@ -356,10 +361,11 @@ fn render_create_overlay(frame: &mut Frame, area: Rect, state: &mut PlaylistStat
 
     let box_area = focused_rect(area, 3);
     let prompt = "Nombre de la playlist (Enter=crear, Esc=cancelar):";
+    let g = &crate::ui::glyphs::GLYPHS;
     let input = Paragraph::new(Line::from(vec![
-        Span::styled("▸ ", Style::new().fg(Color::Green)),
+        Span::styled(g.prompt(), Style::new().fg(Color::Green)),
         Span::raw(state.draft.clone()),
-        Span::styled("▌", Style::new().fg(Color::Yellow)),
+        Span::styled(g.edit_cursor(), Style::new().fg(Color::Yellow)),
     ]))
     .block(Block::default().borders(Borders::ALL).title(prompt))
     .style(Style::new());

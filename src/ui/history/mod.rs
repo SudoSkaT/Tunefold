@@ -30,7 +30,7 @@ pub fn render(frame: &mut Frame, area: Rect, entries: &[HistoryEntry], liked: &L
                     Span::raw(format!("{artist} - {}", e.title)),
                     if liked.contains_id(e.track_id) {
                         Span::styled(
-                            "   ♥",
+                            format!("   {}", crate::ui::glyphs::GLYPHS.heart_liked()),
                             Style::new()
                                 .fg(Color::LightRed)
                                 .add_modifier(Modifier::BOLD),

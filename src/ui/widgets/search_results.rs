@@ -46,14 +46,17 @@ pub fn render(
                     },
                 ),
                 if is_rec {
-                    Span::styled("↳ ", Style::new().fg(Color::Yellow))
+                    Span::styled(
+                        crate::ui::glyphs::GLYPHS.recommended(),
+                        Style::new().fg(Color::Yellow),
+                    )
                 } else {
                     Span::raw("")
                 },
                 Span::raw(format!("{artist} - {}", t.title)),
                 if liked.contains(t) {
                     Span::styled(
-                        "   ♥",
+                        format!("   {}", crate::ui::glyphs::GLYPHS.heart_liked()),
                         Style::new()
                             .fg(Color::LightRed)
                             .add_modifier(Modifier::BOLD),
@@ -66,9 +69,17 @@ pub fn render(
                     .map(|s| {
                         Span::styled(
                             if s.recently_played {
-                                format!("  ● reciente · {}×", s.play_count)
+                                format!(
+                                    "  {} reciente · {}×",
+                                    crate::ui::glyphs::GLYPHS.recent(),
+                                    s.play_count
+                                )
                             } else {
-                                format!("  ↻ {}×", s.play_count)
+                                format!(
+                                    "  {} {}×",
+                                    crate::ui::glyphs::GLYPHS.listens(),
+                                    s.play_count
+                                )
                             },
                             Style::new().fg(Color::Green),
                         )

@@ -1,7 +1,11 @@
 //! Vista Now Playing: tarjeta de canción + barra de progreso + panel de
-//! recomendaciones (5 filas visibles, scrollable) + panel de controles.
+//! recomendaciones (scrollable) + panel de controles.
+//!
+//! El reparto vertical lo decide [`crate::ui::layout`] según el perfil del
+//! terminal: son SIEMPRE las mismas secciones, solo cambia su tamaño (nunca
+//! desaparecen, ni en terminales pequeños).
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -10,21 +14,13 @@ use ratatui::Frame;
 use crate::app::audio::{PlaybackState, PlaybackStatus};
 use crate::app::thumbnail::ThumbnailState;
 
+use super::glyphs::GLYPHS;
+use super::layout::{dashboard_layout, TerminalProfile};
 use crate::ui::related::RelatedState;
-use crate::ui::widgets::{progress_bar, song_card, spinner_phase};
+use crate::ui::widgets::{progress_bar, song_card};
 use crate::visualization::palette::VisualPalette;
 use crate::visualization::render as visualizer;
 use crate::visualization::VisualState;
-
-/// Altura del panel de recomendaciones: 5 filas + borde superior/inferior.
-const RECS_HEIGHT: u16 = 7;
-
-/// Altura mínima de la tarjeta "Now Playing": deja sitio para la miniatura
-/// además de los textos de la canción.
-const CARD_HEIGHT_MIN: u16 = 12;
-/// Altura máxima de la tarjeta: gana espacio extra cuando el terminal es alto
-/// (para que la miniatura pueda crecer hasta ~30 filas) sin aplastar el resto.
-const CARD_HEIGHT_MAX: u16 = 34;
 
 #[allow(clippy::too_many_arguments)] // el frame de animación es interno a la vista
 pub fn render(
@@ -44,22 +40,14 @@ pub fn render(
     liked: bool,
     liked_state: &crate::ui::liked::Liked,
 ) {
-    // Banda del visualizador: reservada cuando el terminal tiene altura; con
-    // el análisis inactivo se pinta apagada (nunca salta el layout).
-    let vis_h: u16 = if area.height >= 24 { 4 } else { 0 };
-
-    let card_h = CARD_HEIGHT_MIN
-        .max(area.height.saturating_sub(18 + vis_h))
-        .min(CARD_HEIGHT_MAX);
+    // Reparto adaptativo (todas las secciones presentes, solo cambia el
+    // tamaño). El panel de recomendaciones se clampa para que la lista pueda
+    // crecer sin oprimir a la barra/controles.
+    let profile = TerminalProfile::from_rect(area);
+    let split = dashboard_layout(area, profile);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(card_h),
-            Constraint::Length(vis_h),
-            Constraint::Length(3),
-            Constraint::Length(RECS_HEIGHT),
-            Constraint::Min(0),
-        ])
+        .constraints(split.constraints())
         .split(area);
 
     let state = playback
@@ -67,11 +55,10 @@ pub fn render(
         .as_ref()
         .and_then(|t| thumbnails.get(&t.identifier()));
     song_card::render(frame, chunks[0], playback.track.as_ref(), state, frame_anim);
-    if vis_h > 0 {
-        // La banda del visual es COMPOSICIÓN completa (lava ambiental + barras);
-        // la paleta de la portada ya la fundió el motor en `visual.scene.palette`.
-        visualizer::render(frame, chunks[1], visual, playback.position.as_secs_f32());
-    }
+    // La banda del visual es COMPOSICIÓN completa (lava ambiental + barras);
+    // la paleta de la portada ya la fundió el motor en `visual.scene.palette`.
+    // Con el análisis inactivo el renderer pinta la banda apagada.
+    visualizer::render(frame, chunks[1], visual, playback.position.as_secs_f32());
     progress_bar::render(frame, chunks[2], playback, frame_anim);
 
     let queue_txt = format!(
@@ -110,6 +97,9 @@ pub fn render(
 /// Panel de estado de reproducción bajo el panel de recomendaciones (antes
 /// "Controles" — tabla de atajos; estos viven SOLO en la ayuda Shift+H). Muestra
 /// el fotograma actual de la sesión: estado, posiciones, modo de cola y L1K3D.
+///
+/// En perfiles bajos (Tiny) condensa en una sola línea; solo cambia la forma,
+/// nunca la información.
 #[allow(clippy::too_many_arguments)] // peak, estado, modo de cola y animación son datos del panel
 fn render_controls(
     frame: &mut Frame,
@@ -124,16 +114,20 @@ fn render_controls(
     palette: &VisualPalette,
 ) {
     let state = match playback.state {
-        PlaybackState::Playing => "▶ reproduciendo",
-        PlaybackState::Paused => "⏸ pausado",
-        PlaybackState::Stopped => "⏹ detenido",
-        PlaybackState::Buffering => "⏳ preparando",
-        PlaybackState::Seeking => "🎚 buscando",
+        PlaybackState::Playing => format!(
+            "{} reproduciendo {}",
+            GLYPHS.play(),
+            GLYPHS.activity(frame_anim)
+        ),
+        PlaybackState::Paused => format!("{} pausado", GLYPHS.pause()),
+        PlaybackState::Stopped => format!("{} detenido", GLYPHS.stop()),
+        PlaybackState::Buffering => format!("{} preparando", GLYPHS.spinner(frame_anim)),
+        PlaybackState::Seeking => format!("{} buscando", GLYPHS.seeking()),
     };
     let stall = if playback.stalled {
         format!(
             " · {} red lenta: rellenando buffer…",
-            spinner_phase(frame_anim)
+            GLYPHS.spinner(frame_anim)
         )
     } else {
         String::new()
@@ -177,7 +171,14 @@ fn render_controls(
             palette.secondary[2],
         ))
     };
-    let heart = Span::styled(if liked { "♥" } else { "♡" }, heart_style);
+    let heart = Span::styled(
+        if liked {
+            GLYPHS.heart_liked()
+        } else {
+            GLYPHS.heart_empty()
+        },
+        heart_style,
+    );
     // Posición de reproducción real del motor (la misma que ve la barra de
     // progreso): la extrapolación del karaoke no aplica aquí.
     let elapsed = super::widgets::format_duration(playback.position);
@@ -186,6 +187,23 @@ fn render_controls(
         .map(super::widgets::format_duration)
         .unwrap_or_else(|| "--:--".to_string());
     let autoplay_txt = if autoplay { "ON" } else { "OFF" };
+    if area.height < 5 {
+        // Fila compacta para terminales bajos: misma información, una sola
+        // línea (sin decoración, para no robarle filas a la lista).
+        frame.render_widget(
+            Paragraph::new(vec![Line::from(vec![
+                Span::raw(format!(
+                    "{state}{stall}  ·  {elapsed} / {total}  ·  {shuffle_txt} · {repeat_txt} · autoplay {autoplay_txt}"
+                )),
+                Span::raw("  "),
+                Span::styled("l", Style::new().fg(Color::Cyan)),
+                Span::raw(" L1K3D "),
+                heart,
+            ])]),
+            area,
+        );
+        return;
+    }
     let lines = vec![
         Line::from(vec![Span::raw(format!(
             "{state}{stall}  ·  {elapsed} / {total}"

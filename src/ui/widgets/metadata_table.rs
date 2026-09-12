@@ -42,7 +42,7 @@ pub fn render(frame: &mut Frame, area: Rect, track: &Track, liked: &Liked) {
     // L1K3D: el corazón de la canción en curso, visible aunque sea otra
     // dependencia del track.
     let liked_cell = if liked.contains(track) {
-        "♥ En L1K3D".to_string()
+        format!("{} En L1K3D", crate::ui::glyphs::GLYPHS.heart_liked())
     } else {
         "No en L1K3D · l para marcarla".to_string()
     };

@@ -11,12 +11,13 @@ pub mod thumb;
 use ratatui::layout::Rect;
 use std::time::Duration;
 
-/// Fases de un spinner para animaciones de la TUI (8 estados, 2 símbolos).
-pub(crate) const SPINNER: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+use super::glyphs::GLYPHS;
 
-/// Fase del spinner correspondiente al frame actual de animación.
+/// Fase del spinner correspondiente al frame actual de animación (delegada a
+/// [`crate::ui::glyphs`]: la secuencia y su respaldo ASCII viven en el sistema
+/// de glifos, que es la única fuente).
 pub(crate) fn spinner_phase(frame: u64) -> char {
-    SPINNER[frame as usize % SPINNER.len()]
+    GLYPHS.spinner(frame)
 }
 
 /// Formatea una duración como `m:ss` (o `h:mm:ss` si supera la hora).
