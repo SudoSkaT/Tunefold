@@ -15,7 +15,7 @@ The YouTube/YouTube Music provider component is derived from rustypipe 0.11.4
 code of that modified component is available in this repository, per GPL-3.0
 section 6:
 
-    https://github.com/SudoSkaT/PlayFusion/tree/main/vendor/rustypipe
+    https://github.com/SudoSkaT/Tunefold/tree/main/vendor/rustypipe
 
 All other parts of this program are original works. This NOTICE is served with
 the program to satisfy the Section 5(d) requirement of the GNU General Public

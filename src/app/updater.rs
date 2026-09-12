@@ -9,14 +9,29 @@ use anyhow::{Context, Result};
 
 use crate::infrastructure::dirs;
 
-const RELEASES_API: &str = "https://api.github.com/repos/SudoSkaT/PlayFusion/releases/latest";
+const RELEASES_API: &str = "https://api.github.com/repos/SudoSkaT/Tunefold/releases/latest";
+const REPOS_API: &str = "https://api.github.com/repos/SudoSkaT/Tunefold";
 
 /// Ejecuta `tunefold update`. `dry_run` solo informa de la versión disponible.
 pub async fn run(dry_run: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let client = reqwest::Client::new();
 
-    let release = fetch_latest(&client).await?;
+    let release = match fetch_latest(&client).await? {
+        Some(release) => release,
+        None => {
+            // El repo existe pero no ha publicado ninguna Release todavía. No es
+            // un error: es un mensaje de estado. Un `git tag` suelto no basta
+            // para `update`, porque las binaries se distribuyen como assets de
+            // una GitHub Release.
+            println!("El repositorio todavía no tiene releases publicadas.");
+            println!(
+                "Crea una GitHub Release con el asset «{}» para habilitar `update`.",
+                expected_asset_name()
+            );
+            return Ok(());
+        }
+    };
     let tag = release.tag_name.trim_start_matches('v').to_string();
 
     println!("Versión actual: {current}");
@@ -61,26 +76,60 @@ pub async fn run(dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// Resolución de la última release desde la API de GitHub.
-async fn fetch_latest(client: &reqwest::Client) -> Result<Release> {
-    let resp = client
-        .get(RELEASES_API)
+/// GET a la API oficial de GitHub con los headers mínimos exigidos (User-Agent
+/// da nombre a la app y el `Accept` fija el esquema de la respuesta JSON).
+fn gh_get(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+    client
+        .get(url)
         .header(
             "User-Agent",
             format!("Tunefold/{env}", env = env!("CARGO_PKG_VERSION")),
         )
         .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "GitHub respondió {} (¿tag no existente o rate-limit?).",
-            resp.status()
-        );
+}
+
+/// Resolución de la última release desde la API de GitHub.
+///
+/// `Ok(None)` significa "el repositorio existe pero todavía no tiene releases"
+/// (caso normal antes de la primera publicación); `Err` cubre los fallos de red
+/// y los status que sí requieren atención.
+async fn fetch_latest(client: &reqwest::Client) -> Result<Option<Release>> {
+    let resp = gh_get(client, RELEASES_API).send().await?;
+    let status = resp.status();
+    if status.is_success() {
+        return resp
+            .json()
+            .await
+            .map(Some)
+            .context("respuesta inválida de la API de releases");
     }
-    resp.json()
-        .await
-        .context("respuesta inválida de la API de releases")
+    match status {
+        reqwest::StatusCode::NOT_FOUND => {
+            // `/releases/latest` da 404 en dos casos que hay que distinguir:
+            // repo inexistente/privado, o repo existente sin releases todavía.
+            // El segundo GET lo desambigua.
+            let repo = gh_get(client, REPOS_API).send().await?;
+            if repo.status().is_success() {
+                Ok(None)
+            } else {
+                anyhow::bail!(
+                    "No se encontró el repositorio SudoSkaT/Tunefold (¿privado o renombrado?)."
+                )
+            }
+        }
+        _ => anyhow::bail!(gh_error_message(status)),
+    }
+}
+
+/// Mensaje para un status de la API que no es 2xx ni el 404 de "repos sin
+/// releases": el del rate-limit se distingue de cualquier otro fallo.
+fn gh_error_message(status: reqwest::StatusCode) -> String {
+    match status {
+        reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::FORBIDDEN => {
+            "Rate-limit de la API de GitHub: reintenta en unos minutos.".to_string()
+        }
+        s => format!("GitHub respondió {s}."),
+    }
 }
 
 /// Reemplaza el binario en ejecución por `bytes` (escritura temporal + rename
@@ -181,5 +230,27 @@ mod tests {
         if cfg!(windows) {
             assert!(name.ends_with(".exe"));
         }
+    }
+
+    #[test]
+    fn gh_errors_rate_limit_and_generic() {
+        let rate_limited = |msg: &str| msg.to_lowercase().contains("rate-limit");
+        assert!(
+            rate_limited(&gh_error_message(reqwest::StatusCode::TOO_MANY_REQUESTS)),
+            "el 429 menciona el rate-limit"
+        );
+        assert!(
+            rate_limited(&gh_error_message(reqwest::StatusCode::FORBIDDEN)),
+            "el 403 también se trata como rate-limit"
+        );
+        let generic = gh_error_message(reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            generic.contains("503"),
+            "el resto reporta el status literal"
+        );
+        assert!(
+            !generic.contains("¿tag no existente"),
+            "no reaparece el mensaje ambiguo"
+        );
     }
 }

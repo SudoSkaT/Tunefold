@@ -4,7 +4,7 @@ version = "1.5.3"
 edition = "2021"
 description = "TUI music player and recommendation engine. The YouTube/YouTube Music provider is an optional, GPL-3.0 component built with `--features youtube`."
 license = "GPL-3.0"
-repository = "https://github.com/SudoSkaT/PlayFusion"
+repository = "https://github.com/SudoSkaT/Tunefold"
 
 [lib]
 name = "tunefold"
