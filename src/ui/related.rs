@@ -20,6 +20,7 @@ use crate::domain::lyrics::SyncLyrics;
 use crate::domain::track::Track;
 use crate::infrastructure::storage::TrackListeningStats;
 
+use super::liked::Liked;
 use super::widgets::karaoke::KaraokeScroller;
 use super::VisualContent;
 use crate::visualization::palette::VisualPalette;
@@ -190,6 +191,7 @@ pub fn render(
     mouse: &Option<(u16, u16)>,
     click: &mut bool,
     stats: &std::collections::HashMap<String, TrackListeningStats>,
+    liked: &Liked,
 ) {
     let has_lyrics = state.synced.as_ref().filter(|s| !s.is_empty()).is_some();
     // El visual necesita al menos un poco de altura; si el terminal es bajo se
@@ -265,6 +267,7 @@ pub fn render(
         mouse,
         click,
         stats,
+        liked,
     );
 }
 
@@ -340,7 +343,7 @@ fn render_message_over_scene(frame: &mut Frame, area: Rect, title: &str, text: &
 ///
 /// `current_key` identifica el track en curso (doblete contextual `▶`); el
 /// origen de cada fila y el juego de "nuevas" (green badge) viven en el estado.
-#[allow(clippy::too_many_arguments)] // ratón/estadísticas son datos del render
+#[allow(clippy::too_many_arguments)] // ratón/estadísticas/liked son datos del render
 pub fn render_tracks_list(
     frame: &mut Frame,
     area: Rect,
@@ -351,6 +354,7 @@ pub fn render_tracks_list(
     mouse: &Option<(u16, u16)>,
     click: &mut bool,
     stats: &std::collections::HashMap<String, TrackListeningStats>,
+    liked: &Liked,
 ) {
     if state.tracks.is_empty() {
         frame.render_widget(
@@ -407,6 +411,19 @@ pub fn render_tracks_list(
                     Style::new().fg(Color::Cyan),
                 ),
                 Span::raw(format!("{artist} - {}", t.title)),
+                // L1K3D: corazón lleno y cálido para las canciones que el
+                // usuario ya marcó como "me gusta" (presentes en cualquier
+                // lista de la app, no solo en la playlist propia).
+                if liked.contains(t) {
+                    Span::styled(
+                        "   ♥",
+                        Style::new()
+                            .fg(Color::LightRed)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw("")
+                },
                 Span::styled(format!("  ({duration})"), Style::new().fg(Color::DarkGray)),
                 listened
                     .map(|s| {
@@ -481,6 +498,7 @@ mod tests {
                     &None,
                     &mut false,
                     &std::collections::HashMap::new(),
+                    &Liked::default(),
                 )
             })
             .unwrap();
@@ -639,6 +657,7 @@ mod tests {
                     &None,
                     &mut false,
                     &std::collections::HashMap::new(),
+                    &Liked::default(),
                 )
             })
             .unwrap();

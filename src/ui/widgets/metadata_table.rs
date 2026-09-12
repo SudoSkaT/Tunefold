@@ -7,10 +7,11 @@ use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 use ratatui::Frame;
 
 use crate::domain::track::Track;
+use crate::ui::liked::Liked;
 
 use super::format_duration;
 
-pub fn render(frame: &mut Frame, area: Rect, track: &Track) {
+pub fn render(frame: &mut Frame, area: Rect, track: &Track, liked: &Liked) {
     let artists = track
         .artists
         .iter()
@@ -38,6 +39,20 @@ pub fn render(frame: &mut Frame, area: Rect, track: &Track) {
             format!("{}{release}", a.title)
         })
         .unwrap_or_else(|| "-".to_string());
+    // L1K3D: el corazón de la canción en curso, visible aunque sea otra
+    // dependencia del track.
+    let liked_cell = if liked.contains(track) {
+        "♥ En L1K3D".to_string()
+    } else {
+        "No en L1K3D · l para marcarla".to_string()
+    };
+    let liked_style = if liked.contains(track) {
+        Style::new()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(Color::DarkGray)
+    };
 
     let rows = [
         Row::new(vec![Cell::from("Título"), Cell::from(track.title.clone())]),
@@ -45,6 +60,10 @@ pub fn render(frame: &mut Frame, area: Rect, track: &Track) {
         Row::new(vec![Cell::from("Álbum"), Cell::from(album)]),
         Row::new(vec![Cell::from("Duración"), Cell::from(duration)]),
         Row::new(vec![Cell::from("Fuente"), Cell::from(track.source.label())]),
+        Row::new(vec![
+            Cell::from("L1K3D"),
+            Cell::from(liked_cell).style(liked_style),
+        ]),
         Row::new(vec![
             Cell::from("ISRC"),
             Cell::from(track.isrc.clone().unwrap_or_else(|| "-".to_string())),

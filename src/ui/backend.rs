@@ -663,8 +663,8 @@ impl Backend {
                 }
             }
             // ------------------------------------------------------------- L1K3D
-            BackendCommand::LoadLiked => match self.db.liked_track_ids().await {
-                Ok(ids) => vec![BackendEvent::L1K3D(ids)],
+            BackendCommand::LoadLiked => match self.db.liked_tracks().await {
+                Ok(tracks) => vec![BackendEvent::L1K3D(tracks)],
                 Err(e) => vec![BackendEvent::Error(format!("L1K3D: {e}"))],
             },
             BackendCommand::ToggleLiked(track) => {

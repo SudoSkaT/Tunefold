@@ -8,6 +8,7 @@ pub mod backend;
 pub mod dashboard;
 pub mod event;
 pub mod history;
+pub mod liked;
 pub mod metadata;
 pub mod navigation;
 pub mod playlists;

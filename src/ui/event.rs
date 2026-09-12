@@ -103,9 +103,10 @@ pub enum BackendEvent {
         playlist_id: i64,
         tracks: Vec<Track>,
     },
-    /// Estado L1K3D completo (todos los `track_id` actualmente "liked"). Se
-    /// envía al arrancar para pintar los corazones de cada vista.
-    L1K3D(Vec<i64>),
+    /// Estado L1K3D completo (tracks actualmente "liked"). Se envía al arrancar
+    /// para pintar los corazones de cada vista: cada track trae su id interno y
+    /// su id externo, las dos claves por las que la UI resuelve la pertenencia.
+    L1K3D(Vec<Track>),
     /// Una canción entró/salió de L1K3D (toggle inmediato: la UI ya puede
     /// pintar el corazón lleno/vacío sin volver a consultar la playlist).
     L1K3DChanged {

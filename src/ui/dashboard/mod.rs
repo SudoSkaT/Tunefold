@@ -42,6 +42,7 @@ pub fn render(
     stats: &std::collections::HashMap<String, crate::infrastructure::storage::TrackListeningStats>,
     visual: &VisualState,
     liked: bool,
+    liked_state: &crate::ui::liked::Liked,
 ) {
     // Banda del visualizador: reservada cuando el terminal tiene altura; con
     // el análisis inactivo se pinta apagada (nunca salta el layout).
@@ -89,6 +90,7 @@ pub fn render(
         mouse,
         click,
         stats,
+        liked_state,
     );
 
     render_controls(
@@ -96,6 +98,7 @@ pub fn render(
         chunks[4],
         playback,
         related,
+        autoplay,
         shuffle,
         repeat,
         frame_anim,
@@ -104,13 +107,16 @@ pub fn render(
     );
 }
 
-/// Panel de atajos y estado bajo el panel de recomendaciones.
+/// Panel de estado de reproducción bajo el panel de recomendaciones (antes
+/// "Controles" — tabla de atajos; estos viven SOLO en la ayuda Shift+H). Muestra
+/// el fotograma actual de la sesión: estado, posiciones, modo de cola y L1K3D.
 #[allow(clippy::too_many_arguments)] // peak, estado, modo de cola y animación son datos del panel
 fn render_controls(
     frame: &mut Frame,
     area: Rect,
     playback: &PlaybackStatus,
     related: &RelatedState,
+    autoplay: bool,
     shuffle: bool,
     repeat: crate::playback::queue::RepeatMode,
     frame_anim: u64,
@@ -172,37 +178,43 @@ fn render_controls(
         ))
     };
     let heart = Span::styled(if liked { "♥" } else { "♡" }, heart_style);
+    // Posición de reproducción real del motor (la misma que ve la barra de
+    // progreso): la extrapolación del karaoke no aplica aquí.
+    let elapsed = super::widgets::format_duration(playback.position);
+    let total = playback
+        .duration
+        .map(super::widgets::format_duration)
+        .unwrap_or_else(|| "--:--".to_string());
+    let autoplay_txt = if autoplay { "ON" } else { "OFF" };
     let lines = vec![
+        Line::from(vec![Span::raw(format!(
+            "{state}{stall}  ·  {elapsed} / {total}"
+        ))]),
         Line::from(vec![
-            Span::styled("Espacio", Style::new().fg(Color::Cyan)),
-            Span::raw(" pausa/reanuda · "),
-            Span::styled("←/→", Style::new().fg(Color::Cyan)),
-            Span::raw(" ±10s · "),
-            Span::styled("↑/↓", Style::new().fg(Color::Cyan)),
-            Span::raw(" selección · "),
-            Span::styled("Enter", Style::new().fg(Color::Cyan)),
-            Span::raw(" reproduce la selección"),
-        ]),
-        Line::from(vec![
-            Span::styled("Shift+D/A", Style::new().fg(Color::Cyan)),
-            Span::raw(" siguiente/anterior · "),
-            Span::styled("a", Style::new().fg(Color::Cyan)),
-            Span::raw(" autoplay · "),
-            Span::styled("f", Style::new().fg(Color::Cyan)),
-            Span::raw(" shuffle · "),
-            Span::styled("t", Style::new().fg(Color::Cyan)),
-            Span::raw(" repetir · "),
+            Span::styled(
+                format!(
+                    "{shuffle_txt} · {repeat_txt} · {} en cola",
+                    related.tracks.len()
+                ),
+                Style::new().fg(Color::White),
+            ),
+            Span::raw(format!(" · autoplay {autoplay_txt}")),
+            Span::raw(" · "),
             Span::styled("l", Style::new().fg(Color::Cyan)),
             Span::raw(" L1K3D "),
             heart,
         ]),
-        Line::from(format!(
-            "{state}{stall} · {shuffle_txt} · {repeat_txt} · {} en cola",
-            related.tracks.len()
-        )),
+        Line::styled(
+            "Shift+H: todos los atajos",
+            Style::new().fg(Color::DarkGray),
+        ),
     ];
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Controles ")),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Reproducción "),
+        ),
         area,
     );
 }

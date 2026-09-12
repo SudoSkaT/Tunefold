@@ -1,15 +1,16 @@
 //! Vista de historial de reproducción.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem};
 use ratatui::Frame;
 
 use crate::infrastructure::storage::HistoryEntry;
+use crate::ui::liked::Liked;
 use crate::ui::widgets::format_duration;
 
-pub fn render(frame: &mut Frame, area: Rect, entries: &[HistoryEntry]) {
+pub fn render(frame: &mut Frame, area: Rect, entries: &[HistoryEntry], liked: &Liked) {
     let items: Vec<ListItem> = if entries.is_empty() {
         vec![ListItem::new(Line::from("Sin reproducciones todavía."))]
     } else {
@@ -27,6 +28,16 @@ pub fn render(frame: &mut Frame, area: Rect, entries: &[HistoryEntry]) {
                         Style::new().fg(Color::Cyan),
                     ),
                     Span::raw(format!("{artist} - {}", e.title)),
+                    if liked.contains_id(e.track_id) {
+                        Span::styled(
+                            "   ♥",
+                            Style::new()
+                                .fg(Color::LightRed)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::raw("")
+                    },
                     Span::styled(
                         e.duration
                             .and_then(|ms| u64::try_from(ms).ok())

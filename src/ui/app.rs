@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -97,10 +97,16 @@ pub struct App {
     playlists: Vec<PlaylistRow>,
     /// Sub-estado de la vista Playlists (listado/detalle).
     playlist_view: PlaylistState,
+    /// Tabla de atajos abierta (Shift+H): cubre toda la pantalla y se cierra
+    /// con cualquier tecla. Pide Shift+H porque Shift+h en ciertos teclados
+    /// llega en minúscula con SHIFT (normalizado en `on_key`).
+    show_help: bool,
     /// Ids internos de los tracks "liked" (pertenencia a L1K3D). Se llena con
     /// `BackendEvent::L1K3D` al arrancar y se mantiene con `L1K3DChanged`:
-    /// todas las vistas pintan el corazón a partir de este set (no de queries).
-    liked: std::collections::HashSet<i64>,
+    /// todas las vistas pintan el corazón a partir de este estado (no de
+    /// queries). Se indexa por identificador estable Y por id interno de BD
+    /// para que ningún track sin persistir (id=0) se confunda con otro.
+    liked: super::liked::Liked,
     // Estado del ratón: posición (columna, fila) del último evento y si ha
     // habido un click izquierdo pendiente. El render de una vista con lista
     // (Search, Related, Now Playing) lo consume para seleccionar la fila bajo
@@ -169,7 +175,8 @@ impl App {
             settings: None,
             playlists: Vec::new(),
             playlist_view: PlaylistState::default(),
-            liked: std::collections::HashSet::new(),
+            show_help: false,
+            liked: super::liked::Liked::default(),
             mouse_pos: None,
             mouse_click: false,
             status: None,
@@ -278,9 +285,37 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        // Normaliza el evento fuente antes de despachar: algunos terminales y
+        // teclados (p. ej. el Varmilo de Omarchy) reportan Mayús+letra como el
+        // carácter EN MINÚSCULA con modificador SHIFT en vez de la mayúscula
+        // directamente. Todos los atajos de la app esperan la mayúscula
+        // (`Shift+D` salta cola, `Shift+A` retrocede, `Shift+R` renueva), así
+        // que se unifica aquí y el resto del código asume `Char('D')` y cia.
+        let key = Self::normalize_shift(key);
         // Ctrl+C sale siempre (incluso editando).
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
+            return;
+        }
+
+        // Tabla de atajos (Shift+H): una vez abierta, CUALQUIER tecla (incluida
+        // la propia Shift+H y los atajos de vista) la cierra. Así las pantallas
+        // pequeñas pueden consultar los comandos y cerrarla sin rocas de
+        // coordinación con el resto de atajos.
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+        // Se acepta `h` y `H` con o sin modificador SHIFT: la mayoría de
+        // terminales reportan Mayús+letra SIN el modificador (la mayúscula es
+        // el carácter) y algunos teclados (Varmilo) la mandan en minúscula. El
+        // único filtro real es no estar escribiendo texto (búsqueda, ajustes,
+        // crear playlist), para no tragar la `h` tecleada.
+        if matches!(key.code, KeyCode::Char('h' | 'H'))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !self.is_editing_text()
+        {
+            self.show_help = true;
             return;
         }
 
@@ -299,6 +334,28 @@ impl App {
             View::Playlists => self.on_playlists_key(key),
             _ => self.on_read_only_key(key),
         }
+    }
+
+    /// Convierte Mayús+letra en la MAYÚSCULA equivalente cuando el terminal
+    /// reporta la letra en minúscula con el modificador SHIFT (protocolos que
+    /// no aplican el shift a la letra). Idempotente: si el carácter ya es
+    /// mayúscula, o no viene con SHIFT, o no es ASCII, se devuelve tal cual.
+    fn normalize_shift(mut key: KeyEvent) -> KeyEvent {
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            if let KeyCode::Char(c) = key.code {
+                if c.is_ascii_lowercase() {
+                    key.code = KeyCode::Char(c.to_ascii_uppercase());
+                }
+            }
+        }
+        key
+    }
+
+    /// `true` si la vista está recibiendo texto de teclado: búsqueda con
+    /// cursor activo, formulario de ajustes o el diálogo de crear playlist.
+    /// Los atajos globales no deben tragarse esas pulsaciones.
+    fn is_editing_text(&self) -> bool {
+        self.search.editing || self.view == View::Settings || self.playlist_view.creating
     }
 
     /// Teclas en vistas de solo lectura (Now Playing, Related, Sources, ...).
@@ -662,6 +719,17 @@ impl App {
             // y la sesión se reinicia para pedir recomendaciones frescas.
             self.related.clear_lyrics();
             self.recs.on_track_changed();
+        }
+        // La cola se mueve con la reproducción: cada vez que cambia la canción
+        // en curso, el cursor de la lista se sitúa sobre ella para que el
+        // usuario sepa siempre en qué punto de la cola está sonando.
+        if let Some(i) = self
+            .related
+            .tracks
+            .iter()
+            .position(|t| t.identifier() == id)
+        {
+            self.related.list_state.select(Some(i));
         }
         // La sesión decide: sin cambio de canción y con recomendaciones ya
         // cargadas/en vuelo para esta canción, `load_related` no envía nada.
@@ -1046,14 +1114,14 @@ impl App {
                 // sin inventar una copia local.
                 self.related.set_queue(queue, origins);
             }
-            BackendEvent::L1K3D(track_ids) => {
-                self.liked = track_ids.into_iter().collect();
+            BackendEvent::L1K3D(tracks) => {
+                self.liked.set_tracks(tracks);
             }
             BackendEvent::L1K3DChanged { track, liked } => {
                 if liked {
-                    self.liked.insert(track.id);
+                    self.liked.add(&track);
                 } else {
-                    self.liked.remove(&track.id);
+                    self.liked.remove(&track);
                 }
                 self.status = Some(if liked {
                     format!("♥ «{}» añadida a L1K3D.", track.title)
@@ -1089,6 +1157,9 @@ impl App {
         self.render_header(frame, chunks[0]);
         self.render_view(frame, chunks[1]);
         self.render_status(frame, chunks[2]);
+        if self.show_help {
+            self.render_help(frame, area);
+        }
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -1106,10 +1177,66 @@ impl App {
                 ),
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Line::from(format!("{shortcuts}    ·   1..8 sueltos no navegan")),
+            Line::from(format!(
+                "{shortcuts}    ·   Shift+H Ayuda    ·   1..8 sueltos no navegan"
+            )),
         ];
         frame.render_widget(
             Paragraph::new(text).block(Block::default().borders(Borders::BOTTOM)),
+            area,
+        );
+    }
+
+    /// Tabla completa de atajos (Shift+H). Cubre toda la pantalla para que
+    /// quepa y se use bien en ventanas pequeñas. Ordenada por sección.
+    fn render_help(&self, frame: &mut Frame, area: Rect) {
+        let lines = [
+            Line::styled(
+                " Global ",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Line::from("  Shift+1·2·3·4·5·6·7  cambiar de vista   ·    Esc  volver a Now Playing"),
+            Line::from("  q  salir   ·   Ctrl+C  salir forzado   ·   Shift+H  esta ayuda"),
+            Line::styled(
+                " Now Playing / Related ",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Line::from("  Espacio  pausa/reanuda   ·   a  autoplay   ·   v  letras/visual   ·   f  shuffle   ·   t  repetición"),
+            Line::from("  w/s o ↑/↓  mover selección   ·   Enter  reproducir   ·   r  recargar recomendaciones   ·   Shift+R  renovar cola"),
+            Line::from("  Shift+D  siguiente   ·   Shift+A  anterior   ·   l  L1K3D   ·   ←/→  saltar -10s/+10s"),
+            Line::styled(
+                " Búsqueda ",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Line::from("  Enter  buscar   ·   ↑/↓  navegar resultados   ·   ←/→  mover cursor   ·   Esc  volver"),
+            Line::from("  Enter sobre un resultado  reproducir   ·   l  L1K3D del sonando"),
+            Line::styled(
+                " Playlists ",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Line::from("  n  crear   ·   Enter  abrir   ·   p  reproducir cola   ·   d  borrar (solo personales)   ·   Esc  volver"),
+            Line::from("  En una playlist:  Enter  reproducir track   ·   x  quitar   ·   u / Shift+D  mover   ·   Esc  atrás"),
+            Line::styled(
+                " Ajustes / Historial / Metadatos ",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Line::from("  Ajustes:  Enter  guardar   ·   ↑/↓ o Tab  campo   ·   Esc  volver"),
+            Line::from("  Historial/Metadatos:  Shift+5/Shift+6  ver   ·   l  L1K3D"),
+            Line::styled(
+                " Cualquier tecla cierra esta ayuda. ",
+                Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ),
+        ];
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines.to_vec())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().fg(Color::Cyan))
+                        .title(" Atajos — cualquier tecla cierra "),
+                )
+                .style(Style::new().fg(Color::White)),
             area,
         );
     }
@@ -1162,7 +1289,7 @@ impl App {
                 let is_liked = self
                     .now_playing
                     .as_ref()
-                    .map(|t| self.liked.contains(&t.id))
+                    .map(|t| self.is_liked(t))
                     .unwrap_or(false);
                 dashboard::render(
                     frame,
@@ -1179,6 +1306,7 @@ impl App {
                     &self.listening_stats,
                     &state,
                     is_liked,
+                    &self.liked,
                 );
             }
             View::Related => {
@@ -1207,6 +1335,7 @@ impl App {
                     &self.mouse_pos,
                     &mut self.mouse_click,
                     &self.listening_stats,
+                    &self.liked,
                 );
             }
             View::Search => search::render(
@@ -1216,10 +1345,11 @@ impl App {
                 &self.mouse_pos,
                 &mut self.mouse_click,
                 &self.listening_stats,
+                &self.liked,
             ),
             View::Sources => sources::render(frame, area, &self.sources),
-            View::Metadata => metadata::render(frame, area, self.now_playing.as_ref()),
-            View::History => history::render(frame, area, &self.history),
+            View::Metadata => metadata::render(frame, area, self.now_playing.as_ref(), &self.liked),
+            View::History => history::render(frame, area, &self.history, &self.liked),
             View::Settings => {
                 if let Some(settings) = self.settings.as_mut() {
                     settings::render(frame, area, settings);
@@ -1234,6 +1364,7 @@ impl App {
                 &self.mouse_pos,
                 &mut self.mouse_click,
                 &self.listening_stats,
+                &self.liked,
             ),
         }
     }
@@ -1248,6 +1379,11 @@ impl App {
                 ThumbnailState::Loaded(img) => img.palette,
                 _ => None,
             })
+    }
+
+    /// ¿Está este track en L1K3D? Fuente única para todas las vistas.
+    fn is_liked(&self, track: &Track) -> bool {
+        self.liked.contains(track)
     }
 
     /// Posición "ahora mismo" según el reloj maestro (delega en
@@ -1462,6 +1598,38 @@ mod tests {
             app.on_key(key);
             assert_eq!(app.view, view, "atajo Shift+{digit}");
         }
+    }
+
+    #[test]
+    fn help_overlay_toggles_on_h_and_any_key_closes() {
+        let (tx, _rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        app.view = View::NowPlaying;
+        assert!(!app.show_help);
+
+        // `H` sin modificador (terminal que no reporta SHIFT) abre la ayuda.
+        app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
+        assert!(
+            app.show_help,
+            "H (mayúscula sin modificador) debe abrir la ayuda"
+        );
+
+        // Cualquier otra tecla la cierra.
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(!app.show_help, "cualquier tecla cierra la ayuda");
+
+        // Minúscula + SHIFT (teclado Varmilo) también abre: `normalize_shift`
+        // la convierte en mayúscula y el filtro `h|H` la admite.
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::SHIFT));
+        assert!(app.show_help, "h+SHIFT (Varmilo) debe abrir la ayuda");
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.show_help, "q también la cierra");
+
+        // Escribiendo texto (búsqueda con cursor) NO se abre ni se traga la `h`.
+        app.view = View::Search;
+        app.search.editing = true;
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(!app.show_help, "en búsqueda la h es texto, no ayuda");
     }
 
     #[test]

@@ -12,6 +12,7 @@ use ratatui::Frame;
 
 use crate::domain::track::Track;
 use crate::infrastructure::storage::TrackListeningStats;
+use crate::ui::liked::Liked;
 use crate::ui::widgets::search_results;
 
 use super::navigation::ListSelection;
@@ -113,6 +114,7 @@ pub fn render(
     mouse: &Option<(u16, u16)>,
     click: &mut bool,
     stats: &std::collections::HashMap<String, TrackListeningStats>,
+    liked: &Liked,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -177,6 +179,7 @@ pub fn render(
             hovered,
             state.related_from,
             stats,
+            liked,
         );
     }
 }

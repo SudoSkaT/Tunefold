@@ -10,9 +10,11 @@ use ratatui::Frame;
 
 use crate::domain::track::Track;
 use crate::infrastructure::storage::TrackListeningStats;
+use crate::ui::liked::Liked;
 
 /// Renderiza los resultados. `hovered` es el índice bajo el cursor (si lo hay)
 /// y se resalta con `fg(Gray)` para no confundirlo con la selección activa.
+#[allow(clippy::too_many_arguments)] // resultados, estado, hover y metadatos son datos del render
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -21,6 +23,7 @@ pub fn render(
     hovered: Option<usize>,
     related_from: usize,
     stats: &std::collections::HashMap<String, TrackListeningStats>,
+    liked: &Liked,
 ) {
     let items: Vec<ListItem> = results
         .iter()
@@ -48,6 +51,16 @@ pub fn render(
                     Span::raw("")
                 },
                 Span::raw(format!("{artist} - {}", t.title)),
+                if liked.contains(t) {
+                    Span::styled(
+                        "   ♥",
+                        Style::new()
+                            .fg(Color::LightRed)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw("")
+                },
                 Span::styled(format!("  ({duration})"), Style::new().fg(Color::DarkGray)),
                 listened
                     .map(|s| {

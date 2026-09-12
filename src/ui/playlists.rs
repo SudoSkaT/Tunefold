@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use crate::domain::track::Track;
 use crate::infrastructure::storage::{PlaylistRow, TrackListeningStats};
 
+use super::liked::Liked;
 use super::navigation::ListSelection;
 use super::related::{render_tracks_list, RelatedState};
 
@@ -250,6 +251,7 @@ pub fn render(
     mouse: &Option<(u16, u16)>,
     click: &mut bool,
     stats: &std::collections::HashMap<String, TrackListeningStats>,
+    liked: &Liked,
 ) {
     if let Some(detail) = state.detail.as_mut() {
         let count = detail.tracks.tracks.len();
@@ -269,6 +271,7 @@ pub fn render(
             mouse,
             click,
             stats,
+            liked,
         );
         return;
     }
