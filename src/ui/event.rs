@@ -4,7 +4,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 
 use std::sync::Arc;
 
-use crate::analysis::{AudioFeatures, WaveformEnvelope};
+use crate::analysis::{AudioFeatures, StereoWaveform};
 use crate::app::aggregator::SearchOutcome;
 use crate::app::audio::PlaybackStatus;
 use crate::app::thumbnail::ThumbnailState;
@@ -102,7 +102,7 @@ pub enum BackendEvent {
     /// y un solo evento ⇒ un solo redraw.
     VisualFrame {
         features: Arc<AudioFeatures>,
-        waveform: Option<Arc<WaveformEnvelope>>,
+        waveform: Option<Arc<StereoWaveform>>,
     },
     Playlists(Vec<PlaylistRow>),
     PlaylistTracks {

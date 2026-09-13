@@ -23,7 +23,7 @@ use super::fft::SpectrumAnalyzer;
 use super::onset::{FluxAnalyzer, OnsetDetector};
 use super::ring::SpScRing;
 use super::smoother::{FeatureSmoother, SMOOTHED_CHANNELS};
-use super::waveform::{WaveformBus, WaveformEnvelope};
+use super::waveform::{StereoWaveform, WaveformBus};
 
 /// Configuración del pipeline DSP.
 #[derive(Debug, Clone, Copy)]
@@ -175,10 +175,15 @@ fn run(
     let mut bpm = BpmEstimator::new(86.13); // recalibrado al conocer sample_rate
     let mut smoother = FeatureSmoother::new(12.0, 4.0);
 
-    let mut window: VecDeque<f32> = VecDeque::with_capacity(config.fft_size);
+    let mut left_window: VecDeque<f32> = VecDeque::with_capacity(config.fft_size);
+    let mut right_window: VecDeque<f32> = VecDeque::with_capacity(config.fft_size);
     // Buffers reutilizados hop tras hop: cero allocations en el camino caliente
     // (los únicos allocs por frame son los snapshots Arc de los dos buses).
+    // `left_buf`/`right_buf` son las fotos de ventana por canal (envelope); el
+    // FFT se alimenta con `frame_buf` = (L+R)/2 (downmix mono, sin allocs).
     let mut frame_buf: Vec<f32> = Vec::with_capacity(config.fft_size);
+    let mut left_buf: Vec<f32> = Vec::with_capacity(config.fft_size);
+    let mut right_buf: Vec<f32> = Vec::with_capacity(config.fft_size);
     let mut mags_buf: Vec<f32> = Vec::with_capacity(config.fft_size / 2);
     let mut since_hop = 0usize;
     let mut hops_analyzed = 0u64;
@@ -199,7 +204,8 @@ fn run(
         // para que la pista siguiente arranque limpia (sin cola de la vieja).
         if n == 0 {
             if !flushed_on_gap && last_data.elapsed() > Duration::from_millis(300) {
-                window.clear();
+                left_window.clear();
+                right_window.clear();
                 since_hop = 0;
                 hops_analyzed = 0;
                 flux = FluxAnalyzer::new();
@@ -209,7 +215,7 @@ fn run(
                 bpm_hold = 0.0;
                 flushed_on_gap = true;
                 let _ = bus.publish(AudioFeatures::silent(Duration::ZERO));
-                let _ = waveform.publish(WaveformEnvelope::silent());
+                let _ = waveform.publish(StereoWaveform::silent());
             }
             std::thread::sleep(Duration::from_millis(4));
             continue;
@@ -221,7 +227,8 @@ fn run(
         let announced = *meta_cell.lock().unwrap();
         if announced != current_meta {
             current_meta = announced;
-            window.clear();
+            left_window.clear();
+            right_window.clear();
             since_hop = 0;
             hops_analyzed = 0;
             flux = FluxAnalyzer::new();
@@ -229,7 +236,7 @@ fn run(
             bpm = BpmEstimator::new(hop_rate_of(current_meta, &config));
             smoother.reset();
             bpm_hold = 0.0;
-            let _ = waveform.publish(WaveformEnvelope::silent());
+            let _ = waveform.publish(StereoWaveform::silent());
         }
         let Some(meta) = current_meta else {
             // Sin formato anunciado aún: descartar datos hasta el announce.
@@ -237,27 +244,42 @@ fn run(
         };
         let hop_time = config.hop as f32 / meta.sample_rate as f32;
 
-        // Downmix a mono y acumulación en la ventana deslizante.
+        // Acumulación en las ventanas deslizantes POR CANAL (el osciloscopio
+        // es estéreo; el downmix a mono solo alimenta el FFT).
         let ch = meta.channels.max(1) as usize;
         let frames = n / ch;
-        for f in 0..frames {
-            let base = f * ch;
-            let mut sum = 0.0f32;
-            for c in 0..ch {
-                sum += buf[base + c];
+        if ch == 1 {
+            // Mono: L = R = la señal (el renderer la pinta centrada).
+            for &s in &buf[..frames] {
+                push_window(&mut left_window, config.fft_size, s);
+                push_window(&mut right_window, config.fft_size, s);
+                since_hop += 1;
             }
-            window.push_back(sum / ch as f32);
-            if window.len() > config.fft_size {
-                window.pop_front();
+        } else {
+            // Estéreo/multicanal: L = ch0, R = ch1 (muestras interlapadas).
+            for f in 0..frames {
+                let base = f * ch;
+                push_window(&mut left_window, config.fft_size, buf[base]);
+                push_window(&mut right_window, config.fft_size, buf[base + 1]);
+                since_hop += 1;
             }
-            since_hop += 1;
         }
 
         // Analizar cada `hop` muestras nuevas (overlap natural de la ventana).
-        while since_hop >= config.hop && window.len() == config.fft_size {
+        while since_hop >= config.hop
+            && left_window.len() == config.fft_size
+            && right_window.len() == config.fft_size
+        {
             since_hop -= config.hop;
             frame_buf.clear();
-            frame_buf.extend(window.iter().copied());
+            left_buf.clear();
+            right_buf.clear();
+            for (i, &l) in left_window.iter().enumerate() {
+                let r = right_window[i];
+                frame_buf.push((l + r) * 0.5);
+                left_buf.push(l);
+                right_buf.push(r);
+            }
             hops_analyzed += 1;
 
             let raw = analyze_frame(meta, &mut analyzer, &mut flux, &frame_buf, &mut mags_buf);
@@ -298,11 +320,21 @@ fn run(
                 bpm: bpm_hold,
             };
             bus.publish(features);
-            // La envolvente del MISMO hop (misma ventana): el consumidor visual
-            // la decima al ancho del terminal. Un Arc por frame ≈ 1 alloc extra
-            // por hop (documentada; la ruta del audio no la ve).
-            waveform.publish(WaveformEnvelope::from_window(&frame_buf));
+            // La envolvente ESTÉREO del MISMO hop (misma ventana): el
+            // consumidor visual la decima al ancho del terminal y la pinta por
+            // puntos, conservando pico Y valle de cada canal. Un Arc por frame
+            // ≈ 1 alloc extra por hop (documentada; la ruta del audio no la ve).
+            waveform.publish(StereoWaveform::from_windows(&left_buf, &right_buf));
         }
+    }
+}
+
+/// Empuja una muestra a una ventana deslizante de longitud fija (reusa el
+/// VecDeque sin realojar: push_back + pop_front cuando excede).
+fn push_window(window: &mut VecDeque<f32>, fft_size: usize, sample: f32) {
+    window.push_back(sample);
+    if window.len() > fft_size {
+        window.pop_front();
     }
 }
 
@@ -417,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_publishes_waveform_envelopes_from_sine() {
+    fn engine_publishes_stereo_waveform_from_sine() {
         const SR: u32 = 44_100;
         const CH: u16 = 2;
         let runtime = AnalysisRuntime::spawn(AnalysisConfig::default());
@@ -432,7 +464,9 @@ mod tests {
         assert!(waveform.latest().is_none(), "sin audio ⇒ sin envolvente");
 
         // El mismo seno que alimenta features debe publicar envolventes:
-        // llenar ~1 s de audio interleaveado.
+        // llenar ~1 s de audio interleaveado (L y R comparten la señal ⇒
+        // ambas curvas deben coincidir). El valor de cada frame se duplica
+        // a L y R para que la/envolvente resultante sea idéntica.
         let total = (SR as usize) * CH as usize;
         let mut fed = 0usize;
         let mut i = 0usize;
@@ -440,7 +474,8 @@ mod tests {
             let batch_len = (4096).min(total - fed);
             let batch: Vec<f32> = (0..batch_len)
                 .map(|_| {
-                    let s = sine_wave(120.0, SR as f32, i as f32 / SR as f32, 0.5);
+                    let frame = i / CH as usize;
+                    let s = sine_wave(120.0, SR as f32, frame as f32 / SR as f32, 0.5);
                     i += 1;
                     s
                 })
@@ -453,23 +488,93 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut got = None;
         while Instant::now() < deadline {
-            if let Some(env) = waveform.latest() {
-                if env.peak() > 0.05 {
-                    got = Some(env);
+            if let Some(st) = waveform.latest() {
+                if st.peak() > 0.05 {
+                    got = Some(st);
                     break;
                 }
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let env = got.expect("el motor publica envolventes con contenido");
+        let st = got.expect("el motor publica envolventes estéreo con contenido");
         assert!(
-            env.min.iter().zip(env.max.iter()).all(|(lo, hi)| lo <= hi),
-            "min ≤ max en todos los buckets"
+            st.left
+                .min
+                .iter()
+                .zip(st.left.max.iter())
+                .all(|(lo, hi)| lo <= hi)
+                && st
+                    .right
+                    .min
+                    .iter()
+                    .zip(st.right.max.iter())
+                    .all(|(lo, hi)| lo <= hi),
+            "min ≤ max en todos los buckets de ambos canales"
         );
         assert!(
-            env.peak() <= 1.0,
+            st.peak() <= 1.0,
             "amplitud normalizada (peaks ≤ 1): {}",
-            env.peak()
+            st.peak()
+        );
+        // Misma señal en L y R ⇒ curvas idénticas en cada bucket.
+        assert_eq!(st.left, st.right, "el seno compartido clona ambas curvas");
+    }
+
+    #[test]
+    fn engine_splits_stereo_channels_into_distinct_waveforms() {
+        const SR: u32 = 44_100;
+        let runtime = AnalysisRuntime::spawn(AnalysisConfig::default());
+        let waveform = runtime.waveform_bus();
+        let tap = runtime.tap();
+        tap.announce(StreamMeta {
+            sample_rate: SR,
+            channels: 2,
+        });
+
+        // L = seno de 120 Hz, R = seno de 660 Hz: curvas distinta energía
+        // por bucket (no se mezclan ni se cancelan).
+        let total = (SR as usize) * 2usize;
+        let mut fed = 0usize;
+        let mut i = 0usize;
+        while fed < total {
+            let batch_len = (4096).min(total - fed);
+            let batch: Vec<f32> = (0..batch_len)
+                .map(|_| {
+                    let t = i as f32 / SR as f32;
+                    let s = if i.is_multiple_of(2) {
+                        sine_wave(120.0, SR as f32, t, 0.6)
+                    } else {
+                        sine_wave(660.0, SR as f32, t, 0.6)
+                    };
+                    i += 1;
+                    s
+                })
+                .collect();
+            tap.feed(&batch);
+            fed += batch.len();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = None;
+        while Instant::now() < deadline {
+            if let Some(st) = waveform.latest() {
+                if st.left.peak() > 0.1 {
+                    got = Some(st);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let st = got.expect("el canal L dominante se publica con contenido");
+        assert!(
+            st.left != st.right,
+            "señales distintas ⇒ curvas distintas (no se mezclan)"
+        );
+        assert!(
+            st.left.peak() > 0.3,
+            "L conserva su energía: {}",
+            st.left.peak()
         );
     }
 }

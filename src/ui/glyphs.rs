@@ -217,6 +217,23 @@ impl UiGlyphs {
     pub fn status(self) -> &'static str {
         self.pick("›", ">")
     }
+
+    // ------------------------------------------ osciloscopio estéreo (§8)
+
+    /// Punto de trazo del canal IZQUIERDO (ch0).
+    pub fn trace_left(self) -> &'static str {
+        self.pick("●", "*")
+    }
+
+    /// Punto de trazo del canal DERECHO (ch1).
+    pub fn trace_right(self) -> &'static str {
+        self.pick("●", "*")
+    }
+
+    /// Punto de trazo cuando L y R comparten celda (ambos caen ahí).
+    pub fn trace_both(self) -> &'static str {
+        self.pick("●", "*")
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +251,9 @@ mod tests {
         assert_ne!(U.pause(), A.pause());
         assert_ne!(U.stop(), A.stop());
         assert_ne!(U.seeking(), A.seeking());
+        assert_ne!(U.trace_left(), A.trace_left());
+        assert_ne!(U.trace_right(), A.trace_right());
+        assert_ne!(U.trace_both(), A.trace_both());
         let ascii_variants = [
             A.current(),
             A.newly_added(),
@@ -247,6 +267,9 @@ mod tests {
             A.active_source(),
             A.prompt(),
             A.status(),
+            A.trace_left(),
+            A.trace_right(),
+            A.trace_both(),
         ];
         for name in ascii_variants {
             assert_eq!(
@@ -254,6 +277,16 @@ mod tests {
                 0,
                 "el tema ASCII de «{name}» debe ser 7-bit ASCII"
             );
+        }
+    }
+
+    #[test]
+    fn trace_points_are_width_one_in_both_themes() {
+        for g in [U.trace_left(), U.trace_right(), U.trace_both()] {
+            assert_eq!(g.chars().count(), 1, "punto «{g}» es un único carácter");
+        }
+        for g in [A.trace_left(), A.trace_right(), A.trace_both()] {
+            assert_eq!(g.chars().count(), 1);
         }
     }
 

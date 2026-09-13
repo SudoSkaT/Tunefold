@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::analysis::{AudioFeatures, WaveformEnvelope};
+use crate::analysis::{AudioFeatures, StereoWaveform};
 use crate::app::audio::{PlaybackState, PlaybackStatus};
 use crate::app::thumbnail::ThumbnailState;
 use crate::domain::source::Source;
@@ -140,8 +140,8 @@ pub struct App {
     visual_mode: VisualContent,
     /// Último snapshot de features recibido del backend.
     features: Option<Arc<AudioFeatures>>,
-    /// Envolvente de forma de onda del MISMO snapshot (misma cadencia).
-    waveform: Option<Arc<WaveformEnvelope>>,
+    /// Envolvente ESTÉREO de forma de onda del MISMO snapshot (misma cadencia).
+    waveform: Option<Arc<StereoWaveform>>,
     /// Instante de recepción del último snapshot (frescura ~900 ms).
     features_at: Option<std::time::Instant>,
     /// Contador de frames para animaciones de la TUI (spinner, avisos).
@@ -2813,7 +2813,10 @@ mod tests {
         app.features = Some(Arc::new(crate::analysis::AudioFeatures::silent(
             Duration::ZERO,
         )));
-        app.waveform = Some(Arc::new(WaveformEnvelope::from_window(&[0.15; 2048])));
+        app.waveform = Some(Arc::new(StereoWaveform::from_windows(
+            &[0.15; 2048],
+            &[0.15; 2048],
+        )));
         app.features_at = Some(std::time::Instant::now());
 
         for (w, h) in [(120, 40), (100, 30), (80, 24), (70, 20), (60, 15)] {

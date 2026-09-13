@@ -1,17 +1,23 @@
-//! Renderer TUI de la escena visual: osciloscopio de forma de onda + barras.
+//! Renderer TUI de la escena visual: osciloscopio ESTÉREO de forma de onda +
+//! barras.
 //!
 //! Responsabilidad EXCLUSIVA de renderizar (spec §25/§20): sin análisis, sin
 //! HTTP, sin providers, sin relojes. Todo lo que pinta está en el estado que
-//! recibe. La escena es la envolvente min/max del PCM (`WaveformView`)
+//! recibe. La escena es la envolvente min/max del PCM POR CANAL (`WaveformView`)
 //! decimada al ancho del área: por cada columna se vuelcan los buckets que le
-//! tocan y se pinta UNA LÍNEA que sigue la señal (`(min+max)/2`), con glifos
-//! de CUADRANTES (rejilla 2×2 por celda: ▘▝▖▗▀▄▌▐▞▚▛▜▙▟█) — resolución
-//! sub-celda en horizontal Y vertical, casi 4× la de un medio bloque — y un
-//! resplandor suave de fondo a su alrededor. El trazo se lee como una curva
-//! continua, sin "bloques": cada celda pinta una confluencia de cuadrantes
-//! que modela la diagonal real de la señal. Las barras EQ son el espectro
-//! discreto bajo el trazo. Toda la colorimetría sale de [`VisualPalette`] —
-//! nunca se deriva aquí.
+//! tocan y se pintan PUNTOS en las filas del PICO (max) y del VALLE (min) de
+//! cada canal (spec §8). Cada canal tiene su propio color (`ChannelColors`,
+//! derivado de la portada) y su propio resplandor de fondo; todo el trazo se
+//! dibuja con puntos `●` (ASCII `*`), y cuando L y R comparten celda se pinta el
+//! tinte combinado de mezcla — ninguna de las dos curvas se pierde.
+//!
+//! El trazado es un plot de puntos (no una banda ni una línea interpolada):
+//! pico y valle de la TRUE forma de onda quedan visibles columna a columna. El
+//! camino caliente NO asigna memoria por draw (solo `[u16; 2]` en el stack por
+//! columna); los glifos salen del sistema central [`UiGlyphs`] (Unicode `●` /
+//! ASCII `*`). Un resplandor suave acompaña a cada curva de fondo. Las barras
+//! EQ son el espectro discreto bajo el trazo. Toda la colorimetría sale de
+//! [`VisualPalette`] — nunca se deriva aquí.
 
 use ratatui::layout::{Margin, Position, Rect};
 use ratatui::style::{Color, Style};
@@ -19,7 +25,8 @@ use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
-use crate::analysis::WAVEFORM_BUCKETS;
+use crate::analysis::{WaveformEnvelope, WAVEFORM_BUCKETS};
+use crate::ui::glyphs::UiGlyphs;
 use crate::visualization::engine::VisualState;
 use crate::visualization::palette::VisualPalette;
 use crate::visualization::VISUAL_BARS;
@@ -32,8 +39,8 @@ const RAMP: [&str; 8] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇"];
 /// 2 filas, cada fila cubre 0..=8 y la columna total 0..=16 niveles.
 const RAMP_TALL: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
-/// Radio (en filas) del resplandor que acompaña a la línea del osciloscopio:
-/// la celda de la línea se tiñe al máximo y el halo decae linealmente hasta
+/// Radio (en filas) del resplandor que acompaña a cada curva del osciloscopio:
+/// la celda de la curva se tiñe al máximo y el halo decae linealmente hasta
 /// cero a esta distancia. Ceñido (menos de una fila): el trazado se lee fino y
 /// limpio, sin "engordar" la señal con un brillo difuso ancho.
 const GLOW_RADIUS: f32 = 0.75;
@@ -76,40 +83,72 @@ fn column_bucket_range(w: usize, col: usize) -> (usize, usize) {
     (lo, hi)
 }
 
-/// Envolvente min/max de los buckets que tocan la columna.
-fn column_span(
-    view: &crate::visualization::engine::WaveformView,
-    w: usize,
-    col: usize,
-) -> (f32, f32) {
+/// Envolvente min/max de los buckets que tocan la columna, de UN canal.
+fn channel_column_span(channel: &WaveformEnvelope, w: usize, col: usize) -> (f32, f32) {
     let (lo, hi) = column_bucket_range(w, col);
     let mut mn = f32::INFINITY;
     let mut mx = f32::NEG_INFINITY;
     for b in lo..hi {
-        mn = mn.min(view.min[b]);
-        mx = mx.max(view.max[b]);
+        mn = mn.min(channel.min[b]);
+        mx = mx.max(channel.max[b]);
     }
     (mn, mx)
 }
 
-/// Color del trazo según la amplitud de la columna (misma rampa que las barras).
-fn trace_rgb(amplitude: f32, palette: &VisualPalette) -> [u8; 3] {
-    match (amplitude * 4.0) as usize {
-        0 => mix_c(palette.primary, [110, 110, 110], 0.5),
-        1 => palette.accent,
-        2 => palette.secondary,
-        _ => palette.primary,
+/// Fila (0..h) que le corresponde a una amplitud `value` (con signo): el centro
+/// de la celda más cercana a `center - value*scale` (redondeo determinista).
+fn row_of(value: f32, center: f32, scale: f32, h: usize) -> u16 {
+    let y = center - value.clamp(-1.0, 1.0) * scale;
+    y.round().clamp(0.0, (h - 1) as f32) as u16
+}
+
+/// Filas donde debe pintarse UN canal en la columna: el VALLE (`min`) y el
+/// PICO (`max`) de su envolvente, deduplicados si caen en la misma celda.
+///
+/// Devuelve como máximo 2 filas (sin allocs: `[u16; 2]` en el stack). Una
+/// columna sin datos cae al centro (línea base continua).
+fn channel_rows(
+    channel: &WaveformEnvelope,
+    w: usize,
+    col: usize,
+    center: f32,
+    scale: f32,
+    h: usize,
+) -> ([u16; 2], usize) {
+    let mut rows = [0u16; 2];
+    let (mn, mx) = channel_column_span(channel, w, col);
+    let mut n = 0usize;
+    for value in [mn, mx] {
+        let row = row_of(value, center, scale, h);
+        if !rows[..n].contains(&row) {
+            rows[n] = row;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        rows[0] = (h / 2) as u16;
+        n = 1;
+    }
+    (rows, n)
+}
+
+/// Pinta el punto de trazo (símbolo y color; no toca el fondo, que lo dejó el
+/// resplandor de [`render_backdrop`]).
+fn paint_point(frame: &mut Frame, x: u16, y: u16, symbol: &str, color: [u8; 3]) {
+    // SAFETY(ninguna): API pública de ratatui; celdas del área interior.
+    if let Some(cell) = frame.buffer_mut().cell_mut(Position { x, y }) {
+        cell.set_symbol(symbol);
+        cell.set_style(Style::new().fg(to_color(color)));
     }
 }
 
-/// Pinta la capa ambiental (osciloscopio) sobre TODO `area`.
+/// Pinta la capa ambiental (osciloscopio ESTÉREO) sobre TODO `area`.
 ///
 /// Solo toca el fondo de cada celda (spec: la capa ambiental debe poder vivir
-/// detrás de las letras). En lugar de rellenar la banda vertical entre min y
-/// max, tiñe solo un RESPLANDOR suave alrededor de la línea de la señal
-/// (decae a [`GLOW_RADIUS`] filas): el trazado queda fino y el área, limpia.
-/// `subdued` aterriza la escena (reduce resplandor y energía) para que el
-/// texto superior siga siendo legible.
+/// detrás de las letras). Tiñe un RESPLANDOR suave alrededor de las DOS curvas
+/// (L y R, una por canal; decae a [`GLOW_RADIUS`] filas): el trazado queda fino
+/// y el área, limpia. `subdued` aterriza la escena (reduce resplandor y
+/// energía) para que el texto superior siga siendo legible.
 pub fn render_backdrop(frame: &mut Frame, area: Rect, state: &VisualState, subdued: bool) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -134,39 +173,45 @@ pub fn render_backdrop(frame: &mut Frame, area: Rect, state: &VisualState, subdu
     let center = h as f32 * 0.5;
     let scale = (center * 0.92).max(1.0) * scene.waveform.gain;
 
+    let channels = palette.channel_colors();
+    let waveform = &scene.waveform;
+
     for col in 0..w {
-        let (mn, mx) = column_span(&scene.waveform, w, col);
-        // La línea sigue la señal por su valor medio de columna; el halo usa su
-        // amplitud (lo que da color al resplandor, igual que al trazo).
-        let mid = (mn + mx) * 0.5;
-        let amplitude = mn.abs().max(mx.abs()) * scene.waveform.gain;
-        let y_f = center - mid.clamp(-1.0, 1.0) * scale;
-        let trail = trace_rgb(amplitude, palette);
+        let (l_mn, l_mx) = channel_column_span(&waveform.left, w, col);
+        let (r_mn, r_mx) = channel_column_span(&waveform.right, w, col);
+        // Cada curva se tiñe con el color de su canal alrededor de su valor
+        // medio de columna (la envolvente, no el plot de puntos).
+        let l_y = center - (l_mn + l_mx) * 0.5 * scale;
+        let r_y = center - (r_mn + r_mx) * 0.5 * scale;
         for row in 0..h {
             let x = area.x + col as u16;
             let y = area.y + row as u16;
-            let dist = (row as f32 + 0.5 - y_f).abs();
-            let falloff = (1.0 - dist / GLOW_RADIUS).clamp(0.0, 1.0);
-            let bg_color = if falloff > 0.0 {
-                let mut color = mix_c(bg, trail, lit_k * falloff);
-                if brightness > 0.0 {
-                    color = mix_c(color, [255, 255, 255], brightness * 0.12);
-                }
-                to_color(color)
-            } else {
-                to_color(bg)
-            };
+            let dist_l = (row as f32 + 0.5 - l_y).abs();
+            let dist_r = (row as f32 + 0.5 - r_y).abs();
+            let fall_l = (1.0 - dist_l / GLOW_RADIUS).clamp(0.0, 1.0);
+            let fall_r = (1.0 - dist_r / GLOW_RADIUS).clamp(0.0, 1.0);
+            let mut color = bg;
+            if fall_l > 0.0 {
+                color = mix_c(color, channels.left, lit_k * fall_l);
+            }
+            if fall_r > 0.0 {
+                color = mix_c(color, channels.right, lit_k * fall_r);
+            }
+            if brightness > 0.0 {
+                color = mix_c(color, [255, 255, 255], brightness * 0.12);
+            }
             // SAFETY(ninguna): API pública de ratatui; celdas dentro de `area`.
             if let Some(cell) = frame.buffer_mut().cell_mut(Position { x, y }) {
-                cell.set_bg(bg_color);
+                cell.set_bg(to_color(color));
             }
         }
     }
 }
 
-/// Dibuja el visualizador completo: línea del osciloscopio + franja de barras,
-/// con marco de estado. (El resplandor ambiental de fondo se pinta aquí
-/// también, antes del trazo.)
+/// Dibuja el visualizador completo: el trazo del osciloscopio (puntos por
+/// canal) seguido de la franja de barras y el marco de estado. El resplandor
+/// ambiental de fondo
+/// se pinta aquí también, antes del trazo.
 ///
 /// Con `state.active == false` pinta un marco apagado sobre la escena dormida
 /// (línea base centrada): la vista nunca "desaparece" ni salta de layout.
@@ -223,46 +268,25 @@ pub fn render(frame: &mut Frame, area: Rect, state: &VisualState, position_secs:
     render_bars(frame, bars_area, state);
 }
 
-/// Mapa máscara de cuadrantes → glifo de bloque. Cada celda se divide en una
-/// rejilla 2×2 (bits: `1`=superior-izquierdo, `2`=superior-derecho, `4`=
-/// inferior-izquierdo, `8`=inferior-derecho) y el terminal pinta SOLO los
-/// cuadrantes encendidos: resolución sub-celda en las dos direcciones. Al
-/// interpolar los bordes de cada celda entre columnas vecinas, una diagonal
-/// se codifica con las confluencias correctas (▞▚▛▜▙▟) y el trazo se lee como
-/// una curva continua en vez de una escalera de medio bloque.
-const TRACE_QUADS: [&str; 16] = [
-    " ", // 0b0000
-    "▘", // 0b0001 TL
-    "▝", // 0b0010 TR
-    "▀", // 0b0011 TL|TR
-    "▖", // 0b0100 BL
-    "▌", // 0b0101 TL|BL
-    "▞", // 0b0110 TR|BL
-    "▛", // 0b0111 TL|TR|BL
-    "▗", // 0b1000 BR
-    "▚", // 0b1001 TL|BR
-    "▐", // 0b1010 TR|BR
-    "▜", // 0b1011 TL|TR|BR
-    "▄", // 0b1100 BL|BR
-    "▙", // 0b1101 TL|BL|BR
-    "▟", // 0b1110 TR|BL|BR
-    "█", // 0b1111
-];
-
-/// Pinta la curva del osciloscopio: UNA célula por columna, siguiendo la
-/// señal (`(min+max)/2` de la columna) con una rejilla de CUADRANTES 2×2 —
-/// resolución sub-celda en HORIZONTAL y VERTICAL frente a un medio bloque
-/// simple. Se pintan los cuadrantes INMEDIATAMENTE por encima de la curva
-/// (foreground arriba, fondo abajo): en cada celda, los alturas locales
-/// izquierda/derecha (interpoladas entre columnas vecinas) encienden cada
-/// sub-celda cuando la curva las rebasa, y el glifo resultante (▘▝▖▗▀▄▌▐▞▚▛▜▙▟█)
-/// modela la diagonal REAL de la señal: la línea se desliza en pasos de cuarto
-/// de celda, sin escalones toscos ni banda rellena.
+/// Pinta la curva del osciloscopio: un PLOT DE PUNTOS por columna y canal.
 ///
-/// No toca el fondo: el resplandor de [`render_backdrop`] queda vivo detrás y
-/// el área fuera de la línea conserva su ambiental. Por mínimo que sea el
-/// cruce, siempre queda un cuadrante (▘) — la línea nunca hace huecos.
+/// Cada columna vuelca los buckets que le tocan y pinta hasta DOS puntos por
+/// canal — el VALLE (`min`) y el PICO (`max`) de la columnna — en la fila más
+/// cercana a `center - value*scale` (spec §8). Ambas curvas (L/R) se dibujan
+/// con puntos `●` (ASCII `*`), distinguiéndose por el color de cada canal y el
+/// resplandor ambiental de fondo; cuando caen en la MISMA celda se pinta el
+/// punto con el tinte combinado de mezcla: ni pico, ni valle, ni canal se
+/// pierden.
+///
+/// Sin allocations por draw: por cada columna solo se calculan 2 filas por
+/// canal en el stack. No toca el fondo (el resplandor lo dejó `render_backdrop`);
+/// los glifos salen del sistema [`UiGlyphs`] de la sesión.
 fn render_trace(frame: &mut Frame, area: Rect, state: &VisualState) {
+    render_trace_points(frame, area, state, *crate::ui::glyphs::GLYPHS);
+}
+
+/// Núcleo de [`render_trace`] con tema de glifos explícito (para tests).
+fn render_trace_points(frame: &mut Frame, area: Rect, state: &VisualState, glyphs: UiGlyphs) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -274,67 +298,42 @@ fn render_trace(frame: &mut Frame, area: Rect, state: &VisualState) {
 
     let center = h as f32 * 0.5;
     let scale = (center * 0.92).max(1.0) * scene.waveform.gain;
-    let top = (h as f32 - 1.0) + 0.5;
-    let row_last = (h - 1) as u16;
 
-    // Curva en unidades de SUB-FILA (2 por fila) y amplitudes para el color.
-    let mut sub = Vec::with_capacity(w);
-    let mut amps = Vec::with_capacity(w);
-    for col in 0..w {
-        let (mn, mx) = column_span(&scene.waveform, w, col);
-        let mid = (mn + mx) * 0.5;
-        let amplitude = mn.abs().max(mx.abs()) * scene.waveform.gain;
-        let y_f = (center - mid.clamp(-1.0, 1.0) * scale).clamp(0.0, top) * 2.0;
-        sub.push(y_f);
-        amps.push(amplitude);
+    let channels = palette.channel_colors();
+    let mut left_c = channels.left;
+    let mut right_c = channels.right;
+    if brightness > 0.0 {
+        left_c = mix_c(left_c, [255, 255, 255], brightness * 0.12);
+        right_c = mix_c(right_c, [255, 255, 255], brightness * 0.12);
     }
+    let both_c = mix_c(left_c, right_c, 0.5);
+    let g_left = glyphs.trace_left();
+    let g_right = glyphs.trace_right();
+    let g_both = glyphs.trace_both();
 
+    let waveform = &scene.waveform;
     for col in 0..w {
-        // Bordes de la celda: punto medio entre columnas vecinas; en los
-        // extremos se usa la propia curva (la señal no tiene vecino conocido).
-        let y_l = if col > 0 {
-            (sub[col - 1] + sub[col]) * 0.5
-        } else {
-            sub[col]
-        };
-        let y_r = if col + 1 < w {
-            (sub[col] + sub[col + 1]) * 0.5
-        } else {
-            sub[col]
-        };
-        // Celda donde vive la curva: promedio de bordes en filas.
-        let row = (((y_l + y_r) * 0.25) as u16).min(row_last);
-        let base = row as f32 * 2.0;
-        let hl = (y_l - base).clamp(0.0, 2.0);
-        let hr = (y_r - base).clamp(0.0, 2.0);
-        let mut mask = 0u8;
-        if hl > 0.5 {
-            mask |= 0b0001;
-        }
-        if hl > 1.5 {
-            mask |= 0b0100;
-        }
-        if hr > 0.5 {
-            mask |= 0b0010;
-        }
-        if hr > 1.5 {
-            mask |= 0b1000;
-        }
-        if mask == 0 {
-            mask = 0b0001; // cruce mínimo: sliver ▘, la línea no hace huecos
-        }
-        let glyph = TRACE_QUADS[mask as usize];
-        let mut color = trace_rgb(amps[col], palette);
-        if brightness > 0.0 {
-            color = mix_c(color, [255, 255, 255], brightness * 0.12);
-        }
+        let (lrows, ln) = channel_rows(&waveform.left, w, col, center, scale, h);
+        let (rrows, rn) = channel_rows(&waveform.right, w, col, center, scale, h);
         let x = area.x + col as u16;
-        let y = area.y + row;
-        // SAFETY(ninguna): API pública de ratatui; celdas del área.
-        if let Some(cell) = frame.buffer_mut().cell_mut(Position { x, y }) {
-            cell.set_symbol(glyph);
-            // Solo el trazo: el fondo (glow) lo dejó render_backdrop.
-            cell.set_style(Style::new().fg(to_color(color)));
+
+        // Pasada L: el canal izquierdo; donde R comparte fila, mezcla.
+        for &row in &lrows[..ln] {
+            let both = rrows[..rn].contains(&row);
+            let (symbol, color) = if both {
+                (g_both, both_c)
+            } else {
+                (g_left, left_c)
+            };
+            paint_point(frame, x, area.y + row, symbol, color);
+        }
+        // Pasada R: lo que L no pintó (los destinos compartidos ya salieron
+        // como mezcla en la pasada L).
+        for &row in &rrows[..rn] {
+            if lrows[..ln].contains(&row) {
+                continue;
+            }
+            paint_point(frame, x, area.y + row, g_right, right_c);
         }
     }
 }
@@ -393,6 +392,7 @@ fn render_bars(frame: &mut Frame, rect: Rect, state: &VisualState) {
 mod tests {
     use super::*;
     use crate::analysis::WaveformEnvelope;
+    use crate::ui::glyphs::{GlyphTheme, UiGlyphs};
     use crate::visualization::engine::{SceneState, WaveformView};
     use crate::visualization::VISUAL_BARS;
     use ratatui::backend::TestBackend;
@@ -411,7 +411,7 @@ mod tests {
             phase: 0.25,
             active: true,
             scene: SceneState {
-                waveform: oscillating_view(0.6, 0),
+                waveform: view(0.6, 0),
                 energy: level,
                 brightness: level,
                 palette,
@@ -420,9 +420,9 @@ mod tests {
         }
     }
 
-    /// Envolvente con min<max por bucket (señal oscilante: la línea del trazo
-    /// sigue el valor medio de cada columna, con amplitud ∝ la señal de fondo).
-    fn oscillating_view(amp: f32, seed: usize) -> WaveformView {
+    /// Envolvente de un seno (min/max por bucket): señal oscilante con la
+    /// amplitud dada; L y R idénticas (contenido mono → puntos solapados).
+    fn view(amp: f32, seed: usize) -> WaveformView {
         let cycles = 6.0 + (seed % 3) as f32;
         let samples: Vec<f32> = (0..1024)
             .map(|i| {
@@ -433,14 +433,59 @@ mod tests {
             .collect();
         let env = WaveformEnvelope::from_window(&samples);
         WaveformView {
-            min: env.min,
-            max: env.max,
+            left: env,
+            right: env,
+            gain: 1.0,
+        }
+    }
+
+    /// Vista con curvas ASIMÉTRICAS: cada canal un seno de amplitud propia.
+    fn stereo_view(left_amp: f32, right_amp: f32, seed: usize) -> WaveformView {
+        let samples_l: Vec<f32> = (0..1024)
+            .map(|i| {
+                let ang = std::f32::consts::TAU * (i as f32 / 1024.0) * 5.0 + (seed as f32) * 0.7;
+                left_amp * ang.sin()
+            })
+            .collect();
+        let samples_r: Vec<f32> = (0..1024)
+            .map(|i| {
+                let ang = std::f32::consts::TAU * (i as f32 / 1024.0) * 5.0
+                    + (seed as f32) * 0.7
+                    + std::f32::consts::PI;
+                right_amp * ang.sin()
+            })
+            .collect();
+        let left = WaveformEnvelope::from_window(&samples_l);
+        let right = WaveformEnvelope::from_window(&samples_r);
+        WaveformView {
+            left,
+            right,
+            gain: 1.0,
+        }
+    }
+
+    /// Vista onda cuadrada (min=-amp, max=+amp por bucket) en L; R silente.
+    fn square_stereo(amp: f32) -> WaveformView {
+        let square: Vec<f32> = (0..1024)
+            .map(|i| if i % 2 == 0 { amp } else { -amp })
+            .collect();
+        let left = WaveformEnvelope::from_window(&square);
+        WaveformView {
+            left,
+            right: WaveformEnvelope::silent(),
             gain: 1.0,
         }
     }
 
     fn drawing(ch: &dyn Fn(&mut Frame)) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(ch).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn drawing_size(w: u16, h: u16, ch: &dyn Fn(&mut Frame)) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(ch).unwrap();
         terminal.backend().buffer().clone()
@@ -463,6 +508,11 @@ mod tests {
             .map(|c| tint_of(c.bg, base))
             .max()
             .unwrap_or(0)
+    }
+
+    /// Glifos de punto del trazado estéreo (Unicode `●` / ASCII `*`).
+    fn is_point(s: &str) -> bool {
+        matches!(s, "●" | "*")
     }
 
     #[test]
@@ -488,7 +538,19 @@ mod tests {
     }
 
     #[test]
-    fn tiny_areas_do_not_panic() {
+    fn tiny_and_profile_areas_do_not_panic() {
+        let profile_sizes: &[(u16, u16)] = &[(120, 40), (100, 30), (80, 24), (70, 20), (60, 15)];
+        for (w, h) in profile_sizes {
+            let buf = drawing_size(*w, *h, &|f| {
+                render_backdrop(
+                    f,
+                    f.area(),
+                    &active_state(1.0, VisualPalette::fallback()),
+                    false,
+                )
+            });
+            assert_eq!(buf.area.width, *w, "siempre pinta el área completa");
+        }
         let backend = TestBackend::new(10, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -586,78 +648,201 @@ mod tests {
         assert!(lit_high > lit_low, "más energía ⇒ más tinte de trazo");
     }
 
-    /// Glifos de cuadrante del trazo (1 por columna, al menos un cuadrante).
-    fn is_trace_glyph(s: &str) -> bool {
-        matches!(
-            s,
-            "▘" | "▝"
-                | "▀"
-                | "▖"
-                | "▌"
-                | "▞"
-                | "▛"
-                | "▗"
-                | "▚"
-                | "▐"
-                | "▜"
-                | "▄"
-                | "▙"
-                | "▟"
-                | "█"
-        )
+    /// Distancia vertical máxima de los puntos del trazo al centro del área.
+    fn sweep_of(buf: &ratatui::buffer::Buffer) -> f32 {
+        let mut offsets = Vec::new();
+        for y in 1..5u16 {
+            for x in 1..39u16 {
+                if is_point(buf.cell((x, y)).unwrap().symbol()) {
+                    offsets.push((y as f32 - 3.0).abs());
+                }
+            }
+        }
+        offsets.iter().cloned().fold(f32::MIN, f32::max)
     }
 
     #[test]
     fn louder_waveform_trace_sweeps_farther_from_center() {
-        // Mismo estado, solo cambia la amplitud de la envolvente: la línea del
-        // trazo de una señal de pico 0.9 barre más lejos del centro vertical
-        // que la de pico 0.2 (la curva sigue la señal; no es una banda de
-        // espesor fijo).
-        let sweep = |st: VisualState| {
-            let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
-            // Traza: interior 40x8 → x 1..=38, y 1..=4 (barras ocupan 2 filas).
-            let mut offsets = Vec::new();
-            for y in 1..5u16 {
-                for x in 1..39u16 {
-                    if is_trace_glyph(buf.cell((x, y)).unwrap().symbol()) {
-                        offsets.push((y as f32 - 3.0).abs());
-                    }
-                }
-            }
-            offsets.iter().cloned().fold(f32::MIN, f32::max)
-        };
+        // Misma escena, solo cambia la amplitud de la envolvente: los puntos
+        // del trazo de una señal de pico 0.9 barre más lejos del centro que la
+        // de pico 0.2 (el plot sigue pico Y valle; la ganancia es 1.0).
         let mut loud = active_state(0.9, VisualPalette::fallback());
-        loud.scene.waveform = oscillating_view(0.9, 1);
+        loud.scene.waveform = view(0.9, 1);
+        let buf_loud = drawing(&|f| render(f, f.area(), &loud, 0.0));
         let mut quiet = active_state(0.9, VisualPalette::fallback());
-        quiet.scene.waveform = oscillating_view(0.2, 1);
+        quiet.scene.waveform = view(0.2, 1);
+        let buf_quiet = drawing(&|f| render(f, f.area(), &quiet, 0.0));
         assert!(
-            sweep(loud) > sweep(quiet),
-            "señal más fuerte ⇒ la línea barre más lejos del centro"
+            sweep_of(&buf_loud) > sweep_of(&buf_quiet),
+            "señal más fuerte ⇒ puntos más lejos del centro"
         );
     }
 
     #[test]
-    fn thin_line_draws_one_glyph_per_trace_column() {
-        // El osciloscopio es fino: exactamente UNA celda por columna de traza,
-        // con un glifo de cuadrantes 2×2 (resolución sub-celda en fila y
-        // columna), en vez de una banda vertical rellena. La línea se lee
-        // como una curva continua.
+    fn point_plot_spans_every_column_without_gaps() {
+        // Cada columna del área interior pinta al menos un punto (los canales
+        // siempre caen en una celda; una columna sin datos cae al centro).
         let st = active_state(0.9, VisualPalette::fallback());
         let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
-        let counts: Vec<usize> = (1..39u16)
-            .map(|x| {
-                (1..5u16)
-                    .filter(|&y| is_trace_glyph(buf.cell((x, y)).unwrap().symbol()))
-                    .count()
-            })
-            .collect();
+        for x in 1..39u16 {
+            assert!(
+                (1..5u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol())),
+                "la columna {x} del trazo tiene al menos un punto"
+            );
+        }
+    }
+
+    #[test]
+    fn stereo_channels_render_as_distinct_point_sets() {
+        // L fuerte, R débil (amplitudes distintas): ambas curvas son
+        // visibles a la vez con puntos `●`, cada una con su propio color
+        // de canal y su propio resplandor de fondo.
+        let mut st = active_state(0.9, VisualPalette::fallback());
+        st.scene.waveform = stereo_view(0.9, 0.5, 3);
+        let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
+        let channels = st.scene.palette.channel_colors();
+        let brightness = if st.scene.active {
+            st.scene.brightness
+        } else {
+            0.0
+        };
+        let mut left_rgb = channels.left;
+        let mut right_rgb = channels.right;
+        if brightness > 0.0 {
+            left_rgb = mix_c(left_rgb, [255, 255, 255], brightness * 0.12);
+            right_rgb = mix_c(right_rgb, [255, 255, 255], brightness * 0.12);
+        }
+        let left_color = to_color(left_rgb);
+        let right_color = to_color(right_rgb);
+
+        let mut l_count = 0usize;
+        let mut r_count = 0usize;
+        for x in 1..39u16 {
+            for y in 1..5u16 {
+                let cell = buf.cell((x, y)).unwrap();
+                if is_point(cell.symbol()) {
+                    if cell.fg == left_color {
+                        l_count += 1;
+                    }
+                    if cell.fg == right_color {
+                        r_count += 1;
+                    }
+                }
+            }
+        }
+        assert!(l_count > 0, "L llega al trazo con color de canal L");
+        assert!(r_count > 0, "R llega al trazo con color de canal R");
+        // Con amplitudes distintas, cada canal tiene más puntos exclusivos
+        // que de mezcla: la proporción de puntos propios debe ser razonable.
         assert!(
-            counts.iter().all(|&n| n == 1),
-            "una línea, una celda por columna: {counts:?}"
+            l_count + r_count >= 10,
+            "conjuntos de puntos lo suficientemente grandes: L={l_count} R={r_count}"
         );
+    }
+
+    #[test]
+    fn channel_collision_paints_both_with_mixed_color() {
+        // L y R idénticos (contenido mono): en la mayoría de columnas ambos
+        // caen a la misma celda → punto `●` con color de mezcla `both_c`,
+        // sin perder ninguna curva.
+        let st = active_state(0.9, VisualPalette::fallback());
+        let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
+        let channels = st.scene.palette.channel_colors();
+        let brightness = if st.scene.active {
+            st.scene.brightness
+        } else {
+            0.0
+        };
+        let mut left_rgb = channels.left;
+        let mut right_rgb = channels.right;
+        if brightness > 0.0 {
+            left_rgb = mix_c(left_rgb, [255, 255, 255], brightness * 0.12);
+            right_rgb = mix_c(right_rgb, [255, 255, 255], brightness * 0.12);
+        }
+        let both_color = to_color(mix_c(left_rgb, right_rgb, 0.5));
+
+        let has_both = buf
+            .content()
+            .iter()
+            .any(|c| is_point(c.symbol()) && c.fg == both_color);
         assert!(
-            buf.content().iter().any(|c| is_trace_glyph(c.symbol())),
-            "el trazo pinta glifos de cuadrante"
+            has_both,
+            "canales solapados pinta punto `●` con color de mezcla"
+        );
+    }
+
+    #[test]
+    fn min_and_max_of_a_column_are_drawn_separately() {
+        // Onda cuadrada ±0.9 en L (cada bucket conserva valle Y pico), R mudo:
+        // el plot llega tanto a la fila alta (pico) como a la baja (valle) en
+        // la misma columna.
+        let mut st = active_state(0.9, VisualPalette::fallback());
+        st.scene.waveform = square_stereo(0.9);
+        let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
+        // Filas bajas del área interior (bottom = fila 4) y filas altas (= 1).
+        let top_filled = (1..39u16).any(|x| is_point(buf.cell((x, 1)).unwrap().symbol()));
+        let bottom_filled = (1..39u16).any(|x| is_point(buf.cell((x, 4)).unwrap().symbol()));
+        assert!(top_filled, "el pico de la onda cuadrada pinta arriba");
+        assert!(bottom_filled, "el valle de la onda cuadrada pinta abajo");
+        // Y, como L domina y R calla, hay columnas con DSOs puntos: los dos
+        // extremos de la columa en la misma columna.
+        let columns_with_two = (1..39u16)
+            .filter(|&x| {
+                (1..5u16)
+                    .filter(|&y| is_point(buf.cell((x, y)).unwrap().symbol()))
+                    .count()
+                    >= 2
+            })
+            .count();
+        assert!(columns_with_two > 0, "min y max conviven en la columna");
+    }
+
+    #[test]
+    fn ascii_theme_uses_only_ascii_points() {
+        let st = active_state(0.9, VisualPalette::fallback());
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Ascii)));
+        let ascii_points = buf
+            .content()
+            .iter()
+            .filter(|c| !c.symbol().trim().is_empty())
+            .all(|c| matches!(c.symbol(), "*"));
+        assert!(ascii_points, "el tema ASCII solo produce puntos 7-bit `*`");
+        let unicode =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        assert!(
+            unicode.content().iter().any(|c| matches!(c.symbol(), "●")),
+            "el tema Unicode usa puntos `●`"
+        );
+    }
+
+    #[test]
+    fn silence_keeps_the_trace_on_the_center_baseline() {
+        // Con la escena inactiva el trazo es una línea base centrada: todos los
+        // puntos caen en la fila central del área interior (sin NaN ni saltos).
+        let buf = drawing(&|f| render(f, f.area(), &VisualState::inactive(), 0.0));
+        let rows: Vec<u16> = (1..39u16)
+            .filter_map(|x| (1..5u16).find(|&y| is_point(buf.cell((x, y)).unwrap().symbol())))
+            .collect();
+        assert_eq!(rows.len(), 38, "la línea base pinta todas las columnas");
+        assert!(
+            rows.iter().all(|&y| y == 2 || y == 3),
+            "todos los puntos en la banda central: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn live_envelope_gain_scales_the_trace() {
+        // Dos snapshots del MISMO audio (misma envolvente, distinto gain): al
+        // aplicar un gain 2× los puntos se alejan del centro.
+        let mut st = active_state(0.9, VisualPalette::fallback());
+        st.scene.waveform = view(0.7, 5);
+        let g1 = drawing(&|f| render(f, f.area(), &st, 0.0));
+        st.scene.waveform.gain = 2.0;
+        let g2 = drawing(&|f| render(f, f.area(), &st, 0.0));
+        assert!(
+            sweep_of(&g2) > sweep_of(&g1) - 1e-3,
+            "más ganancia ⇒ puntos más lejos del centro"
         );
     }
 

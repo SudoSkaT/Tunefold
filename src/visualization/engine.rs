@@ -8,28 +8,28 @@
 //!   wall-clock.
 //! - El pulso decae por EVENTO recibido (~15 Hz de features): determinista
 //!   frente al flujo de eventos.
-//! - Osciloscopio real: la escena es la envolvente min/max del PCM
-//!   ([`WaveformEnvelope`], ~86 Hz) decimada a `WAVEFORM_BUCKETS`; la ganancia
-//!   se auto-ajusta por frame (1/peak) con suavizado para que el trazo nunca
-//!   "salte" entre ventanas.
+//! - Osciloscopio real: la escena es la envolvente min/max ESTÉREO del PCM
+//!   ([`StereoWaveform`], ~86 Hz) decimada a `WAVEFORM_BUCKETS` por canal; la
+//!   ganancia se auto-ajusta por frame (1/peak) con suavizado para que el
+//!   trazo nunca "salte" entre ventanas.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::analysis::{AudioFeatures, WaveformEnvelope, WAVEFORM_BUCKETS};
+use crate::analysis::{AudioFeatures, StereoWaveform, WaveformEnvelope};
 use crate::visualization::palette::VisualPalette;
 use crate::visualization::params::{ParameterMapper, VisualParameters};
 use crate::visualization::VISUAL_BARS;
 
-/// Vista de forma de onda lista para el renderer (por valor, `Copy`).
+/// Vista de forma de onda ESTÉREO lista para el renderer (por valor, `Copy`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WaveformView {
-    /// Mínimo (valle) por bucket, amplitud sin normalizar (~-1..1).
-    pub min: [f32; WAVEFORM_BUCKETS],
-    /// Máximo (pico) por bucket.
-    pub max: [f32; WAVEFORM_BUCKETS],
+    /// Envolvente del canal izquierdo (ch0), amplitude sin normalizar (~-1..1).
+    pub left: WaveformEnvelope,
+    /// Envolvente del canal derecho (ch1).
+    pub right: WaveformEnvelope,
     /// Ganancia automática suavizada (1/peak acotada): el renderer multiplica
-    /// la amplitud por este factor.
+    /// la amplitud por este factor en AMBOS canales.
     pub gain: f32,
 }
 
@@ -37,14 +37,14 @@ impl WaveformView {
     /// Trazo en línea base (sin señal / escena dormida).
     pub fn baseline() -> Self {
         Self {
-            min: [0.0; WAVEFORM_BUCKETS],
-            max: [0.0; WAVEFORM_BUCKETS],
+            left: WaveformEnvelope::silent(),
+            right: WaveformEnvelope::silent(),
             gain: 1.0,
         }
     }
 }
 
-/// Escena ambiental (osciloscopio de forma de onda) lista para el renderer.
+/// Escena ambiental (osciloscopio estéreo de forma de onda) lista para el renderer.
 ///
 /// El App NO conoce envelopes ni buckets: consume `VisualState` y recibe la
 /// escena ya calculada por el motor (spec §10).
@@ -112,8 +112,8 @@ pub struct VisualEngine {
     /// Vista de forma de onda actual: se mantiene hasta que llegue una envolvente
     /// nueva, así el trazo "respira" sin parpadear entre frames.
     waveform_view: WaveformView,
-    /// Última envolvente procesada (dedupe por identidad del `Arc`).
-    last_envelope: Option<Arc<WaveformEnvelope>>,
+    /// Última envolvente estéreo procesada (dedupe por identidad del `Arc`).
+    last_envelope: Option<Arc<StereoWaveform>>,
     /// Envolventes suavizadas de la escena (para que no "tiemblen").
     smooth_energy: f32,
     smooth_brightness: f32,
@@ -158,7 +158,7 @@ impl VisualEngine {
     pub fn update(
         &mut self,
         features: Option<&Arc<AudioFeatures>>,
-        envelope: Option<&Arc<WaveformEnvelope>>,
+        envelope: Option<&Arc<StereoWaveform>>,
         position: Duration,
         palette: &VisualPalette,
     ) -> VisualState {
@@ -226,8 +226,8 @@ impl VisualEngine {
         let pulse = (params.pulse_kick).max(self.prev_pulse * PULSE_DECAY);
         self.prev_pulse = pulse;
 
-        // Osciloscopio: absorbe la envolvente nueva (dedupe por identidad) y
-        // reajusta la ganancia automática suavemente hacia 1/peak.
+        // Osciloscopio: absorbe la envolvente estéreo nueva (dedupe por
+        // identidad) y reajusta la ganancia automática suavemente hacia 1/peak.
         if let Some(env) = envelope {
             if !self
                 .last_envelope
@@ -238,8 +238,8 @@ impl VisualEngine {
                 let target = (1.0 / peak).clamp(WAVEFORM_GAIN_MIN, WAVEFORM_GAIN_MAX);
                 self.waveform_view.gain +=
                     (target - self.waveform_view.gain) * WAVEFORM_GAIN_SMOOTH;
-                self.waveform_view.min = env.min;
-                self.waveform_view.max = env.max;
+                self.waveform_view.left = env.left;
+                self.waveform_view.right = env.right;
                 self.last_envelope = Some(Arc::clone(env));
             }
         }
@@ -291,9 +291,14 @@ mod tests {
         }
     }
 
-    /// Envolvente de amplitud constante por bucket (útil para auto-gain).
-    fn envelope(amp: f32) -> Arc<WaveformEnvelope> {
-        Arc::new(WaveformEnvelope::from_window(&[amp; 2048]))
+    /// Envolvente estéreo de amplitud constante por bucket (auto-gain).
+    fn envelope(amp: f32) -> Arc<StereoWaveform> {
+        Arc::new(StereoWaveform::from_windows(&[amp; 2048], &[amp; 2048]))
+    }
+
+    /// Envolvente estéreo con canales ASIMÉTRICOS.
+    fn stereo_envelope(left: f32, right: f32) -> Arc<StereoWaveform> {
+        Arc::new(StereoWaveform::from_windows(&[left; 2048], &[right; 2048]))
     }
 
     fn engine() -> VisualEngine {
@@ -437,9 +442,12 @@ mod tests {
         assert!(s
             .scene
             .waveform
+            .left
             .min
             .iter()
-            .chain(s.scene.waveform.max.iter())
+            .chain(s.scene.waveform.left.max.iter())
+            .chain(s.scene.waveform.right.min.iter())
+            .chain(s.scene.waveform.right.max.iter())
             .all(|v| v.is_finite()));
     }
 
@@ -451,8 +459,11 @@ mod tests {
         // Una envolvente nueva se copia y mueve la ganancia hacia 1/peak.
         let loud = envelope(1.0);
         let s = e.update(Some(&f), Some(&loud), Duration::ZERO, &FALLBACK);
-        assert_eq!(s.scene.waveform.max[0], 1.0, "absorbe el pico máximo");
-        assert_eq!(s.scene.waveform.min[0], 1.0, "absorbe el valle (constante)");
+        assert_eq!(s.scene.waveform.left.max[0], 1.0, "absorbe el pico máximo");
+        assert_eq!(
+            s.scene.waveform.left.min[0], 1.0,
+            "absorbe el valle (constante)"
+        );
         let target = (1.0_f32 / 1.0_f32).clamp(WAVEFORM_GAIN_MIN, WAVEFORM_GAIN_MAX);
         assert!(
             (s.scene.waveform.gain - target).abs() < 0.4,
@@ -464,6 +475,29 @@ mod tests {
         // "respira" a la misma ganancia sin parpadeo.
         let again = e.update(Some(&f), Some(&loud), Duration::from_millis(66), &FALLBACK);
         assert_eq!(again.scene.waveform, s.scene.waveform);
+    }
+
+    #[test]
+    fn stereo_channels_absorbed_independently() {
+        let mut e = engine();
+        let f = Arc::new(features(0.6, 0.2, 0.0, false, 0.0));
+
+        // L fuerte, R débil: ambas curvas deben llegar sin mezclarse.
+        let asym = stereo_envelope(0.9, 0.15);
+        let s = e.update(Some(&f), Some(&asym), Duration::ZERO, &FALLBACK);
+        assert_eq!(s.scene.waveform.left.max[0], 0.9, "L conserva su pico");
+        assert_eq!(s.scene.waveform.right.max[0], 0.15, "R conserva el suyo");
+        assert!(
+            (s.scene.waveform.gain - (1.0 / 0.9)).abs() < 0.4,
+            "el auto-gain mira el pico del canal más fuerte: {}",
+            s.scene.waveform.gain
+        );
+
+        // Luego R llega con un pico mayor: la ganancia baja hacia su 1/peak.
+        let flip = stereo_envelope(0.2, 1.0);
+        let s2 = e.update(Some(&f), Some(&flip), Duration::from_millis(66), &FALLBACK);
+        assert_eq!(s2.scene.waveform.left.max[0], 0.2);
+        assert_eq!(s2.scene.waveform.right.max[0], 1.0);
     }
 
     #[test]

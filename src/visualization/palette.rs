@@ -26,7 +26,7 @@
 //!   puede producir, garantizando χ ≥ 4.5 en la línea activa y ≥ 3.0 en las
 //!   históricas independientemente del color dominante de la portada.
 
-/// Tres colores dominantes + fondo derivado.
+/// Tres colores dominantes + fondo derivado + colores de canal del osciloscopio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VisualPalette {
     /// Color más dominante (barras altas, línea de karaoke en lectura).
@@ -115,17 +115,50 @@ impl VisualPalette {
     ///
     /// El ambient aplacado no es un plano: sus trazos iluminan celdas locales.
     /// La celda más clara que puede producir está acotada por una mezcla de la
-    /// base aplacada con el color de la traza (el renderer garantiza esta cota;
-    /// ver `render.rs`). Las letras se resuelven contra este techo para seguir
-    /// legibles aunque un pico de señal pase por detrás de la línea activa.
+    /// base aplacada con el color de la traza MÁS LUMINOSO del osciloscopio
+    /// (accent o cualquiera de los dos canales; el renderer garantiza esta
+    /// cota; ver `render.rs`). Las letras se resuelven contra este techo para
+    /// seguir legibles aunque un pico de señal pase por detrás de la línea
+    /// activa.
     pub fn karaoke_bg_ceiling(&self) -> [u8; 3] {
         let base = self.karaoke_subdued_bg();
+        let channels = self.channel_colors();
+        // Tinte más brillante entre accent, L y R → el peor caso del halo.
+        let mut target = self.accent;
+        for c in [channels.left, channels.right] {
+            if relative_luminance(c) > relative_luminance(target) {
+                target = c;
+            }
+        }
         let t = KARAOKE_TRACE_CEILING;
         [
-            (base[0] as f32 + (self.accent[0] as f32 - base[0] as f32) * t).round() as u8,
-            (base[1] as f32 + (self.accent[1] as f32 - base[1] as f32) * t).round() as u8,
-            (base[2] as f32 + (self.accent[2] as f32 - base[2] as f32) * t).round() as u8,
+            (base[0] as f32 + (target[0] as f32 - base[0] as f32) * t).round() as u8,
+            (base[1] as f32 + (target[1] as f32 - base[1] as f32) * t).round() as u8,
+            (base[2] as f32 + (target[2] as f32 - base[2] as f32) * t).round() as u8,
         ]
+    }
+
+    /// Colores de trazo del osciloscopio ESTÉREO: uno por canal, derivados de
+    /// la portada de forma determinista.
+    ///
+    /// L se funde hacia el dominante de graves (cálido) y R hacia el
+    /// secundario (frío): dos tintes asociados a cada línea del trazo, que se
+    /// distinguen Y conservan la armonía de la portada. Si tras la derivación
+    /// quedan perceptualmente demasiado cerca (portadas monocromas), se separan
+    /// en pasos pequeños y acotados (L hacia claro, R hacia oscuro) sin
+    /// aleatoriedad.
+    pub fn channel_colors(&self) -> ChannelColors {
+        let mut left = Self::blend(self.accent, self.primary, CHANNEL_LEFT_TINT);
+        let mut right = Self::blend(self.secondary, self.primary, CHANNEL_RIGHT_TINT);
+        let mut steps = 0u8;
+        while channel_distance(left, right) < CHANNEL_DISTANCE_MIN
+            && steps < CHANNEL_SEPARATION_STEPS
+        {
+            left = Self::blend(left, [255, 255, 255], CHANNEL_SEPARATION_DELTA);
+            right = Self::blend(right, [0, 0, 0], CHANNEL_SEPARATION_DELTA);
+            steps += 1;
+        }
+        ChannelColors { left, right }
     }
 
     /// Colores de los tres estados del karaoke con contraste garantizado.
@@ -170,6 +203,33 @@ pub const KARAOKE_ACTIVE_CONTRAST: f64 = 4.5;
 
 /// Contraste mínimo (WCAG) de las líneas históricas/futuras del karaoke.
 pub const KARAOKE_DIM_CONTRAST: f64 = 3.0;
+
+/// Fracción de tinte cálido de L → dominante (accent→primary).
+const CHANNEL_LEFT_TINT: f32 = 0.55;
+/// Fracción de tinte frío de R → dominante (secondary→primary).
+const CHANNEL_RIGHT_TINT: f32 = 0.30;
+/// Distancia euclídea mínima aceptable entre L y R (0..442).
+const CHANNEL_DISTANCE_MIN: f32 = 60.0;
+/// Pasos máximos de separación incremental L(↑claro) R(↓oscuro).
+const CHANNEL_SEPARATION_STEPS: u8 = 8;
+/// Factor de corrección por paso de separación (0..1).
+const CHANNEL_SEPARATION_DELTA: f32 = 0.06;
+
+/// Colores de trazo del osciloscopio ESTÉREO (un par por canal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelColors {
+    /// Color del canal izquierdo (ch0).
+    pub left: [u8; 3],
+    /// Color del canal derecho (ch1).
+    pub right: [u8; 3],
+}
+
+/// Distancia euclídea RGB (0..≈442).
+fn channel_distance(a: [u8; 3], b: [u8; 3]) -> f32 {
+    let (ar, ag, ab) = (a[0] as f32, a[1] as f32, a[2] as f32);
+    let (br, bg, bb) = (b[0] as f32, b[1] as f32, b[2] as f32);
+    ((ar - br).powi(2) + (ag - bg).powi(2) + (ab - bb).powi(2)).sqrt()
+}
 
 /// Colores resueltos de los tres estados del karaoke (ya leído / en lectura /
 /// no leído) garantizando contraste contra el fondo de escena.
@@ -475,5 +535,52 @@ mod tests {
             "sobre fondo intermedio se degrada al mejor posible: χ {}",
             contrast_ratio(c.current, bg)
         );
+    }
+
+    // --- Colores de canal del osciloscopio estéreo (§8) ---
+
+    #[test]
+    fn channel_colors_are_distinct_and_deterministic() {
+        for cover in [
+            None,
+            Some([[200u8, 40, 40], [40, 200, 60], [30, 60, 220]]), // RGB primarios
+            Some([[40u8, 30, 90], [120, 60, 40], [10, 80, 110]]),  // portada oscura
+            Some([[240u8, 220, 200], [230, 235, 240], [250, 245, 235]]), // luz
+            Some([[120u8, 120, 120], [130, 130, 130], [128, 128, 128]]), // gris
+        ] {
+            let p = VisualPalette::from_cover(cover);
+            let c1 = p.channel_colors();
+            let c2 = p.channel_colors();
+            assert_eq!(c1, c2, "determinista sin portada ni con ella");
+            assert!(
+                channel_distance(c1.left, c1.right) >= CHANNEL_DISTANCE_MIN,
+                "L {:?} y R {:?} quedan perceptualmente separados (dist {:.0})",
+                c1.left,
+                c1.right,
+                channel_distance(c1.left, c1.right)
+            );
+        }
+    }
+
+    #[test]
+    fn channel_colors_derive_from_cover_palette() {
+        // RGB primarios → L se tiñe de accent(azul)+dominante(rojo) y R de
+        // secondary(verde)+dominante(rojo): dos tintes reconocibles.
+        let p = VisualPalette::from_cover(Some([[200u8, 40, 40], [40, 200, 60], [30, 60, 220]]));
+        let c = p.channel_colors();
+        // L = blend(accent, primary, 0.55): mucho accent, poco primary.
+        assert!(
+            (c.left[2] as u16) > (c.left[1] as u16),
+            "L conservaComponente azul (accent) sobre verde: {:?}",
+            c.left
+        );
+        assert!(
+            (c.right[1] as u16) > (c.right[2] as u16),
+            "R tira a verde (secondary): {:?}",
+            c.right
+        );
+        // Y todos los canales conservan el vínculo con la paleta (no rompen
+        // con las portadas de las que vienen).
+        assert_ne!(c.left, c.right);
     }
 }

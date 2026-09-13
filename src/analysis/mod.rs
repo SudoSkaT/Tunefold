@@ -40,4 +40,4 @@ pub use features::{AudioFeatures, FeatureBus};
 pub use ring::SpScRing;
 pub use smoother::FeatureSmoother;
 pub use tap::TapSource;
-pub use waveform::{WaveformBus, WaveformEnvelope, WAVEFORM_BUCKETS};
+pub use waveform::{StereoWaveform, WaveformBus, WaveformEnvelope, WAVEFORM_BUCKETS};

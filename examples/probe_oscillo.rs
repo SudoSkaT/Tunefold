@@ -1,6 +1,6 @@
-use std::error::Error;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use std::error::Error;
 use tunefold::analysis::WaveformEnvelope;
 use tunefold::visualization::engine::{SceneState, VisualState, WaveformView};
 use tunefold::visualization::palette::VisualPalette;
@@ -21,9 +21,16 @@ fn punchy_view() -> WaveformView {
         samples.push(v);
     }
     let env = WaveformEnvelope::from_window(&samples);
+    // Contenido estéreo: L la señal, R una versión desfasada y más suave.
+    let right: Vec<f32> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, s)| 0.7 * s * (1.0 + 0.3 * (i as f32 / 31.0).cos()))
+        .collect();
+    let env_r = WaveformEnvelope::from_window(&right);
     WaveformView {
-        min: env.min,
-        max: env.max,
+        left: env,
+        right: env_r,
         gain: 1.0,
     }
 }
@@ -54,7 +61,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let palette = VisualPalette::fallback();
     for (w, h) in [(120, 40), (100, 30), (80, 24), (70, 20), (60, 15)] {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| render(f, f.area(), &state(palette), 42.0)).unwrap();
+        term.draw(|f| render(f, f.area(), &state(palette), 42.0))
+            .unwrap();
         let buf = term.backend().buffer().clone();
         let mut out = String::new();
         for y in 0..h {

@@ -19,7 +19,7 @@ use tunefold::analysis::{
     onset::{FluxAnalyzer, OnsetDetector},
     ring::SpScRing,
     smoother::FeatureSmoother,
-    AnalysisConfig, AnalysisRuntime, StreamMeta, WaveformEnvelope,
+    AnalysisConfig, AnalysisRuntime, StereoWaveform, StreamMeta,
 };
 use tunefold::domain::source::Source;
 use tunefold::domain::track::Track;
@@ -136,7 +136,7 @@ fn main() {
 
     let mut engine = VisualEngine::new(ParameterMapper::default());
     let mut pos_ms = 0u64;
-    let envelope = Arc::new(WaveformEnvelope::from_window(&[0.5; 2048]));
+    let envelope = Arc::new(StereoWaveform::from_windows(&[0.5; 2048], &[0.5; 2048]));
     let palette = tunefold::visualization::VisualPalette::from_cover(Some([
         [220, 60, 120],
         [60, 160, 240],

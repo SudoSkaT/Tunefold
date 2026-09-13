@@ -1,20 +1,21 @@
-//! Envolvente de forma de onda (min/max) extraída de la ventana mono del
-//! análisis, publicada junto a las features al consumidor visual (spec §20).
+//! Envolvente ESTÉREO de forma de onda (min/max por canal) extraída de las
+//! ventanas L/R del análisis, publicada junto a las features al consumidor
+//! visual (spec §20).
 //!
-//! La escena ambiental abandona la "lava" sintética (metaballs) por un
-//! osciloscopio REAL: la forma de onda muestreada del PCM, no un FFT. Por cada
-//! hop (~86 Hz) se reduce la ventana deslizante (2048 muestras ≈ 46 ms) a
-//! `WAVEFORM_BUCKETS` pares min/max. El UI decima esos buckets al ancho de
-//! terminal sin re-rankear y pinta el trazo/tinte vertical columna a columna.
+//! La escena ambiental es un osciloscopio REAL: la forma de onda muestreada de
+//! cada canal del PCM. Por cada hop (~86 Hz) se reduce la ventana deslizante
+//! de cada canal (2048 muestras ≈ 46 ms) a `WAVEFORM_BUCKETS` pares min/max.
+//! El UI decima esos buckets al ancho de terminal sin re-rankear y pinta los
+//! puntos del trazo columna a columna, conservando el pico y el valle.
 
 use std::sync::{Arc, RwLock};
 
-/// Nº de buckets (pares min/max). Fijo para que el consumidor decime sin
-/// realojar: 128 cubren pantallas típicas de extremo a extremo.
+/// Nº de buckets (pares min/max por canal). Fijo para que el consumidor decime
+/// sin realojar: 128 cubren pantallas típicas de extremo a extremo.
 pub const WAVEFORM_BUCKETS: usize = 128;
 
-/// Envolvente de UNA ventana (valores de amplitud sin normalizar, ~-1..1).
-#[derive(Debug, Clone, PartialEq)]
+/// Envolvente de UN canal (valores de amplitud sin normalizar, ~-1..1).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WaveformEnvelope {
     /// Mínimo (valle) por bucket.
     pub min: [f32; WAVEFORM_BUCKETS],
@@ -74,14 +75,78 @@ impl WaveformEnvelope {
     }
 }
 
-/// Bus de publicación/lectura del último snapshot de envolvente.
+/// Forma de onda ESTÉREO: envolventes min/max independientes por canal.
+///
+/// Es el payload del [`WaveformBus`]. El renderer conserva pico Y valle de
+/// cada canal; dos curvas distintas pueden pintarse en la misma columna sin
+/// perderse (una se dibuja sobre la otra con su glifo de mezcla).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StereoWaveform {
+    /// Canal izquierdo (ch0).
+    pub left: WaveformEnvelope,
+    /// Canal derecho (ch1).
+    pub right: WaveformEnvelope,
+}
+
+impl StereoWaveform {
+    /// Construye el snapshot desde las ventanas de canal ya de-intercaladas
+    /// (ruta caliente del motor de análisis, sin reordenar muestras).
+    pub fn from_windows(left: &[f32], right: &[f32]) -> Self {
+        Self {
+            left: WaveformEnvelope::from_window(left),
+            right: WaveformEnvelope::from_window(right),
+        }
+    }
+
+    /// Construye el snapshot desde muestras intercaladas (`L0 R0 L1 R1 …`).
+    ///
+    /// Política de canales: mono (1) duplica la señal a ambos canales; estéreo
+    /// y multicanal usan ch0 → L y ch1 → R (el resto se ignora). Pensado para
+    /// bancos de prueba/arranques; el motor caliente usa [`Self::from_windows`].
+    pub fn from_interleaved(samples: &[f32], channels: u16) -> Self {
+        if samples.is_empty() {
+            return Self {
+                left: WaveformEnvelope::silent(),
+                right: WaveformEnvelope::silent(),
+            };
+        }
+        let ch = usize::from(channels.clamp(1, 2));
+        if ch == 1 {
+            let e = WaveformEnvelope::from_window(samples);
+            return Self { left: e, right: e };
+        }
+        let frames = samples.len() / ch;
+        let mut left = Vec::with_capacity(frames);
+        let mut right = Vec::with_capacity(frames);
+        for f in 0..frames {
+            left.push(samples[f * ch]);
+            right.push(samples[f * ch + 1]);
+        }
+        Self::from_windows(&left, &right)
+    }
+
+    /// Snapshot plano para cortes/arranques/pausas (trazo en línea base).
+    pub fn silent() -> Self {
+        Self {
+            left: WaveformEnvelope::silent(),
+            right: WaveformEnvelope::silent(),
+        }
+    }
+
+    /// Amplitud pico absoluta a través de ambos canales (auto-gain del trazo).
+    pub fn peak(&self) -> f32 {
+        self.left.peak().max(self.right.peak())
+    }
+}
+
+/// Bus de publicación/lectura del último snapshot de envolvente ESTÉREO.
 ///
 /// Mismo patrón que [`super::features::FeatureBus`]: escritor único (hilo de
 /// análisis) ~86 Hz, lectores múltiples a ≤15 Hz clonando el `Arc` bajo lock
 /// de lectura — contención despreciable y cero allocs en la ruta del audio.
 #[derive(Clone)]
 pub struct WaveformBus {
-    slot: Arc<RwLock<Option<Arc<WaveformEnvelope>>>>,
+    slot: Arc<RwLock<Option<Arc<StereoWaveform>>>>,
 }
 
 impl Default for WaveformBus {
@@ -98,14 +163,14 @@ impl WaveformBus {
     }
 
     /// Publica la envolvente del último hop como la disponible.
-    pub fn publish(&self, envelope: WaveformEnvelope) -> Arc<WaveformEnvelope> {
+    pub fn publish(&self, envelope: StereoWaveform) -> Arc<StereoWaveform> {
         let arc = Arc::new(envelope);
         *self.slot.write().unwrap() = Some(Arc::clone(&arc));
         arc
     }
 
     /// Última envolvente publicada (`None` hasta que el análisis arranque).
-    pub fn latest(&self) -> Option<Arc<WaveformEnvelope>> {
+    pub fn latest(&self) -> Option<Arc<StereoWaveform>> {
         self.slot.read().unwrap().clone()
     }
 }
@@ -150,13 +215,89 @@ mod tests {
         let bus = WaveformBus::new();
         assert!(bus.latest().is_none(), "sin publicar aún");
 
-        let loud = WaveformEnvelope::from_window(&[0.8; 2048]);
+        let loud = StereoWaveform::from_windows(&[0.8; 2048], &[0.6; 2048]);
         let got = bus.publish(loud);
         assert_eq!(bus.latest().unwrap().peak(), 0.8);
         assert_eq!(Arc::strong_count(&got), 2, "bus + lector local");
 
-        bus.publish(WaveformEnvelope::silent());
+        bus.publish(StereoWaveform::silent());
         assert_eq!(bus.latest().unwrap().peak(), 0.0);
         assert_eq!(got.peak(), 0.8, "el snapshot viejo sigue inmutable");
+    }
+
+    #[test]
+    fn interleaved_mono_duplicates_signal_to_both_channels() {
+        let stereo = StereoWaveform::from_interleaved(&[0.5, -0.25, 0.7, -0.9], 1);
+        assert_eq!(stereo.left, stereo.right);
+        for b in 0..WAVEFORM_BUCKETS {
+            assert_eq!(stereo.left.min[b], stereo.right.min[b]);
+            assert_eq!(stereo.left.max[b], stereo.right.max[b]);
+        }
+        assert!((stereo.peak() - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn interleaved_stereo_splits_channels() {
+        // L es una rampa creciente, R una rampa decreciente (misma magnitud).
+        let mut samples = Vec::with_capacity(1024);
+        for f in 0..512 {
+            let t = f as f32 / 511.0;
+            samples.push(t); // L
+            samples.push(1.0 - t); // R
+        }
+        let stereo = StereoWaveform::from_interleaved(&samples, 2);
+        assert!(
+            (stereo.left.peak() - 1.0).abs() < 1e-6,
+            "L pico a 1: {}",
+            stereo.left.peak()
+        );
+        assert!(
+            (stereo.right.peak() - 1.0).abs() < 1e-6,
+            "R pico a 1: {}",
+            stereo.right.peak()
+        );
+        // En el rango donde la rampa creciente domina, L > R en esos buckets.
+        let mut left_above = false;
+        let mut right_above = false;
+        for b in 0..WAVEFORM_BUCKETS {
+            if stereo.left.max[b] > stereo.right.max[b] + 0.5 {
+                left_above = true;
+            }
+            if stereo.right.max[b] > stereo.left.max[b] + 0.5 {
+                right_above = true;
+            }
+        }
+        assert!(left_above, "ramas L deben dominar hacia el final");
+        assert!(right_above, "ramas R deben dominar hacia el inicio");
+    }
+
+    #[test]
+    fn from_windows_buckets_forth_and_back() {
+        // from_interleaved(2) ≡ from_windows(de-intercalado manual).
+        let samples: Vec<f32> = (0..2048).map(|i| (i as f32 / 2047.0) * 2.0 - 1.0).collect();
+        let mut left = Vec::with_capacity(1024);
+        let mut right = Vec::with_capacity(1024);
+        for f in 0..1024 {
+            left.push(samples[2 * f]);
+            right.push(samples[2 * f + 1]);
+        }
+        let from_i = StereoWaveform::from_interleaved(&samples, 2);
+        let from_w = StereoWaveform::from_windows(&left, &right);
+        assert_eq!(from_i.left, from_w.left);
+        assert_eq!(from_i.right, from_w.right);
+    }
+
+    #[test]
+    fn silent_channels_and_opposite_phases() {
+        // Canal derecho mudo: solo L debe mover el trazo.
+        let stereo = StereoWaveform::from_windows(&[0.6; 2048], &[0.0; 2048]);
+        assert!((stereo.peak() - 0.6).abs() < 1e-6);
+        assert_eq!(stereo.right.peak(), 0.0);
+
+        // Fases opuestas (L=sin, R=-sin): picos iguales (no se cancelan).
+        let opposite = StereoWaveform::from_windows(&[0.9; 2048], &[-0.9; 2048]);
+        assert!((opposite.peak() - 0.9).abs() < 1e-6);
+
+        assert_eq!(StereoWaveform::silent().peak(), 0.0);
     }
 }

@@ -24,7 +24,7 @@ pub mod params;
 pub mod render;
 
 pub use engine::{VisualEngine, VisualState};
-pub use palette::VisualPalette;
+pub use palette::{ChannelColors, VisualPalette};
 pub use params::{MapperConfig, ParameterMapper};
 
 /// Nº de barras del espectro TUI v0.

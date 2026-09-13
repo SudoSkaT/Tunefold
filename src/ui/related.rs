@@ -619,8 +619,15 @@ mod tests {
             cells.iter().any(|(s, fg)| *s == "t" && *fg == unread),
             "no leído = tercer color resuelto"
         );
-        // La activa (rojo, ya legible) conserva el tinte exacto de la portada.
-        assert_eq!(colors.current, [255, 0, 0]);
+        // La activa (rojo) conserva dominancia roja: el primer canal es el
+        // mayor de los tres (puede ser ajustado hacia blanco por contraste
+        // cuando el techo de brillo sube por un canal osciloscopio brillante,
+        // pero la dominancia cromática se preserva).
+        assert!(
+            colors.current[0] >= colors.current[1] && colors.current[0] >= colors.current[2],
+            "activa conserva dominancia roja: {:?}",
+            colors.current
+        );
     }
 
     #[test]
