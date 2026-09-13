@@ -61,8 +61,6 @@ pub struct VisualParameters {
     pub energy: f32,
     /// Brillo 0..1 (agudos + flujo): intensidad de color/resplandor.
     pub brightness: f32,
-    /// Deformación espacial 0..1 (medios + flujo): wobble de los glóbulos.
-    pub distortion: f32,
 }
 
 fn shaped(v: f32, cfg: &MapperConfig) -> f32 {
@@ -177,7 +175,6 @@ impl ParameterMapper {
             f.high * 0.8 + f.high_mid * 0.4 + f.spectral_flux * 0.3,
             &self.cfg,
         );
-        let distortion = (f.mid * 0.6 + f.spectral_flux * self.cfg.turbulence_gain).clamp(0.0, 1.0);
 
         VisualParameters {
             bars,
@@ -188,7 +185,6 @@ impl ParameterMapper {
             phase_rate,
             energy,
             brightness,
-            distortion,
         }
     }
 }
@@ -240,7 +236,7 @@ mod tests {
         for v in [p.level, p.intensity, p.turbulence, p.pulse_kick] {
             assert!((0.0..=1.0).contains(&v), "{v} fuera de rango");
         }
-        for v in [p.energy, p.brightness, p.distortion] {
+        for v in [p.energy, p.brightness] {
             assert!((0.0..=1.0).contains(&v), "{v} fuera de rango");
         }
     }
@@ -316,14 +312,6 @@ mod tests {
     }
 
     #[test]
-    fn mids_and_flux_raise_distortion() {
-        let mapper = ParameterMapper::default();
-        let busier = mapper.map(&features([0.3, 0.3, 0.8, 0.3, 0.3], 0.5, 0.0, false, 0.0));
-        let calm = mapper.map(&features([0.3, 0.3, 0.1, 0.3, 0.3], 0.05, 0.0, false, 0.0));
-        assert!(busier.distortion > calm.distortion, "medios+flujo deforman");
-    }
-
-    #[test]
     fn energy_brightness_do_not_touch_on_silence() {
         let mapper = ParameterMapper::default();
         let p = mapper.map(&features(
@@ -335,7 +323,6 @@ mod tests {
         ));
         assert_eq!(p.energy, 0.0);
         assert_eq!(p.brightness, 0.0);
-        assert_eq!(p.distortion, 0.0);
     }
 
     #[test]

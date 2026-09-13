@@ -212,8 +212,8 @@ pub fn paint_frame(frame: &mut Frame, area: Rect, title: &str, title_color: Colo
 }
 
 /// Overlay de karaoke que NO destruye el fondo: pinta solo el marco y el texto
-/// de las líneas (fondo transparente), para que la capa ambiental (lava) siga
-/// viva detrás de las letras (spec §7/§15).
+/// de las líneas (fondo transparente), para que el fondo de osciloscopio siga
+/// vivo detrás de las letras (spec §7/§15).
 ///
 /// La línea activa queda en una fila estable alrededor de dos tercios del
 /// panel; usa el mismo deslizamiento en cascada de [`KaraokeScroller`].
@@ -258,8 +258,8 @@ pub fn render_over_scene(
         } else {
             Style::new().fg(unread_c)
         };
-        // Escritura directa al buffer: el fondo de la celda NO se toca, así la
-        // lava ambiental permanece detrás del texto.
+        // Escritura directa al buffer: el fondo de la celda NO se toca, así el
+        // fondo de osciloscopio permanece detrás del texto.
         let text = &line.text;
         let width = text.chars().count();
         let pad = inner_w.saturating_sub(width) / 2;
@@ -422,7 +422,7 @@ mod tests {
     #[test]
     fn overlay_preserves_background_below_text() {
         // El karaoke superpuesto NO debe borrar el fondo (a diferencia del
-        // Paragraph antiguo): la lava ambiental queda viva detrás del texto.
+        // Paragraph antiguo): el fondo de osciloscopio queda vivo detrás del texto.
         use ratatui::backend::TestBackend;
         use ratatui::layout::Margin;
         use ratatui::Terminal;

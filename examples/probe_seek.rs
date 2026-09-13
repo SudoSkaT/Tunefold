@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     println!("pista: {} ({})", track.title, track.identifier());
 
     let (bus, joined) = EventBus::channel();
-    let (engine_config, _features) = tunefold::infrastructure::playback::build_engines(
+    let (engine_config, _features, _waveform) = tunefold::infrastructure::playback::build_engines(
         &tunefold::infrastructure::config::Config::default(),
         bus,
         reqwest::Client::new(),

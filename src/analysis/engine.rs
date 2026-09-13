@@ -2,7 +2,8 @@
 //! [`AudioFeatures`] publicadas al bus (spec §19-§20).
 //!
 //! Diseño del camino caliente:
-//! - cero allocations por hop salvo el snapshot publicado (uno cada ~11 ms);
+//! - cero allocations por hop salvo los DOS snapshots publicados (features +
+//!   envolvente, uno cada ~11 ms);
 //! - ventana deslizante de tamaño `fft_size`, procesando cuando hay ≥`hop`
 //!   muestras nuevas (overlap 75% con los valores por defecto);
 //! - si la fuente cambia de formato o hay un GAP (>300 ms sin datos: cambio
@@ -22,6 +23,7 @@ use super::fft::SpectrumAnalyzer;
 use super::onset::{FluxAnalyzer, OnsetDetector};
 use super::ring::SpScRing;
 use super::smoother::{FeatureSmoother, SMOOTHED_CHANNELS};
+use super::waveform::{WaveformBus, WaveformEnvelope};
 
 /// Configuración del pipeline DSP.
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +80,7 @@ impl PcmTap {
 pub struct AnalysisRuntime {
     tap: PcmTap,
     bus: FeatureBus,
+    waveform: WaveformBus,
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -98,6 +101,7 @@ impl AnalysisRuntime {
         // para la ventana (2048) + jitter de scheduling, sin retener MB.
         let ring = SpScRing::new(1 << 17);
         let self_bus = FeatureBus::new();
+        let self_waveform = WaveformBus::new();
         let meta: Arc<Mutex<Option<StreamMeta>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -106,15 +110,26 @@ impl AnalysisRuntime {
             let meta = Arc::clone(&meta);
             let stop = Arc::clone(&stop);
             let bus_for_thread = self_bus.clone();
+            let waveform_for_thread = self_waveform.clone();
             std::thread::Builder::new()
                 .name("audio-analysis".into())
-                .spawn(move || run(config, ring, meta, stop, bus_for_thread))
+                .spawn(move || {
+                    run(
+                        config,
+                        ring,
+                        meta,
+                        stop,
+                        bus_for_thread,
+                        waveform_for_thread,
+                    )
+                })
                 .expect("spawn del hilo de análisis")
         };
 
         Self {
             tap: PcmTap { ring, meta },
             bus: self_bus,
+            waveform: self_waveform,
             stop,
             join: Some(join),
         }
@@ -128,6 +143,11 @@ impl AnalysisRuntime {
     /// Bus de lectura para consumidores (visualización/métricas).
     pub fn bus(&self) -> FeatureBus {
         self.bus.clone()
+    }
+
+    /// Bus de envolvente de forma de onda (mismo hilo, mismo cadencia).
+    pub fn waveform_bus(&self) -> WaveformBus {
+        self.waveform.clone()
     }
 }
 
@@ -147,6 +167,7 @@ fn run(
     meta_cell: Arc<Mutex<Option<StreamMeta>>>,
     stop: Arc<AtomicBool>,
     bus: FeatureBus,
+    waveform: WaveformBus,
 ) {
     let mut analyzer = SpectrumAnalyzer::new(config.fft_size);
     let mut flux = FluxAnalyzer::new();
@@ -156,7 +177,7 @@ fn run(
 
     let mut window: VecDeque<f32> = VecDeque::with_capacity(config.fft_size);
     // Buffers reutilizados hop tras hop: cero allocations en el camino caliente
-    // (el único alloc por frame es el snapshot Arc del bus, por diseño).
+    // (los únicos allocs por frame son los snapshots Arc de los dos buses).
     let mut frame_buf: Vec<f32> = Vec::with_capacity(config.fft_size);
     let mut mags_buf: Vec<f32> = Vec::with_capacity(config.fft_size / 2);
     let mut since_hop = 0usize;
@@ -188,6 +209,7 @@ fn run(
                 bpm_hold = 0.0;
                 flushed_on_gap = true;
                 let _ = bus.publish(AudioFeatures::silent(Duration::ZERO));
+                let _ = waveform.publish(WaveformEnvelope::silent());
             }
             std::thread::sleep(Duration::from_millis(4));
             continue;
@@ -207,6 +229,7 @@ fn run(
             bpm = BpmEstimator::new(hop_rate_of(current_meta, &config));
             smoother.reset();
             bpm_hold = 0.0;
+            let _ = waveform.publish(WaveformEnvelope::silent());
         }
         let Some(meta) = current_meta else {
             // Sin formato anunciado aún: descartar datos hasta el announce.
@@ -275,6 +298,10 @@ fn run(
                 bpm: bpm_hold,
             };
             bus.publish(features);
+            // La envolvente del MISMO hop (misma ventana): el consumidor visual
+            // la decima al ancho del terminal. Un Arc por frame ≈ 1 alloc extra
+            // por hop (documentada; la ruta del audio no la ve).
+            waveform.publish(WaveformEnvelope::from_window(&frame_buf));
         }
     }
 }
@@ -386,6 +413,63 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "el Drop hace join sin colgarse"
+        );
+    }
+
+    #[test]
+    fn engine_publishes_waveform_envelopes_from_sine() {
+        const SR: u32 = 44_100;
+        const CH: u16 = 2;
+        let runtime = AnalysisRuntime::spawn(AnalysisConfig::default());
+        let waveform = runtime.waveform_bus();
+        let tap = runtime.tap();
+        tap.announce(StreamMeta {
+            sample_rate: SR,
+            channels: CH,
+        });
+
+        // Sin samples: la ventana está vacía y el bus aún no tiene nada.
+        assert!(waveform.latest().is_none(), "sin audio ⇒ sin envolvente");
+
+        // El mismo seno que alimenta features debe publicar envolventes:
+        // llenar ~1 s de audio interleaveado.
+        let total = (SR as usize) * CH as usize;
+        let mut fed = 0usize;
+        let mut i = 0usize;
+        while fed < total {
+            let batch_len = (4096).min(total - fed);
+            let batch: Vec<f32> = (0..batch_len)
+                .map(|_| {
+                    let s = sine_wave(120.0, SR as f32, i as f32 / SR as f32, 0.5);
+                    i += 1;
+                    s
+                })
+                .collect();
+            tap.feed(&batch);
+            fed += batch.len();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = None;
+        while Instant::now() < deadline {
+            if let Some(env) = waveform.latest() {
+                if env.peak() > 0.05 {
+                    got = Some(env);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let env = got.expect("el motor publica envolventes con contenido");
+        assert!(
+            env.min.iter().zip(env.max.iter()).all(|(lo, hi)| lo <= hi),
+            "min ≤ max en todos los buckets"
+        );
+        assert!(
+            env.peak() <= 1.0,
+            "amplitud normalizada (peaks ≤ 1): {}",
+            env.peak()
         );
     }
 }

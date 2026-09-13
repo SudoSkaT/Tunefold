@@ -4,7 +4,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 
 use std::sync::Arc;
 
-use crate::analysis::AudioFeatures;
+use crate::analysis::{AudioFeatures, WaveformEnvelope};
 use crate::app::aggregator::SearchOutcome;
 use crate::app::audio::PlaybackStatus;
 use crate::app::thumbnail::ThumbnailState;
@@ -96,8 +96,14 @@ pub enum BackendEvent {
         key: String,
         state: ThumbnailState,
     },
-    /// Último snapshot de análisis de audio (~15 Hz mientras suena).
-    Features(Arc<AudioFeatures>),
+    /// Último snapshot de análisis de audio (~15 Hz mientras suena). Una SOLA
+    /// estructura con las características musicales y la envolvente de forma
+    /// de onda del MISMO frame (spec): el consumidor visual las consume juntas
+    /// y un solo evento ⇒ un solo redraw.
+    VisualFrame {
+        features: Arc<AudioFeatures>,
+        waveform: Option<Arc<WaveformEnvelope>>,
+    },
     Playlists(Vec<PlaylistRow>),
     PlaylistTracks {
         playlist_id: i64,

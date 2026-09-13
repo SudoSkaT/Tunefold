@@ -19,7 +19,7 @@ use tunefold::analysis::{
     onset::{FluxAnalyzer, OnsetDetector},
     ring::SpScRing,
     smoother::FeatureSmoother,
-    AnalysisConfig, AnalysisRuntime, StreamMeta,
+    AnalysisConfig, AnalysisRuntime, StreamMeta, WaveformEnvelope,
 };
 use tunefold::domain::source::Source;
 use tunefold::domain::track::Track;
@@ -136,6 +136,7 @@ fn main() {
 
     let mut engine = VisualEngine::new(ParameterMapper::default());
     let mut pos_ms = 0u64;
+    let envelope = Arc::new(WaveformEnvelope::from_window(&[0.5; 2048]));
     let palette = tunefold::visualization::VisualPalette::from_cover(Some([
         [220, 60, 120],
         [60, 160, 240],
@@ -143,10 +144,20 @@ fn main() {
     ]));
     bench("visual engine update", vis_budget, || {
         pos_ms += 66;
-        black_box(engine.update(Some(&feats), Duration::from_millis(pos_ms), &palette));
+        black_box(engine.update(
+            Some(&feats),
+            Some(&envelope),
+            Duration::from_millis(pos_ms),
+            &palette,
+        ));
     });
 
-    let state = engine.update(Some(&feats), Duration::from_secs(3), &palette);
+    let state = engine.update(
+        Some(&feats),
+        Some(&envelope),
+        Duration::from_secs(3),
+        &palette,
+    );
     bench("render TUI completo (80×5)", vis_budget, || {
         let backend = ratatui::backend::TestBackend::new(80, 5);
         let mut term = ratatui::Terminal::new(backend).unwrap();

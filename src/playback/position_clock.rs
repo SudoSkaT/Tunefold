@@ -33,11 +33,14 @@ const SPURIOUS_BLIP: Duration = Duration::from_millis(500);
 /// evento dedicado llegó a destiempo. Se re-ancla a lo reportado y se avisa con
 /// [`ClockEvent::Restarted`]: la letra sigue siendo válida, solo se rebobina.
 const RESTART_THRESHOLD: Duration = Duration::from_secs(10);
-/// Horizonte máximo de extrapolación. El motor reporta cada ~500 ms; si el
-/// ancla quedó más vieja que esto (ticker perdido, UI saturada durante
-/// segundos), la lectura se congelará en vez de adelantarse sin límite: las
-/// letras jamás se van por delante de lo que el audio realmente podrá seguir.
-const MAX_EXTRAPOLATION: Duration = Duration::from_millis(750);
+/// Horizonte máximo de extrapolación. El motor reporta cada ~500 ms; el límite
+/// se fija POR DEBAJO de esa cadencia para que la lectura nunca se ponga por
+/// delante de donde PUEDE estar la siguiente muestra: un ticker perdido o un
+/// corte aún no reportado congelan la lectura en vez de adelantarla, y el
+/// rebote "se adelanta y vuelve" de las letras desaparece. Con el reenvío
+/// inmediato de estados en el backend (`Buffering`/`Paused`/`Stopped`), el
+/// hueco de stall queda cerrado casi a cero.
+const MAX_EXTRAPOLATION: Duration = Duration::from_millis(400);
 
 /// Seek solicitado aún no confirmado por el motor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

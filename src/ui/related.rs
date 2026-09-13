@@ -23,7 +23,6 @@ use crate::infrastructure::storage::TrackListeningStats;
 use super::liked::Liked;
 use super::widgets::karaoke::KaraokeScroller;
 use super::VisualContent;
-use crate::visualization::palette::VisualPalette;
 use crate::visualization::render as visualizer;
 
 use super::navigation::ListSelection;
@@ -136,7 +135,7 @@ impl super::navigation::ListSelection for RelatedState {
 
 /// Contenido efectivo de la banda superior, resuelto desde [`VisualContent`].
 enum BandContent {
-    /// El visualizador (lava + barras) ocupa la banda.
+    /// El visualizador (osciloscopio + barras) ocupa la banda.
     Visual,
     /// Letras karaoke sobre la capa ambiental.
     Lyrics,
@@ -219,18 +218,12 @@ pub fn render(
                 );
             }
             BandContent::Lyrics => {
-                visualizer::render_ambient(frame, top_area, visual, true);
-                render_karaoke_over_scene(
-                    frame,
-                    top_area,
-                    state,
-                    position,
-                    finished,
-                    &visual.scene.palette,
-                );
+                visualizer::render_backdrop(frame, top_area, visual, true);
+                let colors = visual.scene.palette.karaoke_colors();
+                render_karaoke_over_scene(frame, top_area, state, position, finished, colors);
             }
             BandContent::Unavailable => {
-                visualizer::render_ambient(frame, top_area, visual, true);
+                visualizer::render_backdrop(frame, top_area, visual, true);
                 render_message_over_scene(
                     frame,
                     top_area,
@@ -239,7 +232,7 @@ pub fn render(
                 );
             }
             BandContent::Waiting => {
-                visualizer::render_ambient(frame, top_area, visual, true);
+                visualizer::render_backdrop(frame, top_area, visual, true);
                 render_message_over_scene(
                     frame,
                     top_area,
@@ -268,17 +261,18 @@ pub fn render(
 /// Prepara el estado del karaoke (línea activa, fin de letra, paleta) y delega
 /// el render en el overlay que preserva la capa ambiental.
 ///
-/// Los tres estados (ya leído / en lectura / no leído) adoptan los tres colores
-/// de la paleta fundida de la portada (que el motor visual entrega en
-/// `visual.scene.palette`). El panel se limpia cuando la reproducción terminó
-/// de verdad (`finished` = estado `Stopped` del motor).
+/// Los tres estados (ya leído / en lectura / no leído) reciben los colores de
+/// la paleta fundida de la portada con contraste garantizado contra la escena
+/// aplacada (χ ≥ 4.5 activa, χ ≥ 3.0 históricas; ver `palette.rs`). El panel
+/// se limpia cuando la reproducción terminó de verdad (`finished` = estado
+/// `Stopped` del motor).
 fn render_karaoke_over_scene(
     frame: &mut Frame,
     area: Rect,
     state: &mut RelatedState,
     position: Option<Duration>,
     finished: bool,
-    palette: &VisualPalette,
+    colors: crate::visualization::palette::KaraokeColors,
 ) {
     let Some(sync) = state.synced.as_ref().filter(|s| !s.is_empty()) else {
         return;
@@ -289,7 +283,6 @@ fn render_karaoke_over_scene(
     } else {
         sync.active_index(pos)
     };
-    let colors = karaoke_colors(palette);
     super::widgets::karaoke::render_over_scene(
         frame,
         area,
@@ -297,18 +290,12 @@ fn render_karaoke_over_scene(
         sync,
         active,
         finished,
-        colors,
+        (
+            Color::Rgb(colors.read[0], colors.read[1], colors.read[2]),
+            Color::Rgb(colors.current[0], colors.current[1], colors.current[2]),
+            Color::Rgb(colors.unread[0], colors.unread[1], colors.unread[2]),
+        ),
     );
-}
-
-/// Mapea los tres estados del karaoke a los tres colores de la paleta fundida:
-/// `(ya leído, en lectura, no leído)`. La línea activa usa el dominante.
-fn karaoke_colors(p: &VisualPalette) -> (Color, Color, Color) {
-    (
-        Color::Rgb(p.secondary[0], p.secondary[1], p.secondary[2]),
-        Color::Rgb(p.primary[0], p.primary[1], p.primary[2]),
-        Color::Rgb(p.accent[0], p.accent[1], p.accent[2]),
-    )
 }
 
 /// Panel de aviso CON fondo transparente (escritura directa): no borra la capa
@@ -459,6 +446,7 @@ pub fn render_tracks_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::visualization::palette::VisualPalette;
     use crate::visualization::VisualState;
     use ratatui::backend::TestBackend;
 
@@ -602,33 +590,37 @@ mod tests {
     #[test]
     fn karaoke_uses_cover_palette() {
         let sync = SyncLyrics::parse("[00:05] uno\n[00:10] dos\n[00:15] tres\n");
+        let cover = Some([[255, 0, 0], [0, 255, 0], [0, 0, 255]]);
+        // Los estados adoptan la paleta de la portada YA resuelta por contraste
+        // (la activa conserva el tinte cuando cumple; las demás se iluminan si
+        // el tercer color azul puro no alcanzaba 3:1 sobre la escena aplacada).
+        let colors = VisualPalette::from_cover(cover).karaoke_colors();
         // En posición 12s: "uno" (ya leído), "dos" (en lectura), "tres" (no leído).
         let buf = render_state(
             Some(sync),
             Duration::from_secs(12),
             false,
             VisualContent::Auto,
-            Some([[255, 0, 0], [0, 255, 0], [0, 0, 255]]),
+            cover,
         );
         let cells: Vec<(&str, Color)> = buf.content().iter().map(|c| (c.symbol(), c.fg)).collect();
+        let active = Color::Rgb(colors.current[0], colors.current[1], colors.current[2]);
+        let read = Color::Rgb(colors.read[0], colors.read[1], colors.read[2]);
+        let unread = Color::Rgb(colors.unread[0], colors.unread[1], colors.unread[2]);
         assert!(
-            cells
-                .iter()
-                .any(|(s, fg)| *s == "d" && *fg == Color::Rgb(255, 0, 0)),
-            "en lectura = color dominante"
+            cells.iter().any(|(s, fg)| *s == "d" && *fg == active),
+            "en lectura = color dominante resuelto"
         );
         assert!(
-            cells
-                .iter()
-                .any(|(s, fg)| *s == "u" && *fg == Color::Rgb(0, 255, 0)),
-            "ya leído = segundo color"
+            cells.iter().any(|(s, fg)| *s == "u" && *fg == read),
+            "ya leído = segundo color resuelto"
         );
         assert!(
-            cells
-                .iter()
-                .any(|(s, fg)| *s == "t" && *fg == Color::Rgb(0, 0, 255)),
-            "no leído = tercer color"
+            cells.iter().any(|(s, fg)| *s == "t" && *fg == unread),
+            "no leído = tercer color resuelto"
         );
+        // La activa (rojo, ya legible) conserva el tinte exacto de la portada.
+        assert_eq!(colors.current, [255, 0, 0]);
     }
 
     #[test]
@@ -690,15 +682,16 @@ mod tests {
     }
 
     #[test]
-    fn karaoke_colors_map_from_palette() {
+    fn karaoke_colors_resolve_for_contrast() {
+        // La resolución adapta los tres estados garantizando contraste contra
+        // el techo del fondo (χ ≥ 4.5 activo, χ ≥ 3.0 históricos).
         let p = VisualPalette::fallback();
-        let (read, cur, unread) = karaoke_colors(&p);
-        assert_eq!(
-            read,
-            Color::Rgb(p.secondary[0], p.secondary[1], p.secondary[2])
-        );
-        assert_eq!(cur, Color::Rgb(p.primary[0], p.primary[1], p.primary[2]));
-        assert_eq!(unread, Color::Rgb(p.accent[0], p.accent[1], p.accent[2]));
+        let colors = p.karaoke_colors();
+        let bg = p.karaoke_bg_ceiling();
+        let ratio = crate::visualization::palette::contrast_ratio;
+        assert!(ratio(colors.current, bg) >= 4.5, "activa legible");
+        assert!(ratio(colors.read, bg) >= 3.0, "leída legible");
+        assert!(ratio(colors.unread, bg) >= 3.0, "no leída legible");
     }
 
     #[test]

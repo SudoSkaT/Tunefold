@@ -22,21 +22,27 @@ pub use rodio_backend::RodioBackend;
 
 /// Construye los motores a partir de la configuración. `http` es el cliente
 /// HTTP compartido para resolver/descargar streams. Todos los motores notifican
-/// al `bus` agrupado.
+/// al `bus` agrupado. Devuelve también los buses del análisis (features y
+/// envolvente de forma de onda), ambos `None` si el flag de análisis está OFF.
 pub fn build_engines(
     config: &Config,
     bus: EventBus,
     http: reqwest::Client,
-) -> (RouterConfig, Option<crate::analysis::FeatureBus>) {
+) -> (
+    RouterConfig,
+    Option<crate::analysis::FeatureBus>,
+    Option<crate::analysis::WaveformBus>,
+) {
     let mut engines: Vec<Arc<dyn PlaybackEngine>> = Vec::new();
 
     // Análisis de audio opcional: un runtime por construcción de motores; su
-    // Drop detiene el hilo al reconstruirse (ajustes). El FeatureBus viaja
-    // hacia fuera para los consumidores (visualización Fase 7).
+    // Drop detiene el hilo al reconstruirse (ajustes). Los buses viajan hacia
+    // fuera para los consumidores (visualización, métricas).
     let analysis = config.flags.audio_analysis.then(|| {
         crate::analysis::AnalysisRuntime::spawn(crate::analysis::AnalysisConfig::default())
     });
     let features = analysis.as_ref().map(|rt| rt.bus());
+    let waveform = analysis.as_ref().map(|rt| rt.waveform_bus());
 
     // Salida local para rodio. Si no hay dispositivo de audio, el backend
     // notificará el error en play(). Sus errores en caliente (underrun,
@@ -53,7 +59,7 @@ pub fn build_engines(
     )));
 
     let policy = config.playback_policy.clone();
-    (RouterConfig { engines, policy }, features)
+    (RouterConfig { engines, policy }, features, waveform)
 }
 
 /// Fuentes que reproducen stream HTTP directo. Todos los orígenes actuales lo son.

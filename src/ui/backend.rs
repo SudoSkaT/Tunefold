@@ -137,6 +137,8 @@ pub struct Backend {
     preload: Arc<crate::playback::PreloadManager>,
     /// Bus de features del análisis de audio (`None` si el flag está OFF).
     features: Option<crate::analysis::FeatureBus>,
+    /// Bus de envolvente de forma de onda del mismo análisis.
+    waveform: Option<crate::analysis::WaveformBus>,
 }
 
 impl Backend {
@@ -171,10 +173,11 @@ impl Backend {
             .expect("cliente HTTP válido");
 
         // Bus de eventos agrupado: todos los motores notifican aquí. El
-        // análisis de audio (si está habilitado) entrega además su bus de
-        // features para consumidores posteriores (visualización).
+        // análisis de audio (si está habilitado) entrega además sus buses de
+        // features y forma de onda a los consumidores (visualización).
         let (bus, joined) = EventBus::channel();
-        let (engine_config, features) = playback::build_engines(&config, bus, http.clone());
+        let (engine_config, features, waveform) =
+            playback::build_engines(&config, bus, http.clone());
         let router = Arc::new(PlaybackRouter::new(engine_config, joined));
 
         let preload = Arc::new(crate::playback::PreloadManager::new(
@@ -199,13 +202,19 @@ impl Backend {
             recovery_budget: Arc::new(tokio::sync::Mutex::new(RecoveryBudget::default())),
             preload,
             features,
+            waveform,
         }
     }
 
     /// Último snapshot de features de audio, si el análisis está activo
-    /// (consumidores: visualización Fase 7, métricas).
+    /// (consumidores: visualización, métricas).
     pub fn features(&self) -> Option<&crate::analysis::FeatureBus> {
         self.features.as_ref()
+    }
+
+    /// Última envolvente de forma de onda, si el análisis está activo.
+    pub fn waveform(&self) -> Option<&crate::analysis::WaveformBus> {
+        self.waveform.as_ref()
     }
 
     /// Reconstruye el agregador de proveedores a partir de la configuración actual.
@@ -335,10 +344,11 @@ impl Backend {
                 // Reconstruye router y motores con la nueva política/config
                 // (el Drop del AnalysisRuntime viejo detiene su hilo).
                 let (bus, joined) = EventBus::channel();
-                let (engine_config, features) =
+                let (engine_config, features, waveform) =
                     playback::build_engines(&self.config, bus, self.http.clone());
                 self.router = Arc::new(PlaybackRouter::new(engine_config, joined));
                 self.features = features;
+                self.waveform = waveform;
                 Some(BackendEvent::Settings(self.config.form()))
             }
             BackendCommand::LoadHistory => match self.history.recent(30).await {
@@ -1006,6 +1016,24 @@ enum RecoveryOutcome {
     Failed(String),
 }
 
+/// ¿Un evento del bus de reproducción exige reenviar a la UI el estado REAL
+/// del motor de inmediato, sin esperar al tick de 500 ms?
+///
+/// Son los cambios de estado: un corte por rellenado de buffer (`Buffering`),
+/// la reanudación (`Playing`), una pausa (`Paused`) y la parada (`Stopped`).
+/// El ticker los acabaría reenviando igualmente, pero cada ~500 ms de retraso
+/// deja al reloj de letras extrapolando por delante de un audio congelado. Los
+/// demás eventos tienen reenvío propio (seek/error/fin).
+fn forwards_real_state(ev: &PlaybackEvent) -> bool {
+    matches!(
+        ev,
+        PlaybackEvent::Buffering
+            | PlaybackEvent::Playing
+            | PlaybackEvent::Paused
+            | PlaybackEvent::Stopped
+    )
+}
+
 /// Lanza la tarea del backend y devuelve (emisor de comandos, receptor de eventos).
 pub fn spawn_backend(
     mut backend: Backend,
@@ -1184,6 +1212,19 @@ pub fn spawn_backend(
                         Ok(PlaybackEvent::SeekFailed) => {
                             let _ = event_tx.send(BackendEvent::SeekFailed);
                         }
+                        // Cambios de estado del motor: NO se descartan. Aunque el
+                        // ticker de 500 ms los reenvíe cada ciclo, la UI debe
+                        // enterarse de un corte (buffer bajo el stream en
+                        // `Buffering`, pausa, parada) EN CUANTO ocurre: hasta el
+                        // tick siguiente su reloj de letras seguiría extrapolando
+                        // — hasta ~500 ms por delante de un audio congelado — y
+                        // las letras se adelantan y luego rebotan (el bug
+                        // "se están acelerando"). Un snapshot aqui cierra el hueco.
+                        Ok(ev) if forwards_real_state(&ev) => {
+                            let _ = event_tx.send(BackendEvent::Playback(
+                                backend.router.status().await,
+                            ));
+                        }
                         _ => {}
                     }
                 }
@@ -1204,7 +1245,15 @@ pub fn spawn_backend(
                             if let Some(f) = bus.latest() {
                                 if last_sent_features != Some(f.timestamp) {
                                     last_sent_features = Some(f.timestamp);
-                                    let _ = event_tx.send(BackendEvent::Features(std::sync::Arc::clone(&f)));
+                                    // La envolvente del MISMO frame viaja con
+                                    // las features en un único evento (spec).
+                                    let waveform = backend
+                                        .waveform()
+                                        .and_then(|wb| wb.latest());
+                                    let _ = event_tx.send(BackendEvent::VisualFrame {
+                                        features: std::sync::Arc::clone(&f),
+                                        waveform,
+                                    });
                                 }
                             }
                         }
@@ -1310,6 +1359,31 @@ mod tests {
         assert_eq!(t.identifier(), "vid");
         t.external_id = None;
         assert_eq!(t.identifier(), "Canción|Banda");
+    }
+
+    /// Los cortes de estado del motor se reenvían a la UI INMEDIATAMENTE (para
+    /// que el karaoke congele su extrapolación en cuanto el audio se para), no
+    /// solo en el tick de 500 ms.
+    #[test]
+    fn state_changes_are_forwarded_immediately_but_others_are_not() {
+        for ev in [
+            PlaybackEvent::Buffering,
+            PlaybackEvent::Playing,
+            PlaybackEvent::Paused,
+            PlaybackEvent::Stopped,
+        ] {
+            assert!(forwards_real_state(&ev), "se reenvía {ev:?}");
+        }
+        for ev in [
+            PlaybackEvent::Finished,
+            PlaybackEvent::Cut("fin".to_string()),
+            PlaybackEvent::Error("boom".to_string()),
+            PlaybackEvent::SeekStarted,
+            PlaybackEvent::SeekCompleted,
+            PlaybackEvent::SeekFailed,
+        ] {
+            assert!(!forwards_real_state(&ev), "tiene reenvío propio {ev:?}");
+        }
     }
 
     /// La decisión de recuperación consume presupuesto EXACTAMENTE una vez por

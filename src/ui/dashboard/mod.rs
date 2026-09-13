@@ -55,7 +55,7 @@ pub fn render(
         .as_ref()
         .and_then(|t| thumbnails.get(&t.identifier()));
     song_card::render(frame, chunks[0], playback.track.as_ref(), state, frame_anim);
-    // La banda del visual es COMPOSICIÓN completa (lava ambiental + barras);
+    // La banda del visual es COMPOSICIÓN completa (osciloscopio + barras);
     // la paleta de la portada ya la fundió el motor en `visual.scene.palette`.
     // Con el análisis inactivo el renderer pinta la banda apagada.
     visualizer::render(frame, chunks[1], visual, playback.position.as_secs_f32());

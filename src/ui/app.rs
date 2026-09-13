@@ -1,6 +1,7 @@
 //! Estado de la TUI y loop principal de eventos.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -10,7 +11,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::analysis::AudioFeatures;
+use crate::analysis::{AudioFeatures, WaveformEnvelope};
 use crate::app::audio::{PlaybackState, PlaybackStatus};
 use crate::app::thumbnail::ThumbnailState;
 use crate::domain::source::Source;
@@ -97,14 +98,11 @@ pub struct App {
     playlists: Vec<PlaylistRow>,
     /// Sub-estado de la vista Playlists (listado/detalle).
     playlist_view: PlaylistState,
-    /// Tabla de atajos abierta (Shift+H): se cierra con casi cualquier tecla
-    /// (excepto la navegación interna de desplazamiento). Pide Shift+H porque
+    /// Tabla de atajos abierta (Shift+H): se cierra con CUALQUIER tecla
+    /// (legible en cualquier terminal, sin scroll). Pide Shift+H porque
     /// Shift+h en ciertos teclados llega en minúscula con SHIFT (normalizado
     /// en `on_key`).
     show_help: bool,
-    /// Desplazamiento de la tabla de atajos: en terminales estrechos cabe con
-    /// scroll interno (la tabla deja de caber en una pantalla).
-    help_scroll: usize,
     /// Ids internos de los tracks "liked" (pertenencia a L1K3D). Se llena con
     /// `BackendEvent::L1K3D` al arrancar y se mantiene con `L1K3DChanged`:
     /// todas las vistas pintan el corazón a partir de este estado (no de
@@ -142,6 +140,8 @@ pub struct App {
     visual_mode: VisualContent,
     /// Último snapshot de features recibido del backend.
     features: Option<Arc<AudioFeatures>>,
+    /// Envolvente de forma de onda del MISMO snapshot (misma cadencia).
+    waveform: Option<Arc<WaveformEnvelope>>,
     /// Instante de recepción del último snapshot (frescura ~900 ms).
     features_at: Option<std::time::Instant>,
     /// Contador de frames para animaciones de la TUI (spinner, avisos).
@@ -180,7 +180,6 @@ impl App {
             playlists: Vec::new(),
             playlist_view: PlaylistState::default(),
             show_help: false,
-            help_scroll: 0,
             liked: super::liked::Liked::default(),
             mouse_pos: None,
             mouse_click: false,
@@ -193,6 +192,7 @@ impl App {
             visual: VisualEngine::new(ParameterMapper::default()),
             visual_mode: VisualContent::default(),
             features: None,
+            waveform: None,
             features_at: None,
             frame: 0,
             clock: crate::playback::PositionClock::new(),
@@ -303,24 +303,11 @@ impl App {
             return;
         }
 
-        // Tabla de atajos (Shift+H): una vez abierta, casi cualquier tecla la
-        // cierra. Solo las de desplazamiento (↑/↓, PgUp/PgDn, w/s/k/j) se
-        // reservan para moverse dentro de la ayuda si el contenido no cabe en
-        // pantalla; el resto (incluida la propia Shift+H y los atajos de
-        // vista) la cierra. Así las pantallas pequeñas pueden consultar los
-        // comandos sin filtros de coordinación con el resto de atajos.
+        // Tabla de atajos (Shift+H): CUALQUIER tecla la cierra (incluida la
+        // propia Shift+H y las de desplazamiento antiguas, ya sin uso). Como el
+        // popup no tiene scroll, no hay teclas reservadas que consultar.
         if self.show_help {
-            match key.code {
-                KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
-                    self.scroll_help(-1);
-                }
-                KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('j') => {
-                    self.scroll_help(1);
-                }
-                KeyCode::PageUp => self.scroll_help(-8),
-                KeyCode::PageDown => self.scroll_help(8),
-                _ => self.show_help = false,
-            }
+            self.show_help = false;
             return;
         }
         // Se acepta `h` y `H` con o sin modificador SHIFT: la mayoría de
@@ -366,16 +353,6 @@ impl App {
             }
         }
         key
-    }
-
-    /// Desplaza la tabla de atajos abierta. El límite superior se ajusta en el
-    /// render (depende del tamaño del terminal); aquí solo se mueve el índice.
-    fn scroll_help(&mut self, delta: isize) {
-        if delta < 0 {
-            self.help_scroll = self.help_scroll.saturating_sub(delta.unsigned_abs());
-        } else {
-            self.help_scroll = self.help_scroll.saturating_add(delta as usize);
-        }
     }
 
     /// `true` si la vista está recibiendo texto de teclado: búsqueda con
@@ -1101,10 +1078,12 @@ impl App {
             BackendEvent::Thumbnail { key, state } => {
                 self.thumbnails.insert(key, state);
             }
-            // Nuevo frame de análisis: se guarda; el DIBUJO lo dispara el
-            // propio evento (cada Features ⇒ un redraw a ~15 Hz).
-            BackendEvent::Features(f) => {
-                self.features = Some(f);
+            // Nuevo frame visual: features + envolvente del mismo análisis.
+            // Se guardan juntos; el DIBUJO lo dispara el propio evento
+            // (cada VisualFrame ⇒ un redraw a ~15 Hz).
+            BackendEvent::VisualFrame { features, waveform } => {
+                self.features = Some(features);
+                self.waveform = waveform;
                 self.features_at = Some(std::time::Instant::now());
             }
             BackendEvent::Playlists(playlists) => {
@@ -1194,14 +1173,7 @@ impl App {
         self.render_view(frame, chunks[1]);
         self.render_status(frame, chunks[2]);
         if self.show_help {
-            let (scroll, _) = crate::ui::help::render_help(
-                frame,
-                area,
-                self.help_scroll,
-                profile,
-                *crate::ui::glyphs::GLYPHS,
-            );
-            self.help_scroll = scroll;
+            crate::ui::help::render_help(frame, area, profile, *crate::ui::glyphs::GLYPHS);
         }
     }
 
@@ -1255,9 +1227,8 @@ impl App {
 
     /// Tabla de atajos (Shift+H). La definición de atajos vive en
     /// [`crate::ui::help::BINDINGS`] (fuente única) y el popup aquí se delega
-    /// íntegramente a [`crate::ui::help::render_help`]: responsive en columnas,
-    /// con scroll en terminales bajos y cualquier tecla (salvo las de
-    /// desplazamiento) para cerrarla.
+    /// íntegramente a [`crate::ui::help::render_help`]: responsive en columnas
+    /// por categorías completas, SIN scroll, y cualquier tecla la cierra.
     fn playback_line(&self) -> String {
         let g = &crate::ui::glyphs::GLYPHS;
         let state = match self.playback.state {
@@ -1283,6 +1254,18 @@ impl App {
         }
     }
 
+    /// Avanza el motor visual con el snapshot más reciente (features +
+    /// envolvente del mismo frame) y la posición maestra.
+    fn make_visual_state(
+        &mut self,
+        fresh: Option<&Arc<AudioFeatures>>,
+        position: Duration,
+        palette: &VisualPalette,
+    ) -> crate::visualization::VisualState {
+        self.visual
+            .update(fresh, self.waveform.as_ref(), position, palette)
+    }
+
     fn render_view(&mut self, frame: &mut Frame, area: Rect) {
         // FUENTE ÚNICA de la posición mostrada: antes de renderizar, la barra
         // de progreso, el visual y cualquier consumidor adoptan el reloj
@@ -1303,7 +1286,7 @@ impl App {
                 // La paleta de la portada entra al MOTOR: el engine la funde con
                 // la anterior y la escena la expone ya mezclada al renderer.
                 let palette = VisualPalette::from_cover(self.cover_palette());
-                let state = self.visual.update(fresh.as_ref(), position, &palette);
+                let state = self.make_visual_state(fresh.as_ref(), position, &palette);
                 let is_liked = self
                     .now_playing
                     .as_ref()
@@ -1337,7 +1320,7 @@ impl App {
                     .filter(|t| t.elapsed() < std::time::Duration::from_millis(900))
                     .and_then(|_| self.features.clone());
                 let palette = VisualPalette::from_cover(self.cover_palette());
-                let visual = self.visual.update(fresh.as_ref(), position, &palette);
+                let visual = self.make_visual_state(fresh.as_ref(), position, &palette);
                 related::render(
                     frame,
                     area,
@@ -2566,6 +2549,49 @@ mod tests {
     }
 
     #[test]
+    fn buffering_status_freezes_karaoke_immediately() {
+        // El backend reenvía el corte de estado (Buffering) EN CUANTO el buffer
+        // se queda corto, sin esperar al tick de 500 ms: si llegara tarde, el
+        // reloj seguiría extrapolando sobre un audio congelado y las letras se
+        // adelantarían ("se están acelerando"). Aquí se fuerza un ancla vieja y
+        // se verifica que el estado real alcanza a congelar la lectura.
+        let (tx, _rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        let track = rec_track("song-1");
+        let status = PlaybackStatus {
+            track: Some(track.clone()),
+            state: PlaybackState::Playing,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(200)),
+            stalled: false,
+        };
+        app.on_backend(BackendEvent::PlaybackStarted {
+            status: status.clone(),
+            stats: vec![],
+        });
+        // Ancla de hace 350 ms: de seguir "Playing", la extrapolación ya habría
+        // corrido por delante de la muestra.
+        app.clock
+            .force_anchor(std::time::Instant::now() - std::time::Duration::from_millis(350));
+        assert!(
+            app.karaoke_now() > Duration::from_secs(42),
+            "mientras dice Playing extrapola"
+        );
+
+        // Llega el estado REAL de corte: la extrapolación se congela aunque el
+        // audio congelado esté en la MISMA posición (sin rebote de las letras).
+        app.on_backend(BackendEvent::Playback(PlaybackStatus {
+            state: PlaybackState::Buffering,
+            ..status
+        }));
+        assert_eq!(
+            app.karaoke_now(),
+            Duration::from_secs(42),
+            "Buffering congela el reloj de letras de inmediato"
+        );
+    }
+
+    #[test]
     fn karaoke_clock_rebases_on_every_sample_not_only_when_position_advances() {
         let (tx, _rx) = unbounded_channel::<BackendCommand>();
         let mut app = App::new(tx);
@@ -2781,6 +2807,15 @@ mod tests {
         };
         app.related.tracks = vec![rec_track("a"), rec_track("b"), rec_track("c")];
 
+        // Visual ACTIVO en todos los tamaños: features + envolvente frescos
+        // para que el osciloscopio (trazo + franja de barras) se dibuje de
+        // verdad, no solo la escena dormida.
+        app.features = Some(Arc::new(crate::analysis::AudioFeatures::silent(
+            Duration::ZERO,
+        )));
+        app.waveform = Some(Arc::new(WaveformEnvelope::from_window(&[0.15; 2048])));
+        app.features_at = Some(std::time::Instant::now());
+
         for (w, h) in [(120, 40), (100, 30), (80, 24), (70, 20), (60, 15)] {
             let backend = TestBackend::new(w, h);
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -2798,7 +2833,6 @@ mod tests {
                 .draw(|f| app.render(f))
                 .unwrap_or_else(|_| panic!("ayuda a {w}x{h}"));
             app.show_help = false;
-            app.help_scroll = 0;
 
             // La vista Now Playing conserva su sección de recomendaciones en
             // cualquier perfil (recs >= 3 con título de bloque).
