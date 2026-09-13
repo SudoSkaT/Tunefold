@@ -12,8 +12,20 @@
 //!   transcurrido desde ella, pero jamás más allá de [`MAX_EXTRAPOLATION`]),
 //!   congelada en pausa/stall y cuando el ancla quedó demasiado vieja
 //!   (p. ej. la UI saturada no recibió una muestra): no se inventa tiempo;
-//! - **re-anclada en CADA muestra**, incluso si la posición no avanzó: así no
-//!   acumula el tiempo de una pausa larga;
+//! - **re-anclada en CADA muestra avance** (posición mayor que la anterior),
+//!   aunque el avance sea pequeño: así no acumula el tiempo de una pausa larga;
+//!   una muestra con la MISMA posición NO re-ancla (el ticker/flap de estado
+//!   intermedio no debe reiniciar la extrapolación y producir retrocesos), salvo
+//!   cuando el ancla quedó fría (> [`MAX_EXTRAPOLATION`]) — reanudar tras un
+//!   stall largo debe volver a arrancar la rampa;
+//! - **continua (monótona en reproducción)**: el horizonte de extrapolación
+//!   supera la cadencia de muestreo del motor ([`MAX_EXTRAPOLATION`]), de modo
+//!   que durante la reproducción normal el ancla nunca se enfría entre muestras
+//!   y la lectura crece sin el "diente de sierra" (sube a cada muestra y se cae
+//!   a media rampa) que hacía saltar la línea activa del karaoke. Como última
+//!   red, además, toda lectura en reproducción se sujeta a la última entregada
+//!   (piso de continuidad), que se descarta cuando la reproducción realmente
+//!   retrocede o cambia de track;
 //! - **con seek pendiente**: mientras el motor no confirma el salto, sigue el
 //!   reloj REAL del audio (que sigue sonando desde donde estaba) y solo al
 //!   confirmarse adopta el objetivo.
@@ -22,6 +34,7 @@
 //! lógica fue extraída VERBATIM del reloj del karaoke de `ui/app.rs`; los
 //! tests originales cubren ahora este módulo directamente.
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Retroceso máximo tolerable sin considerarlo real: un pequeño blip espurio
@@ -33,14 +46,26 @@ const SPURIOUS_BLIP: Duration = Duration::from_millis(500);
 /// evento dedicado llegó a destiempo. Se re-ancla a lo reportado y se avisa con
 /// [`ClockEvent::Restarted`]: la letra sigue siendo válida, solo se rebobina.
 const RESTART_THRESHOLD: Duration = Duration::from_secs(10);
-/// Horizonte máximo de extrapolación. El motor reporta cada ~500 ms; el límite
-/// se fija POR DEBAJO de esa cadencia para que la lectura nunca se ponga por
-/// delante de donde PUEDE estar la siguiente muestra: un ticker perdido o un
-/// corte aún no reportado congelan la lectura en vez de adelantarla, y el
-/// rebote "se adelanta y vuelve" de las letras desaparece. Con el reenvío
-/// inmediato de estados en el backend (`Buffering`/`Paused`/`Stopped`), el
-/// hueco de stall queda cerrado casi a cero.
-const MAX_EXTRAPOLATION: Duration = Duration::from_millis(400);
+/// Horizonte máximo de extrapolación.
+///
+/// El motor reporta cada ~500 ms (ticker del backend). El límite debe quedar
+/// POR ENCIMA de esa cadencia (650 ms = 500 + ~30% de holgura): si fuera menor,
+/// en cada intervalo el ancla se enfriaría ANTES de la siguiente muestra y, al
+/// expirar antes de que llegara el reporte nuevo, la lectura se caería por
+/// ~un intervalo y volvería a subir en el frame siguiente — un diente de
+/// sierra que, sobre un LRC denso (líneas a decenas de ms), hacía que la
+/// línea activa saltara entre líneas (retroceso o doble avance en un frame).
+///
+/// Con el ancla siempre "caliente" durante la reproducción continua, la
+/// lectura crece monótona y el karaoke cruza cada límite de línea una sola
+/// vez, en cascada suave. El papel de freno que tenía el horizonte corto
+/// (no adelantarse a un audio congelado) lo cumplen ahora los estados REALES
+/// que el backend reenvía de inmediato (`Buffering`/`Paused`/`Stopped`/`Error`,
+/// ver `forwards_real_state`) y la bandera `stalled` del tick: un corte
+/// congelado llega a la UI como un cambio de estado que apaga la extrapolación
+/// al instante. El horizonte queda solo como límite de último recurso si todo
+/// eso fallara (casi inalcanzable en la práctica).
+const MAX_EXTRAPOLATION: Duration = Duration::from_millis(650);
 
 /// Seek solicitado aún no confirmado por el motor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +109,12 @@ pub struct PositionClock {
     position: Duration,
     seek: Option<PendingSeek>,
     synced_at: Option<Instant>,
+    /// Piso de continuidad de las lecturas en reproducción: la última lectura
+    /// extrapolada entregada. Impide que una muestra plana o un evento de
+    /// estado intermedio hagan "caer" la lectura unos milisegundos (salto
+    /// extraño de las letras cerca de los límites). Se descarta cuando la
+    /// reproducción retrocede de verdad (seek, restart, drift, track nuevo).
+    last_playing_read: Mutex<Option<Duration>>,
 }
 
 impl PositionClock {
@@ -117,6 +148,7 @@ impl PositionClock {
             self.position = reported;
             self.synced_at = Some(now);
             self.seek = None;
+            *self.last_playing_read.lock().unwrap() = None;
             return Some(ClockEvent::NewTrack);
         }
 
@@ -131,6 +163,7 @@ impl PositionClock {
                 self.position = seek.target;
                 self.synced_at = Some(now);
                 self.seek = None;
+                *self.last_playing_read.lock().unwrap() = None;
             } else {
                 self.position = reported;
                 self.synced_at = Some(now);
@@ -141,16 +174,26 @@ impl PositionClock {
         // Misma canción: clasificar la dirección de la muestra frente a lo
         // que ya reportamos (la muestra del motor es la fuente de verdad; el
         // reloj no debe inventar ni ignorar retrocesos reales).
-        let event = if reported >= self.position {
-            // Adelanto o igual: el motor avanza y el reloj lo adopta como nueva
-            // base. El re-anclaje en cada muestra (aunque la posición no
-            // avance por pausa/stall) evita acumular el tiempo de una pausa
-            // larga en la extrapolación.
+        let old_position = self.position;
+        let (event, refresh_anchor) = if reported >= old_position {
+            // Adelanto (o igual): el motor avanza y el reloj adopta lo
+            // reportado como base. El ancla SOLO se refresca cuando la
+            // posición AVANZA o cuando quedó fría (> MAX_EXTRAPOLATION): una
+            // muestra plana a mitad de intervalo no debe reiniciar la rampa y
+            // provocar un micro-retroceso entre muestras (eso lo mantiene
+            // suave además el piso de continuidad de [`Self::snapshot`]); pero
+            // al REANUDAR tras una pausa/stall largo, el ancla frío debe
+            // refrescarse para que la extrapolación arranque de nuevo — si no,
+            // la letra se quedaría clavada en la última posición hasta que
+            // llegara un avance nuevo.
             self.position = reported;
-            None
+            let cold = self
+                .synced_at
+                .is_none_or(|t| now.saturating_duration_since(t) > MAX_EXTRAPOLATION);
+            (None, reported > old_position || cold)
         } else {
             // Retroceso respecto a lo reportado.
-            let delta = self.position - reported;
+            let delta = old_position - reported;
             if delta > RESTART_THRESHOLD {
                 // Discontinuidad: el mismo track volvió a un punto anterior
                 // muy lejano (o a ~0). En vez de congelarnos en una posición
@@ -158,19 +201,24 @@ impl PositionClock {
                 // rigidez), re-anclamos a lo que el motor dice y rebobinamos
                 // la ventana de letras con la reproducción.
                 self.position = reported;
-                Some(ClockEvent::Restarted)
+                *self.last_playing_read.lock().unwrap() = None;
+                (Some(ClockEvent::Restarted), true)
             } else if delta > SPURIOUS_BLIP {
                 // Drift moderado hacia atrás (re-anclaje suave, sin salto
-                // visual: entre 0.5s y 10s).
+                // visual: entre 0.5s y 10s). El piso se descarta: el motor es
+                // la verdad y retrocede de verdad.
                 self.position = reported;
-                None
+                *self.last_playing_read.lock().unwrap() = None;
+                (None, true)
             } else {
                 // Blip espurio (re-buffer que reinicia transitoriamente su
                 // contador): se ignora; no se toca la posición.
-                None
+                (None, false)
             }
         };
-        self.synced_at = Some(now);
+        if refresh_anchor {
+            self.synced_at = Some(now);
+        }
         event
     }
 
@@ -195,6 +243,7 @@ impl PositionClock {
         if let Some(seek) = self.seek.take() {
             self.position = seek.target;
             self.synced_at = Some(now);
+            *self.last_playing_read.lock().unwrap() = None;
         }
     }
 
@@ -209,6 +258,7 @@ impl PositionClock {
         self.position = Duration::ZERO;
         self.synced_at = None;
         self.seek = None;
+        *self.last_playing_read.lock().unwrap() = None;
     }
 
     /// Apaga el reloj por completo (cambio de canción pedido por el usuario:
@@ -230,6 +280,7 @@ impl PositionClock {
         self.synced_at = Some(now);
         self.seek = None;
         self.track_key = Some(key.to_string());
+        *self.last_playing_read.lock().unwrap() = None;
         ClockEvent::NewTrack
     }
 
@@ -241,6 +292,15 @@ impl PositionClock {
     /// audio. En pausa/stall queda congelada. Nunca supera `duration` si esta
     /// es conocida: la letra no debe "terminar" antes de tiempo porque el motor
     /// dejara de reportar.
+    ///
+    /// En reproducción ACTIVA (extrapolando) la lectura es MONÓTONA (piso de
+    /// continuidad): nunca entrega menos que la anterior. Es la defensa contra
+    /// los micro-retrocesos de la extrapolación entre muestras (una muestra
+    /// plana o un evento de estado intermedio re-ancla la base sin mover la
+    /// posición; sin el piso, la letra "saltaría hacia atrás" un instante). El
+    /// piso solo vive mientras la extrapolación está SANO: en pausa/stall o
+    /// con el ancla fría se entrega la posición exacta (y se descarta el piso),
+    /// para no sostener un valor que la verdad del motor ya no respalda.
     pub fn snapshot(
         &self,
         playing: bool,
@@ -259,9 +319,20 @@ impl PositionClock {
         } else {
             self.position
         };
-        match duration {
+        let value = match duration {
             Some(total) if !total.is_zero() && value > total => total,
             _ => value,
+        };
+        let mut floor = self.last_playing_read.lock().unwrap();
+        if extrapolate {
+            let out = value.max(floor.unwrap_or(Duration::ZERO));
+            *floor = Some(out);
+            out
+        } else {
+            // Extrapolación no respaldada (pausa, stall o ancla fría): el piso
+            // expira junto con la confianza en la rampa.
+            *floor = None;
+            value
         }
     }
 
@@ -703,5 +774,167 @@ mod tests {
             Duration::from_secs(180),
             "tras el error la UI congela el reloj, no lo extrapola"
         );
+    }
+
+    #[test]
+    fn extrapolation_never_reverts_within_normal_sample_cadence() {
+        // El horizonte de extrapolación debe superar la cadencia del motor
+        // (ticker de 500 ms). Si fuera menor, a mitad de intervalo el ancla se
+        // enfriaría y la lectura se CAERÍA de vuelta a la posición confirmada
+        // (diente de sierra): sobre un LRC denso eso hacía saltar la línea
+        // activa entre líneas. Dentro de la cadencia la lectura crece estricta
+        // y monotonamente, sin retroceder jamás.
+        let mut c = PositionClock::new();
+        let t0 = Instant::now();
+        c.update(Some("a"), Duration::from_secs(45), t0);
+        assert!(MAX_EXTRAPOLATION > Duration::from_millis(500));
+
+        let mut prev = Duration::from_secs(45);
+        let mut readings = Vec::new();
+        for ms in (50..=480).step_by(30) {
+            let read = c.snapshot(
+                true,
+                false,
+                Some(Duration::from_secs(200)),
+                t0 + Duration::from_millis(ms),
+            );
+            assert!(
+                read >= prev,
+                "la lectura nunca cae dentro de la cadencia ({ms} ms): {read:?} < {prev:?}"
+            );
+            assert!(
+                read <= Duration::from_millis(45_000 + ms),
+                "no se adelanta más que el tiempo real ({ms} ms): {read:?}"
+            );
+            prev = read;
+            readings.push(ms);
+        }
+        assert!(
+            !readings.is_empty() && prev > Duration::from_secs(45),
+            "extrapoló a lo largo de toda la cadencia"
+        );
+    }
+    #[test]
+    fn equal_position_samples_do_not_reanchor_the_extrapolation() {
+        // Una muestra con la MISMA posición (p. ej. el ticker reenviando el
+        // estado, o un flap Buffering/Playing) a mitad de intervalo no debe
+        // reiniciar la extrapolación: si re-anclara y reiniciara la rampa,
+        // la lectura se caería a la posición exacta y volvería a subir — el
+        // "salto extraño" de las letras entre muestras.
+        let mut c = PositionClock::new();
+        let t0 = Instant::now();
+        c.update(Some("a"), Duration::from_secs(42), t0);
+        let read1 = c.snapshot(
+            true,
+            false,
+            Some(Duration::from_secs(200)),
+            t0 + Duration::from_millis(300),
+        );
+        assert_eq!(read1, Duration::from_millis(42_300));
+
+        // Muestra plana llegada a mitad del intervalo...
+        c.update(
+            Some("a"),
+            Duration::from_secs(42),
+            t0 + Duration::from_millis(300),
+        );
+        // ...la extrapolación CONTINÚA desde el ancla original (400 ms tras la
+        // muestra, no "cae" a 42 + 100 ms).
+        let read2 = c.snapshot(
+            true,
+            false,
+            Some(Duration::from_secs(200)),
+            t0 + Duration::from_millis(400),
+        );
+        assert_eq!(
+            read2,
+            Duration::from_millis(42_400),
+            "una muestra plana no reinicia la rampa de extrapolación"
+        );
+    }
+
+    #[test]
+    fn playing_reads_never_step_backwards_across_flat_intermediate_events() {
+        // Incluso si un evento intermedio consigue tocar el ancla sin mover la
+        // posición, la lectura entregada es MONÓTONA (piso de continuidad): un
+        // flap de estado no puede hacer "saltar hacia atrás" la letra aunque el
+        // valor subyacente caiga.
+        let mut c = PositionClock::new();
+        let t0 = Instant::now();
+        c.update(Some("a"), Duration::from_secs(42), t0);
+        let r1 = c.snapshot(
+            true,
+            false,
+            Some(Duration::from_secs(200)),
+            t0 + Duration::from_millis(300),
+        );
+        assert!(r1 > Duration::from_secs(42));
+
+        // El backend re-ancla con la misma posición 250 ms después (peor caso:
+        // el valor subyacente cae de 42.30 a 42.05).
+        c.force_anchor(t0 + Duration::from_millis(300));
+        let r2 = c.snapshot(
+            true,
+            false,
+            Some(Duration::from_secs(200)),
+            t0 + Duration::from_millis(350),
+        );
+        assert!(r2 >= r1, "la lectura nunca retrocede: {r1:?} → {r2:?}");
+        assert_eq!(
+            r2,
+            Duration::from_millis(42_300),
+            "el piso sostiene la rampa"
+        );
+
+        // Y cuando el valor subyacente vuelve a superar el piso, sigue subiendo.
+        let r3 = c.snapshot(
+            true,
+            false,
+            Some(Duration::from_secs(200)),
+            t0 + Duration::from_millis(700),
+        );
+        assert!(r3 > r2, "la rampa se reanuda al superar el piso: {r3:?}");
+    }
+
+    #[test]
+    fn continuity_floor_drops_on_real_backward_moves() {
+        let mut c = PositionClock::new();
+        let t0 = Instant::now();
+        c.update(Some("a"), Duration::from_secs(120), t0);
+        let read = c.snapshot(
+            true,
+            false,
+            Some(Duration::from_secs(300)),
+            t0 + Duration::from_millis(300),
+        );
+        assert!(read > Duration::from_secs(120));
+
+        // Un seek real hacia atrás DESCARTÓ el piso: la lectura vuelve a servir
+        // la posición verdadera (baja) sin quedarse pegada al valor extrapolado.
+        c.begin_seek(Duration::from_secs(50));
+        c.confirm_seek(t0);
+        let after = c.snapshot(
+            true,
+            false,
+            Some(Duration::from_secs(300)),
+            t0 + Duration::from_millis(50),
+        );
+        assert_eq!(
+            after,
+            Duration::from_millis(50_050),
+            "piso descartado al buscar atrás"
+        );
+
+        // Replay del mismo track: parte de cero sin piso heredado y, al no
+        // haber ancla aún, sirve la posición exacta (0) — nunca un valor
+        // extrapolado de la canción anterior.
+        c.restart_same_track();
+        let replay = c.snapshot(
+            true,
+            false,
+            Some(Duration::from_secs(300)),
+            t0 + Duration::from_millis(100),
+        );
+        assert_eq!(replay, Duration::ZERO, "replay desde 0 sin piso ni ancla");
     }
 }

@@ -4,11 +4,14 @@
 //! HTTP, sin providers, sin relojes. Todo lo que pinta está en el estado que
 //! recibe. La escena es la envolvente min/max del PCM (`WaveformView`)
 //! decimada al ancho del área: por cada columna se vuelcan los buckets que le
-//! tocan y se pinta una LÍNEA delgada que sigue la señal (`(min+max)/2`), con
-//! medios bloques (▀/▄) para resolución sub-celda y un resplandor suave de
-//! fondo a su alrededor — un trazado fino y limpio, en vez de una banda
-//! vertical rellena entre min y max. Toda la colorimetría sale de
-//! [`VisualPalette`] — nunca se deriva aquí.
+//! tocan y se pinta UNA LÍNEA que sigue la señal (`(min+max)/2`), con glifos
+//! de CUADRANTES (rejilla 2×2 por celda: ▘▝▖▗▀▄▌▐▞▚▛▜▙▟█) — resolución
+//! sub-celda en horizontal Y vertical, casi 4× la de un medio bloque — y un
+//! resplandor suave de fondo a su alrededor. El trazo se lee como una curva
+//! continua, sin "bloques": cada celda pinta una confluencia de cuadrantes
+//! que modela la diagonal real de la señal. Las barras EQ son el espectro
+//! discreto bajo el trazo. Toda la colorimetría sale de [`VisualPalette`] —
+//! nunca se deriva aquí.
 
 use ratatui::layout::{Margin, Position, Rect};
 use ratatui::style::{Color, Style};
@@ -21,13 +24,19 @@ use crate::visualization::engine::VisualState;
 use crate::visualization::palette::VisualPalette;
 use crate::visualization::VISUAL_BARS;
 
-/// Escalera de una fila de barras (0 = vacío, 7 = lleno).
+/// Escalera de una fila de barras de espectro (0 = vacío, 8 = lleno).
+/// Fila de 1 celda: niveles 0..=7 sobre la versión corta ([`RAMP`]).
 const RAMP: [&str; 8] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇"];
+
+/// Escalera completa de una fila (incluye el bloque lleno): para barras de
+/// 2 filas, cada fila cubre 0..=8 y la columna total 0..=16 niveles.
+const RAMP_TALL: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
 /// Radio (en filas) del resplandor que acompaña a la línea del osciloscopio:
 /// la celda de la línea se tiñe al máximo y el halo decae linealmente hasta
-/// cero a esta distancia. Fino, pero vivo: no rellena la banda vertical.
-const GLOW_RADIUS: f32 = 1.5;
+/// cero a esta distancia. Ceñido (menos de una fila): el trazado se lee fino y
+/// limpio, sin "engordar" la señal con un brillo difuso ancho.
+const GLOW_RADIUS: f32 = 0.75;
 
 fn to_color(c: [u8; 3]) -> Color {
     Color::Rgb(c[0], c[1], c[2])
@@ -197,33 +206,62 @@ pub fn render(frame: &mut Frame, area: Rect, state: &VisualState, position_secs:
         return;
     }
 
-    // Franja de barras: SOLO la fila inferior del área interior (espectro
-    // discreto bajo el trazo del osciloscopio; el resto es todo forma de onda).
-    let bars_h = 1usize.min(inner.height as usize);
+    // Franja de barras: las DOS filas inferiores del área interior (espectro
+    // discreto bajo el trazo del osciloscopio). Dos filas dan escala y
+    // presencia al EQ; en áreas diminutas se cae a una sola fila.
+    let bars_h = if inner.height >= 5 { 2u16 } else { 1u16 };
     let trace_area = Rect::new(
         inner.x,
         inner.y,
         inner.width,
-        inner.height.saturating_sub(bars_h as u16),
+        inner.height.saturating_sub(bars_h),
     );
-    let bars_area = Rect::new(
-        inner.x,
-        inner.y + trace_area.height,
-        inner.width,
-        bars_h as u16,
-    );
+    let bars_area = Rect::new(inner.x, inner.y + trace_area.height, inner.width, bars_h);
 
     render_backdrop(frame, trace_area, state, false);
     render_trace(frame, trace_area, state);
     render_bars(frame, bars_area, state);
 }
 
-/// Pinta la curva del osciloscopio: UNA célula por columna, siguiendo la señal
-/// (`(min+max)/2` de la columna) con medios bloques ▀/▄ según la mitad de la
-/// celda donde caiga el trazo — resolución sub-celda, línea fina y limpia.
+/// Mapa máscara de cuadrantes → glifo de bloque. Cada celda se divide en una
+/// rejilla 2×2 (bits: `1`=superior-izquierdo, `2`=superior-derecho, `4`=
+/// inferior-izquierdo, `8`=inferior-derecho) y el terminal pinta SOLO los
+/// cuadrantes encendidos: resolución sub-celda en las dos direcciones. Al
+/// interpolar los bordes de cada celda entre columnas vecinas, una diagonal
+/// se codifica con las confluencias correctas (▞▚▛▜▙▟) y el trazo se lee como
+/// una curva continua en vez de una escalera de medio bloque.
+const TRACE_QUADS: [&str; 16] = [
+    " ", // 0b0000
+    "▘", // 0b0001 TL
+    "▝", // 0b0010 TR
+    "▀", // 0b0011 TL|TR
+    "▖", // 0b0100 BL
+    "▌", // 0b0101 TL|BL
+    "▞", // 0b0110 TR|BL
+    "▛", // 0b0111 TL|TR|BL
+    "▗", // 0b1000 BR
+    "▚", // 0b1001 TL|BR
+    "▐", // 0b1010 TR|BR
+    "▜", // 0b1011 TL|TR|BR
+    "▄", // 0b1100 BL|BR
+    "▙", // 0b1101 TL|BL|BR
+    "▟", // 0b1110 TR|BL|BR
+    "█", // 0b1111
+];
+
+/// Pinta la curva del osciloscopio: UNA célula por columna, siguiendo la
+/// señal (`(min+max)/2` de la columna) con una rejilla de CUADRANTES 2×2 —
+/// resolución sub-celda en HORIZONTAL y VERTICAL frente a un medio bloque
+/// simple. Se pintan los cuadrantes INMEDIATAMENTE por encima de la curva
+/// (foreground arriba, fondo abajo): en cada celda, los alturas locales
+/// izquierda/derecha (interpoladas entre columnas vecinas) encienden cada
+/// sub-celda cuando la curva las rebasa, y el glifo resultante (▘▝▖▗▀▄▌▐▞▚▛▜▙▟█)
+/// modela la diagonal REAL de la señal: la línea se desliza en pasos de cuarto
+/// de celda, sin escalones toscos ni banda rellena.
 ///
 /// No toca el fondo: el resplandor de [`render_backdrop`] queda vivo detrás y
-/// el área fuera de la línea conserva su ambiental, sin "rellenar" la banda.
+/// el área fuera de la línea conserva su ambiental. Por mínimo que sea el
+/// cruce, siempre queda un cuadrante (▘) — la línea nunca hace huecos.
 fn render_trace(frame: &mut Frame, area: Rect, state: &VisualState) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -236,20 +274,57 @@ fn render_trace(frame: &mut Frame, area: Rect, state: &VisualState) {
 
     let center = h as f32 * 0.5;
     let scale = (center * 0.92).max(1.0) * scene.waveform.gain;
-    let last_row = (h - 1) as f32;
+    let top = (h as f32 - 1.0) + 0.5;
+    let row_last = (h - 1) as u16;
 
+    // Curva en unidades de SUB-FILA (2 por fila) y amplitudes para el color.
+    let mut sub = Vec::with_capacity(w);
+    let mut amps = Vec::with_capacity(w);
     for col in 0..w {
         let (mn, mx) = column_span(&scene.waveform, w, col);
         let mid = (mn + mx) * 0.5;
         let amplitude = mn.abs().max(mx.abs()) * scene.waveform.gain;
-        let y_f = (center - mid.clamp(-1.0, 1.0) * scale).clamp(0.0, last_row);
-        // Mitad de la celda: arriba → ▀ (bloque superior), abajo → ▄ (inferior).
-        // Al desplazarse el trazo por dentro de la fila, el glifo pasa de ▀ a ▄
-        // en el punto medio, dando el aspecto de línea continua de medio bloque.
-        let row = y_f as u16;
-        let frac = y_f - y_f.floor();
-        let glyph = if frac < 0.5 { "▀" } else { "▄" };
-        let mut color = trace_rgb(amplitude, palette);
+        let y_f = (center - mid.clamp(-1.0, 1.0) * scale).clamp(0.0, top) * 2.0;
+        sub.push(y_f);
+        amps.push(amplitude);
+    }
+
+    for col in 0..w {
+        // Bordes de la celda: punto medio entre columnas vecinas; en los
+        // extremos se usa la propia curva (la señal no tiene vecino conocido).
+        let y_l = if col > 0 {
+            (sub[col - 1] + sub[col]) * 0.5
+        } else {
+            sub[col]
+        };
+        let y_r = if col + 1 < w {
+            (sub[col] + sub[col + 1]) * 0.5
+        } else {
+            sub[col]
+        };
+        // Celda donde vive la curva: promedio de bordes en filas.
+        let row = (((y_l + y_r) * 0.25) as u16).min(row_last);
+        let base = row as f32 * 2.0;
+        let hl = (y_l - base).clamp(0.0, 2.0);
+        let hr = (y_r - base).clamp(0.0, 2.0);
+        let mut mask = 0u8;
+        if hl > 0.5 {
+            mask |= 0b0001;
+        }
+        if hl > 1.5 {
+            mask |= 0b0100;
+        }
+        if hr > 0.5 {
+            mask |= 0b0010;
+        }
+        if hr > 1.5 {
+            mask |= 0b1000;
+        }
+        if mask == 0 {
+            mask = 0b0001; // cruce mínimo: sliver ▘, la línea no hace huecos
+        }
+        let glyph = TRACE_QUADS[mask as usize];
+        let mut color = trace_rgb(amps[col], palette);
         if brightness > 0.0 {
             color = mix_c(color, [255, 255, 255], brightness * 0.12);
         }
@@ -264,7 +339,12 @@ fn render_trace(frame: &mut Frame, area: Rect, state: &VisualState) {
     }
 }
 
-/// Dibuja la franja de barras (una fila: cada barra es un paso de la rampa).
+/// Dibuja la franja de barras del espectro (`rect` de 1 o 2 filas).
+///
+/// Cada columna es una barra con niveles discretos: con 2 filas, la fila
+/// inferior se llena primero (▁..█) y la superior sube cuando la barra la
+/// rebasa (0..=16 niveles) — crecimiento desde la base, clásico de un EQ. Sin
+/// señal la columna queda en el plano de fondo con una guía tenue.
 fn render_bars(frame: &mut Frame, rect: Rect, state: &VisualState) {
     if rect.width == 0 || rect.height == 0 {
         return;
@@ -275,20 +355,36 @@ fn render_bars(frame: &mut Frame, rect: Rect, state: &VisualState) {
         Color::DarkGray
     };
     let bg = state.scene.palette.background;
+    let rows = rect.height;
+    let bottom = rect.y + rect.height - 1;
 
-    let r = rect.y;
     for col in rect.x..rect.x + rect.width {
         let idx =
             ((col - rect.x) as usize * VISUAL_BARS / rect.width as usize).min(VISUAL_BARS - 1);
         let v = (state.bars[idx] + state.pulse * 0.06).clamp(0.0, 1.0);
-        let step = (v * (RAMP.len() - 1) as f32).round() as usize;
-        if let Some(cell) = frame.buffer_mut().cell_mut(Position { x: col, y: r }) {
-            cell.set_symbol(RAMP[step]);
-            cell.set_style(
-                Style::new()
-                    .fg(if step > 0 { color } else { Color::DarkGray })
-                    .bg(to_color(bg)),
-            );
+        // Niveles por columna: 16 con dos filas (8 por fila), 8 con una.
+        let steps = (v * (8 * rows) as f32).round() as usize;
+        for off in 0..rows {
+            let row = bottom - off;
+            let level = if off == 0 {
+                // Fila inferior (base): se llena primero.
+                steps.min(8)
+            } else {
+                steps.saturating_sub(8)
+            };
+            let glyph = if rows == 1 {
+                RAMP[level.min(RAMP.len() - 1)]
+            } else {
+                RAMP_TALL[level]
+            };
+            if let Some(cell) = frame.buffer_mut().cell_mut(Position { x: col, y: row }) {
+                cell.set_symbol(glyph);
+                cell.set_style(
+                    Style::new()
+                        .fg(if level > 0 { color } else { Color::DarkGray })
+                        .bg(to_color(bg)),
+                );
+            }
         }
     }
 }
@@ -490,6 +586,27 @@ mod tests {
         assert!(lit_high > lit_low, "más energía ⇒ más tinte de trazo");
     }
 
+    /// Glifos de cuadrante del trazo (1 por columna, al menos un cuadrante).
+    fn is_trace_glyph(s: &str) -> bool {
+        matches!(
+            s,
+            "▘" | "▝"
+                | "▀"
+                | "▖"
+                | "▌"
+                | "▞"
+                | "▛"
+                | "▗"
+                | "▚"
+                | "▐"
+                | "▜"
+                | "▄"
+                | "▙"
+                | "▟"
+                | "█"
+        )
+    }
+
     #[test]
     fn louder_waveform_trace_sweeps_farther_from_center() {
         // Mismo estado, solo cambia la amplitud de la envolvente: la línea del
@@ -498,16 +615,16 @@ mod tests {
         // espesor fijo).
         let sweep = |st: VisualState| {
             let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
-            // Traza: interior 40x8 → x 1..=38, y 1..=5 (sin la fila de barras).
+            // Traza: interior 40x8 → x 1..=38, y 1..=4 (barras ocupan 2 filas).
             let mut offsets = Vec::new();
-            for y in 1..6u16 {
+            for y in 1..5u16 {
                 for x in 1..39u16 {
-                    if matches!(buf.cell((x, y)).unwrap().symbol(), "▀" | "▄") {
+                    if is_trace_glyph(buf.cell((x, y)).unwrap().symbol()) {
                         offsets.push((y as f32 - 3.0).abs());
                     }
                 }
             }
-            offsets.iter().sum::<f32>() / offsets.len() as f32
+            offsets.iter().cloned().fold(f32::MIN, f32::max)
         };
         let mut loud = active_state(0.9, VisualPalette::fallback());
         loud.scene.waveform = oscillating_view(0.9, 1);
@@ -522,25 +639,51 @@ mod tests {
     #[test]
     fn thin_line_draws_one_glyph_per_trace_column() {
         // El osciloscopio es fino: exactamente UNA celda por columna de traza,
-        // con medio bloque (▀/▄), en vez de una banda vertical rellena.
+        // con un glifo de cuadrantes 2×2 (resolución sub-celda en fila y
+        // columna), en vez de una banda vertical rellena. La línea se lee
+        // como una curva continua.
         let st = active_state(0.9, VisualPalette::fallback());
         let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
-        let mut counts = Vec::new();
-        for x in 1..39u16 {
-            let n = (1..6u16)
-                .filter(|&y| matches!(buf.cell((x, y)).unwrap().symbol(), "▀" | "▄"))
-                .count();
-            counts.push(n);
-        }
+        let counts: Vec<usize> = (1..39u16)
+            .map(|x| {
+                (1..5u16)
+                    .filter(|&y| is_trace_glyph(buf.cell((x, y)).unwrap().symbol()))
+                    .count()
+            })
+            .collect();
         assert!(
             counts.iter().all(|&n| n == 1),
             "una línea, una celda por columna: {counts:?}"
         );
         assert!(
-            buf.content()
-                .iter()
-                .any(|c| matches!(c.symbol(), "▀" | "▄")),
-            "el trazo pinta glifos de medio bloque"
+            buf.content().iter().any(|c| is_trace_glyph(c.symbol())),
+            "el trazo pinta glifos de cuadrante"
+        );
+    }
+
+    #[test]
+    fn bars_grow_into_two_rows_when_room() {
+        // En un terminal con área interior de 6 filas, la franja del EQ ocupa
+        // las DOS filas inferiores: la base siempre tiene barra y las fuertes
+        // suben a la fila de arriba (crecimiento desde la base).
+        let st = active_state(1.0, VisualPalette::fallback());
+        let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
+        // Barras del EQ: columnas x 1..=38 sobre las filas y 5..=6.
+        let is_bar = |x: u16, y: u16| {
+            let c = buf.cell((x, y)).unwrap();
+            !c.symbol().trim().is_empty() && RAMP_TALL.contains(&c.symbol())
+        };
+        assert!(
+            (1..39u16).all(|x| is_bar(x, 6)),
+            "la fila base (inferior) del EQ tiene barra en cada columna"
+        );
+        assert!(
+            (1..39u16).any(|x| is_bar(x, 5)),
+            "las barras fuertes crecen a la fila superior"
+        );
+        assert!(
+            (1..39u16).any(|x| !is_bar(x, 5)),
+            "no toda columna llega arriba: la escalera es gradual"
         );
     }
 
