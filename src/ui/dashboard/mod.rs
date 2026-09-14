@@ -55,10 +55,12 @@ pub fn render(
         .as_ref()
         .and_then(|t| thumbnails.get(&t.identifier()));
     song_card::render(frame, chunks[0], playback.track.as_ref(), state, frame_anim);
-    // La banda del visual es COMPOSICIÓN completa (osciloscopio + barras);
-    // la paleta de la portada ya la fundió el motor en `visual.scene.palette`.
-    // Con el análisis inactivo el renderer pinta la banda apagada.
-    visualizer::render(frame, chunks[1], visual, playback.position.as_secs_f32());
+    // La banda del visual en Now Playing es SOLO barras del espectro,
+    // ampliadas a toda la banda (el osciloscopio de puntos vive solo en la
+    // vista Related / Shift+2). La paleta de la portada ya la fundió el motor
+    // en `visual.scene.palette`. Con el análisis inactivo el renderer pinta la
+    // banda apagada.
+    visualizer::render_bars_only(frame, chunks[1], visual);
     progress_bar::render(frame, chunks[2], playback, frame_anim);
 
     let queue_txt = format!(

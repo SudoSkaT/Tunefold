@@ -144,11 +144,16 @@ fn paint_point(frame: &mut Frame, x: u16, y: u16, symbol: &str, color: [u8; 3]) 
 
 /// Pinta la capa ambiental (osciloscopio ESTÉREO) sobre TODO `area`.
 ///
-/// Solo toca el fondo de cada celda (spec: la capa ambiental debe poder vivir
-/// detrás de las letras). Tiñe un RESPLANDOR suave alrededor de las DOS curvas
-/// (L y R, una por canal; decae a [`GLOW_RADIUS`] filas): el trazado queda fino
-/// y el área, limpia. `subdued` aterriza la escena (reduce resplandor y
-/// energía) para que el texto superior siga siendo legible.
+/// Resetea cada celda del área (símbolo a `" "`) y tiñe el fondo con un
+/// RESPLANDOR suave alrededor de las DOS curvas (L y R, una por canal; decae
+/// a [`GLOW_RADIUS`] filas).
+///
+/// La capa ambiental es dueña de sus celdas: al resetear los símbolos elimina
+/// los fantasmas del frame anterior (barras `█`, puntos viejos, letras) que el
+/// buffer reutilizado de la TUI real conservaría — el trazo posterior solo
+/// pinta 2–4 celdas por columna y jamás limpiaría el resto. El karaoke pinta su
+/// texto DESPUÉS, preservando este fondo. `subdued` aterriza la escena (reduce
+/// resplandor y energía) para que el texto superior siga siendo legible.
 pub fn render_backdrop(frame: &mut Frame, area: Rect, state: &VisualState, subdued: bool) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -201,7 +206,11 @@ pub fn render_backdrop(frame: &mut Frame, area: Rect, state: &VisualState, subdu
                 color = mix_c(color, [255, 255, 255], brightness * 0.12);
             }
             // SAFETY(ninguna): API pública de ratatui; celdas dentro de `area`.
+            // Se resetea el símbolo: sin esto, el buffer reutilizado mostraría
+            // glifos del frame/vista anterior (bloques de barras, Gauge, letras)
+            // "encima" de los puntos del trazo.
             if let Some(cell) = frame.buffer_mut().cell_mut(Position { x, y }) {
+                cell.set_symbol(" ");
                 cell.set_bg(to_color(color));
             }
         }
@@ -338,12 +347,40 @@ fn render_trace_points(frame: &mut Frame, area: Rect, state: &VisualState, glyph
     }
 }
 
-/// Dibuja la franja de barras del espectro (`rect` de 1 o 2 filas).
+/// Banda del visual para Now Playing: SOLO barras del espectro, ampliadas a
+/// toda el área interior (el osciloscopio de puntos vive solo en Related).
 ///
-/// Cada columna es una barra con niveles discretos: con 2 filas, la fila
-/// inferior se llena primero (▁..█) y la superior sube cuando la barra la
-/// rebasa (0..=16 niveles) — crecimiento desde la base, clásico de un EQ. Sin
-/// señal la columna queda en el plano de fondo con una guía tenue.
+/// Composición autocontenida: marco + barras que usan TODAS las filas
+/// disponibles (cada fila aporta 8 subniveles desde la base, clásico de un
+/// EQ). Cada celda del interior se repinta entera (símbolo + fg + bg), así la
+/// banda nunca arrastra fantasmas del frame anterior.
+pub fn render_bars_only(frame: &mut Frame, area: Rect, state: &VisualState) {
+    let title_color = if state.active {
+        bar_color(state.intensity.max(0.15), &state.scene.palette)
+    } else {
+        Color::DarkGray
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" Ecualizador ", Style::new().fg(title_color)));
+    frame.render_widget(block, area);
+
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    render_bars(frame, inner, state);
+}
+
+/// Dibuja barras del espectro en `rect` (cualquier altura ≥ 1 fila).
+///
+/// Cada columna es una barra con niveles discretos que crece desde la base:
+/// cada fila aporta 8 subniveles (0..=8·filas en total). Con 1 fila usa la
+/// rampa corta; con 2 o más, la rampa alta (▁..█). Sin señal la columna queda
+/// en el plano de fondo con una guía tenue.
 fn render_bars(frame: &mut Frame, rect: Rect, state: &VisualState) {
     if rect.width == 0 || rect.height == 0 {
         return;
@@ -361,16 +398,14 @@ fn render_bars(frame: &mut Frame, rect: Rect, state: &VisualState) {
         let idx =
             ((col - rect.x) as usize * VISUAL_BARS / rect.width as usize).min(VISUAL_BARS - 1);
         let v = (state.bars[idx] + state.pulse * 0.06).clamp(0.0, 1.0);
-        // Niveles por columna: 16 con dos filas (8 por fila), 8 con una.
+        // Niveles por columna: 8 por fila (8 con una fila, 16 con dos, …).
         let steps = (v * (8 * rows) as f32).round() as usize;
         for off in 0..rows {
             let row = bottom - off;
-            let level = if off == 0 {
-                // Fila inferior (base): se llena primero.
-                steps.min(8)
-            } else {
-                steps.saturating_sub(8)
-            };
+            // Fila inferior (base) se llena primero; las superiores suben
+            // cuando la barra las rebasa. Idéntico al comportamiento previo
+            // para 1–2 filas; para N filas escala igual.
+            let level = steps.saturating_sub(usize::from(off) * 8).min(8);
             let glyph = if rows == 1 {
                 RAMP[level.min(RAMP.len() - 1)]
             } else {
@@ -873,6 +908,65 @@ mod tests {
     }
 
     #[test]
+    fn bars_only_expanded_fills_height_without_trace_points() {
+        // Modo Now Playing: solo barras, ampliadas a todo el interior, sin
+        // ningún punto `●` del osciloscopio.
+        let st = active_state(1.0, VisualPalette::fallback());
+        let buf = drawing(&|f| render_bars_only(f, f.area(), &st));
+        assert!(
+            buf.content().iter().all(|c| c.symbol() != "●"),
+            "ni un solo punto del osciloscopio en el modo barras"
+        );
+        // Con señal fuerte las barras llegan hasta la fila superior interior.
+        let is_bar = |x: u16, y: u16| {
+            let c = buf.cell((x, y)).unwrap();
+            !c.symbol().trim().is_empty() && RAMP_TALL.contains(&c.symbol())
+        };
+        assert!(
+            (1..39u16).all(|x| is_bar(x, 6)),
+            "la base del EQ tiene barra en cada columna"
+        );
+        assert!(
+            (1..39u16).any(|x| is_bar(x, 1)),
+            "las barras ampliadas alcanzan la fila superior"
+        );
+        assert!(
+            buf.content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+                .contains("Ecualizador"),
+            "la banda se titula como ecualizador"
+        );
+    }
+
+    #[test]
+    fn bars_levels_scale_with_available_rows() {
+        // Misma señal fuerte: a más filas interiores, más filas con barra
+        // (la escalera crece desde la base sin saltos ni pánicos).
+        let st = active_state(1.0, VisualPalette::fallback());
+        let lit_rows_at = |h: u16| {
+            let buf = drawing_size(40, h, &|f| render_bars_only(f, f.area(), &st));
+            let inner_h = h.saturating_sub(2);
+            (1..=inner_h)
+                .filter(|&y| {
+                    (1..39u16).any(|x| {
+                        let c = buf.cell((x, y)).unwrap();
+                        !c.symbol().trim().is_empty() && RAMP_TALL.contains(&c.symbol())
+                    })
+                })
+                .count()
+        };
+        let small = lit_rows_at(5);
+        let big = lit_rows_at(12);
+        assert!(small >= 1, "con poco alto hay barras visibles");
+        assert!(
+            big > small,
+            "más alto ⇒ más filas con barra ({small} → {big})"
+        );
+    }
+
+    #[test]
     fn subdued_dims_the_trace_for_legibility() {
         let palette = VisualPalette::fallback();
         let st = active_state(0.9, palette);
@@ -900,14 +994,43 @@ mod tests {
     }
 
     #[test]
-    fn backdrop_only_sets_background_not_symbols() {
+    fn backdrop_resets_symbols_and_sets_background() {
         let st = active_state(0.9, VisualPalette::fallback());
         let buf = drawing(&|f| render_backdrop(f, f.area(), &st, false));
-        // La capa ambiental no pinta glifos (solo fondo), así el texto superior
-        // (karaoke) puede superponerse limpiamente.
+        // La capa ambiental resetea los glifos a blanco (mata los fantasmas del
+        // frame anterior: bloques de barras, puntos viejos) y solo tiñe el
+        // fondo, así el texto superior (karaoke) o el trazo posterior parten
+        // de una capa limpia.
         assert!(
             buf.content().iter().all(|c| c.symbol() == " "),
-            "backdrop es fondo puro (celda en blanco, sin símbolos)"
+            "backdrop deja la capa en blanco (sin símbolos heredados)"
+        );
+    }
+
+    #[test]
+    fn backdrop_clears_stale_glyphs_from_previous_frames() {
+        // Simula el buffer reutilizado de la TUI real: celdas con bloques de
+        // un frame anterior (barras/Gauge). Tras el backdrop no debe quedar
+        // ningún bloque que luego "pisaría" los puntos del trazo.
+        let st = active_state(0.9, VisualPalette::fallback());
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                for y in 0..8u16 {
+                    for x in 0..40u16 {
+                        if let Some(cell) = f.buffer_mut().cell_mut(Position { x, y }) {
+                            cell.set_symbol("█");
+                        }
+                    }
+                }
+                render_backdrop(f, f.area(), &st, false);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        assert!(
+            buf.content().iter().all(|c| c.symbol() == " "),
+            "ni un solo bloque fantasma sobrevive al backdrop"
         );
     }
 

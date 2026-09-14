@@ -2808,8 +2808,8 @@ mod tests {
         app.related.tracks = vec![rec_track("a"), rec_track("b"), rec_track("c")];
 
         // Visual ACTIVO en todos los tamaños: features + envolvente frescos
-        // para que el osciloscopio (trazo + franja de barras) se dibuje de
-        // verdad, no solo la escena dormida.
+        // para que el visual se dibuje de verdad (barras en Now Playing,
+        // osciloscopio en Related), no solo la escena dormida.
         app.features = Some(Arc::new(crate::analysis::AudioFeatures::silent(
             Duration::ZERO,
         )));
