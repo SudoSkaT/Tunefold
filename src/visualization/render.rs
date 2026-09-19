@@ -3,21 +3,33 @@
 //!
 //! Responsabilidad EXCLUSIVA de renderizar (spec §25/§20): sin análisis, sin
 //! HTTP, sin providers, sin relojes. Todo lo que pinta está en el estado que
-//! recibe. La escena es la envolvente min/max del PCM POR CANAL (`WaveformView`)
-//! decimada al ancho del área: por cada columna se vuelcan los buckets que le
-//! tocan y se pintan PUNTOS en las filas del PICO (max) y del VALLE (min) de
-//! cada canal (spec §8). Cada canal tiene su propio color (`ChannelColors`,
-//! derivado de la portada) y su propio resplandor de fondo; todo el trazo se
-//! dibuja con puntos `●` (ASCII `*`), y cuando L y R comparten celda se pinta el
-//! tinte combinado de mezcla — ninguna de las dos curvas se pierde.
+//! recibe.
 //!
-//! El trazado es un plot de puntos (no una banda ni una línea interpolada):
-//! pico y valle de la TRUE forma de onda quedan visibles columna a columna. El
-//! camino caliente NO asigna memoria por draw (solo `[u16; 2]` en el stack por
-//! columna); los glifos salen del sistema central [`UiGlyphs`] (Unicode `●` /
-//! ASCII `*`). Un resplandor suave acompaña a cada curva de fondo. Las barras
-//! EQ son el espectro discreto bajo el trazo. Toda la colorimetría sale de
-//! [`VisualPalette`] — nunca se deriva aquí.
+//! El osciloscopio es un SCATTER de puntos discretos (referencia conceptual
+//! scope-tui `GraphType::Scatter`, nunca `GraphType::Line`) sobre UN plano
+//! compartido: L y R usan el mismo eje central (`amplitud == 0` en el medio
+//! del área) y las mismas coordenadas de tiempo, cada uno con sus propios
+//! puntos y colores. Las curvas se cruzan y superponen como en un osciloscopio
+//! estéreo real; donde coinciden en una celda se pinta el tinte de mezcla.
+//! Cada columna aporta hasta DOS candidatos por canal
+//! (valle y pico de su envolvente, que preservan extremos y transitorios);
+//! cada candidato se cuantiza a `(columna, fila)` y solo se emite si aporta
+//! novedad a su pista (espaciado en columnas si repite fila, emisión
+//! inmediata ante saltos). Así las regiones redundantes (silencio,
+//! constantes, mesetas) quedan como puntos espaciados en vez de una línea
+//! punteada continua, mientras que la forma real (senos, cuadradas,
+//! transitorios) conserva sus picos, valles y cruces por cero.
+//!
+//! Garantías del trazo: sin `draw_line` entre muestras, sin `fill_rect` del
+//! intervalo min..max, sin glifos de bloque (`█▁▂▃▄▅▆▇`) y sin celdas de fondo
+//! tintadas como bloques — solo puntos `•` (ASCII `*`), uno por celda como
+//! máximo, sobre un fondo plano de la paleta. El camino caliente NO asigna
+//! memoria por draw (estado de thinning en el stack); los glifos salen del
+//! sistema central [`UiGlyphs`]. Tras las letras el mismo scatter se pinta
+//! atenuado ([`render_trace_subdued`], colores fundidos hacia el techo de
+//! contraste). Las barras EQ viven en [`render_bars_only`] (vista Now
+//! Playing), NUNCA dentro del bloque del osciloscopio. Toda la colorimetría
+//! sale de [`VisualPalette`] — nunca se deriva aquí.
 
 use ratatui::layout::{Margin, Position, Rect};
 use ratatui::style::{Color, Style};
@@ -39,12 +51,6 @@ const RAMP: [&str; 8] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇"];
 /// 2 filas, cada fila cubre 0..=8 y la columna total 0..=16 niveles.
 const RAMP_TALL: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
-/// Radio (en filas) del resplandor que acompaña a cada curva del osciloscopio:
-/// la celda de la curva se tiñe al máximo y el halo decae linealmente hasta
-/// cero a esta distancia. Ceñido (menos de una fila): el trazado se lee fino y
-/// limpio, sin "engordar" la señal con un brillo difuso ancho.
-const GLOW_RADIUS: f32 = 0.75;
-
 fn to_color(c: [u8; 3]) -> Color {
     Color::Rgb(c[0], c[1], c[2])
 }
@@ -54,11 +60,6 @@ fn mix_c(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     let t = t.clamp(0.0, 1.0);
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     [l(a[0], b[0]), l(a[1], b[1]), l(a[2], b[2])]
-}
-
-/// Oscurece un color por `k`.
-fn shade(c: [u8; 3], k: f32) -> [u8; 3] {
-    mix_c(c, [0, 0, 0], 1.0 - k.clamp(0.0, 1.0))
 }
 
 /// Color de la barra según la intensidad y la paleta fundida de la portada:
@@ -102,34 +103,84 @@ fn row_of(value: f32, center: f32, scale: f32, h: usize) -> u16 {
     y.round().clamp(0.0, (h - 1) as f32) as u16
 }
 
-/// Filas donde debe pintarse UN canal en la columna: el VALLE (`min`) y el
-/// PICO (`max`) de su envolvente, deduplicados si caen en la misma celda.
+/// Proyección estática de amplitud para el osciloscopio: soft-clip `atan` que
+/// expande los niveles medios sin mover los extremos.
 ///
-/// Devuelve como máximo 2 filas (sin allocs: `[u16; 2]` en el stack). Una
-/// columna sin datos cae al centro (línea base continua).
+/// Motivación: en una TUI el carril tiene 3–11 filas y el mapeo lineal
+/// desperdicia casi todas en señales típicas (0.2–0.3 ⇒ 1–2 filas centrales:
+/// la onda se ve como una línea plana). La curva `atan(3·v)/atan(3)` reparte
+/// esos niveles por el carril (0.3 ⇒ 0.59) manteniendo fijos 0 y ±1, el orden,
+/// el signo y la monotonía — la dinámica relativa L/R se conserva intacta.
+///
+/// Frente a una potencia `|v|^γ`: la pendiente en cero está acotada
+/// (`3/atan(3) ≈ 2.4`, sin ganancia infinita al ruido de fondo) y satura con
+/// suavidad hacia ±1.
+///
+/// Es ESTÁTICA (sin memoria entre frames): no introduce `pumping` ni cambia la
+/// semántica del auto-gain existente, que sigue actuando vía `scale`. Pura y
+/// barata (un `atan` por candidato).
+fn project_amplitude(value: f32) -> f32 {
+    const KNEE: f32 = 3.0;
+    const NORM: f32 = 1.2490458; // atan(3.0)
+    (value.clamp(-1.0, 1.0) * KNEE).atan() / NORM
+}
+
+/// Filas candidatas de UN canal en el plano compartido: `min`/`max` de la
+/// columna cuantizados con [`row_of`] tras [`project_amplitude`], deduplicados.
+///
+/// Como máximo 2 filas, sin allocs. Ambos canales usan la MISMA geometría
+/// (mismo centro y escala): sus puntos coexisten en las mismas coordenadas de
+/// tiempo y se cruzan sobre el eje central como en un osciloscopio estéreo.
 fn channel_rows(
     channel: &WaveformEnvelope,
     w: usize,
     col: usize,
+    h: usize,
+    y0: u16,
     center: f32,
     scale: f32,
-    h: usize,
 ) -> ([u16; 2], usize) {
     let mut rows = [0u16; 2];
+    if h == 0 {
+        return (rows, 0);
+    }
     let (mn, mx) = channel_column_span(channel, w, col);
     let mut n = 0usize;
     for value in [mn, mx] {
-        let row = row_of(value, center, scale, h);
+        // La proyección expande los niveles medios al plano (ver
+        // `project_amplitude`): sin ella todo lo moderado cae al centro.
+        let row = y0 + row_of(project_amplitude(value), center, scale, h);
         if !rows[..n].contains(&row) {
             rows[n] = row;
             n += 1;
         }
     }
-    if n == 0 {
-        rows[0] = (h / 2) as u16;
-        n = 1;
-    }
     (rows, n)
+}
+
+/// Distancia mínima entre puntos emitidos de la MISMA pista (min o max).
+///
+/// Sin esto, cada columna pinta su punto y el conjunto degenera en una línea
+/// punteada continua (`••••`). Con esto, un punto solo se emite si aporta
+/// información espacial nueva: la forma (picos, valles, cruces por cero)
+/// cambia de fila y se sigue emitiendo; lo redundante (mesetas, silencios)
+/// queda espaciado. Criterio de densidad/resolución, no mutilación.
+const SCATTER_MIN_DIST: usize = 2;
+
+/// `true` si el candidato de una pista aporta información nueva (y actualiza
+/// el registro de la pista). Estado en el stack, sin allocs.
+fn scatter_emit(last: &mut Option<(usize, u16)>, col: usize, row: u16) -> bool {
+    let emit = match *last {
+        None => true,
+        Some((lc, lr)) => {
+            col.saturating_sub(lc) >= SCATTER_MIN_DIST
+                || row.abs_diff(lr) as usize >= SCATTER_MIN_DIST
+        }
+    };
+    if emit {
+        *last = Some((col, row));
+    }
+    emit
 }
 
 /// Pinta el punto de trazo (símbolo y color; no toca el fondo, que lo dejó el
@@ -142,85 +193,54 @@ fn paint_point(frame: &mut Frame, x: u16, y: u16, symbol: &str, color: [u8; 3]) 
     }
 }
 
-/// Pinta la capa ambiental (osciloscopio ESTÉREO) sobre TODO `area`.
+/// Pinta la capa ambiental sobre TODO `area`: fondo PLANO y reseteo de celdas.
 ///
-/// Resetea cada celda del área (símbolo a `" "`) y tiñe el fondo con un
-/// RESPLANDOR suave alrededor de las DOS curvas (L y R, una por canal; decae
-/// a [`GLOW_RADIUS`] filas).
+/// Resetea cada celda del área (símbolo a `" "`) y la tiñe con un fondo
+/// uniforme: `background` de la paleta en modo vivo, techo de contraste
+/// ([`VisualPalette::karaoke_bg_ceiling`]) en modo `subdued` (banda de
+/// letras/mensajes). A propósito SIN resplandor por celda: en el terminal
+/// cada celda tintada se lee como un bloque sólido de color, y el halo del
+/// osciloscopio producía 9 de cada 10 celdas tintadas — bloques por encima,
+/// por debajo y detrás de los puntos y las letras. La señal la llevan
+/// únicamente los puntos del trazo (colores de canal derivados de la
+/// portada); el fondo nunca compite con ellos.
 ///
-/// La capa ambiental es dueña de sus celdas: al resetear los símbolos elimina
-/// los fantasmas del frame anterior (barras `█`, puntos viejos, letras) que el
-/// buffer reutilizado de la TUI real conservaría — el trazo posterior solo
-/// pinta 2–4 celdas por columna y jamás limpiaría el resto. El karaoke pinta su
-/// texto DESPUÉS, preservando este fondo. `subdued` aterriza la escena (reduce
-/// resplandor y energía) para que el texto superior siga siendo legible.
+/// La capa ambiental sigue siendo dueña de sus celdas: al resetear los
+/// símbolos elimina los fantasmas del frame anterior (barras `█`, puntos
+/// viejos, letras) que el buffer reutilizado de la TUI real conservaría — el
+/// trazo posterior solo pinta celdas dispersas y jamás limpiaría el resto. El
+/// karaoke pinta su texto DESPUÉS, preservando este fondo.
+///
+/// Al ser el fondo aplacado exactamente el color contra el que se resolvieron
+/// los colores del karaoke, los umbrales χ ≥ 4.5/3.0 se cumplen por
+/// construcción.
 pub fn render_backdrop(frame: &mut Frame, area: Rect, state: &VisualState, subdued: bool) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let scene = &state.scene;
-    let palette = &scene.palette;
-    let w = area.width as usize;
-    let h = area.height as usize;
+    let palette = &state.scene.palette;
 
-    let mut bg = palette.background;
-    if subdued {
-        bg = shade(bg, 0.45);
-    }
-    let active = scene.active && !subdued;
-    let energy = if active { scene.energy } else { 0.0 };
-    let brightness = if active { scene.brightness } else { 0.0 };
-    let lit_k = if subdued {
-        (0.25 + 0.65 * energy).clamp(0.0, 1.0) * 0.50
+    let flat = if subdued {
+        to_color(palette.karaoke_bg_ceiling())
     } else {
-        (0.25 + 0.65 * energy).clamp(0.0, 1.0)
+        to_color(palette.background)
     };
-    let center = h as f32 * 0.5;
-    let scale = (center * 0.92).max(1.0) * scene.waveform.gain;
-
-    let channels = palette.channel_colors();
-    let waveform = &scene.waveform;
-
-    for col in 0..w {
-        let (l_mn, l_mx) = channel_column_span(&waveform.left, w, col);
-        let (r_mn, r_mx) = channel_column_span(&waveform.right, w, col);
-        // Cada curva se tiñe con el color de su canal alrededor de su valor
-        // medio de columna (la envolvente, no el plot de puntos).
-        let l_y = center - (l_mn + l_mx) * 0.5 * scale;
-        let r_y = center - (r_mn + r_mx) * 0.5 * scale;
-        for row in 0..h {
-            let x = area.x + col as u16;
-            let y = area.y + row as u16;
-            let dist_l = (row as f32 + 0.5 - l_y).abs();
-            let dist_r = (row as f32 + 0.5 - r_y).abs();
-            let fall_l = (1.0 - dist_l / GLOW_RADIUS).clamp(0.0, 1.0);
-            let fall_r = (1.0 - dist_r / GLOW_RADIUS).clamp(0.0, 1.0);
-            let mut color = bg;
-            if fall_l > 0.0 {
-                color = mix_c(color, channels.left, lit_k * fall_l);
-            }
-            if fall_r > 0.0 {
-                color = mix_c(color, channels.right, lit_k * fall_r);
-            }
-            if brightness > 0.0 {
-                color = mix_c(color, [255, 255, 255], brightness * 0.12);
-            }
-            // SAFETY(ninguna): API pública de ratatui; celdas dentro de `area`.
-            // Se resetea el símbolo: sin esto, el buffer reutilizado mostraría
-            // glifos del frame/vista anterior (bloques de barras, Gauge, letras)
-            // "encima" de los puntos del trazo.
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
             if let Some(cell) = frame.buffer_mut().cell_mut(Position { x, y }) {
                 cell.set_symbol(" ");
-                cell.set_bg(to_color(color));
+                cell.set_bg(flat);
             }
         }
     }
 }
 
-/// Dibuja el visualizador completo: el trazo del osciloscopio (puntos por
-/// canal) seguido de la franja de barras y el marco de estado. El resplandor
-/// ambiental de fondo
-/// se pinta aquí también, antes del trazo.
+/// Dibuja el osciloscopio estéreo: L y R superpuestos en un plano compartido
+/// con eje central, sobre un fondo plano de la paleta.
+///
+/// El área interior se dedica ÍNTEGRA al trazo (la franja EQ vive en
+/// [`render_bars_only`], nunca aquí: así la forma de onda no se fusiona con
+/// bloques de espectro).
 ///
 /// Con `state.active == false` pinta un marco apagado sobre la escena dormida
 /// (línea base centrada): la vista nunca "desaparece" ni salta de layout.
@@ -243,7 +263,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &VisualState, position_secs:
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            format!(" Visual {} ", pulse_dot),
+            format!(" Visual L/R {} ", pulse_dot),
             Style::new().fg(title_color),
         ))
         .title_bottom(Span::styled(
@@ -252,50 +272,70 @@ pub fn render(frame: &mut Frame, area: Rect, state: &VisualState, position_secs:
         ));
     frame.render_widget(block, area);
 
-    let inner = area.inner(Margin {
+    // El área interior es TODA para el trazo superpuesto L/R: la EQ no
+    // vive aquí (ver `render_bars_only`), así la onda nunca se lee fusionada
+    // con bloques de espectro.
+    let trace_area = area.inner(Margin {
         horizontal: 1,
         vertical: 1,
     });
-    if inner.width == 0 || inner.height == 0 {
+    if trace_area.width == 0 || trace_area.height == 0 {
         return;
     }
 
-    // Franja de barras: las DOS filas inferiores del área interior (espectro
-    // discreto bajo el trazo del osciloscopio). Dos filas dan escala y
-    // presencia al EQ; en áreas diminutas se cae a una sola fila.
-    let bars_h = if inner.height >= 5 { 2u16 } else { 1u16 };
-    let trace_area = Rect::new(
-        inner.x,
-        inner.y,
-        inner.width,
-        inner.height.saturating_sub(bars_h),
-    );
-    let bars_area = Rect::new(inner.x, inner.y + trace_area.height, inner.width, bars_h);
-
     render_backdrop(frame, trace_area, state, false);
     render_trace(frame, trace_area, state);
-    render_bars(frame, bars_area, state);
 }
 
-/// Pinta la curva del osciloscopio: un PLOT DE PUNTOS por columna y canal.
+/// Pinta el osciloscopio: SCATTER de puntos en un plano compartido (L+R).
 ///
-/// Cada columna vuelca los buckets que le tocan y pinta hasta DOS puntos por
-/// canal — el VALLE (`min`) y el PICO (`max`) de la columnna — en la fila más
-/// cercana a `center - value*scale` (spec §8). Ambas curvas (L/R) se dibujan
-/// con puntos `●` (ASCII `*`), distinguiéndose por el color de cada canal y el
-/// resplandor ambiental de fondo; cuando caen en la MISMA celda se pinta el
-/// punto con el tinte combinado de mezcla: ni pico, ni valle, ni canal se
-/// pierden.
+/// Cada columna aporta hasta DOS candidatos por canal (VALLE `min` y PICO
+/// `max` de su envolvente, spec §8), cuantizados con el MISMO centro
+/// (`amplitud == 0` en el medio del área) y la MISMA escala: L y R coexisten
+/// en las mismas coordenadas de tiempo y se cruzan sobre el eje central.
+/// Cada candidato solo se pinta si aporta novedad a su pista: misma fila que
+/// el anterior de la pista ⇒ se espacia en columnas; salto de filas ⇒ se
+/// emite siempre (picos y transitorios sobreviven). Las columnas redundantes
+/// quedan VACÍAS en vez de forzar una línea punteada continua. Cada canal
+/// conserva sus puntos y su color; donde ambos caen en la misma celda se
+/// pinta el tinte de mezcla (la coincidencia se ve, ningún canal se pierde).
 ///
-/// Sin allocations por draw: por cada columna solo se calculan 2 filas por
-/// canal en el stack. No toca el fondo (el resplandor lo dejó `render_backdrop`);
-/// los glifos salen del sistema [`UiGlyphs`] de la sesión.
+/// Garantía Scatter: SOLO se pintan esos puntos discretos. Nunca se une un
+/// punto con el anterior (sin `draw_line`), nunca se rellena el intervalo
+/// vertical y nunca se emite un glifo de bloque en esta capa.
+///
+/// Sin allocations por draw: por columna, como máximo 2 candidatos por canal
+/// y cuatro registros `(columna, fila)` en el stack. No toca el fondo (plano,
+/// lo dejó `render_backdrop`); los glifos salen del sistema
+/// [`UiGlyphs`] de la sesión.
 fn render_trace(frame: &mut Frame, area: Rect, state: &VisualState) {
     render_trace_points(frame, area, state, *crate::ui::glyphs::GLYPHS);
 }
 
 /// Núcleo de [`render_trace`] con tema de glifos explícito (para tests).
 fn render_trace_points(frame: &mut Frame, area: Rect, state: &VisualState, glyphs: UiGlyphs) {
+    trace_points_impl(frame, area, state, glyphs, false);
+}
+
+/// Trazo del osciloscopio ATENUADO para la banda de letras: el mismo scatter
+/// superpuesto, pero con los colores de canal fundidos hacia el fondo del
+/// techo de contraste (siempre derivados de la paleta de la portada) y sin el
+/// blanqueado de brillo. El osciloscopio sigue vivo tras el texto sin
+/// competir con él; el fondo no se toca (lo dejó `render_backdrop`).
+pub fn render_trace_subdued(frame: &mut Frame, area: Rect, state: &VisualState) {
+    trace_points_impl(frame, area, state, *crate::ui::glyphs::GLYPHS, true);
+}
+
+/// Fracción de fundido de los puntos atenuados hacia el fondo del techo.
+const SUBDUED_TRACE_DIM: f32 = 0.55;
+
+fn trace_points_impl(
+    frame: &mut Frame,
+    area: Rect,
+    state: &VisualState,
+    glyphs: UiGlyphs,
+    subdued: bool,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -303,14 +343,26 @@ fn render_trace_points(frame: &mut Frame, area: Rect, state: &VisualState, glyph
     let palette = &scene.palette;
     let w = area.width as usize;
     let h = area.height as usize;
-    let brightness = if scene.active { scene.brightness } else { 0.0 };
+    let brightness = if scene.active && !subdued {
+        scene.brightness
+    } else {
+        0.0
+    };
 
-    let center = h as f32 * 0.5;
-    let scale = (center * 0.92).max(1.0) * scene.waveform.gain;
+    // Plano único: centro discreto del área y una sola escala para AMBOS
+    // canales (el 0 compartido queda en la fila central).
+    let gain = scene.waveform.gain;
+    let center = (h as f32 - 1.0) * 0.5;
+    let scale = ((h as f32 - 1.0) * 0.5 * 0.92).max(1.0) * gain;
 
     let channels = palette.channel_colors();
     let mut left_c = channels.left;
     let mut right_c = channels.right;
+    if subdued {
+        let ceiling = palette.karaoke_bg_ceiling();
+        left_c = mix_c(left_c, ceiling, SUBDUED_TRACE_DIM);
+        right_c = mix_c(right_c, ceiling, SUBDUED_TRACE_DIM);
+    }
     if brightness > 0.0 {
         left_c = mix_c(left_c, [255, 255, 255], brightness * 0.12);
         right_c = mix_c(right_c, [255, 255, 255], brightness * 0.12);
@@ -321,28 +373,51 @@ fn render_trace_points(frame: &mut Frame, area: Rect, state: &VisualState, glyph
     let g_both = glyphs.trace_both();
 
     let waveform = &scene.waveform;
+    // Una pista por extremo (min/max) y canal: los raíles persistentes
+    // (cuadradas, mesetas) se espacian por pista y dejan huecos, mientras que
+    // un transitorio salta de fila y se emite aunque comparta columna.
+    let mut last_lmn: Option<(usize, u16)> = None;
+    let mut last_lmx: Option<(usize, u16)> = None;
+    let mut last_rmn: Option<(usize, u16)> = None;
+    let mut last_rmx: Option<(usize, u16)> = None;
     for col in 0..w {
-        let (lrows, ln) = channel_rows(&waveform.left, w, col, center, scale, h);
-        let (rrows, rn) = channel_rows(&waveform.right, w, col, center, scale, h);
         let x = area.x + col as u16;
-
-        // Pasada L: el canal izquierdo; donde R comparte fila, mezcla.
-        for &row in &lrows[..ln] {
-            let both = rrows[..rn].contains(&row);
-            let (symbol, color) = if both {
+        // Candidatos de cada canal tras el thinning (filas absolutas).
+        let (lrows, ln) = channel_rows(&waveform.left, w, col, h, area.y, center, scale);
+        let mut lsel = [0u16; 2];
+        let mut lsel_n = 0usize;
+        for (i, &row) in lrows[..ln].iter().enumerate() {
+            let last = if i == 0 { &mut last_lmn } else { &mut last_lmx };
+            if scatter_emit(last, col, row) {
+                lsel[lsel_n] = row;
+                lsel_n += 1;
+            }
+        }
+        let (rrows, rn) = channel_rows(&waveform.right, w, col, h, area.y, center, scale);
+        let mut rsel = [0u16; 2];
+        let mut rsel_n = 0usize;
+        for (i, &row) in rrows[..rn].iter().enumerate() {
+            let last = if i == 0 { &mut last_rmn } else { &mut last_rmx };
+            if scatter_emit(last, col, row) {
+                rsel[rsel_n] = row;
+                rsel_n += 1;
+            }
+        }
+        // L primero; donde R coincide se pinta la mezcla (coincidencia
+        // visible, como trazos superpuestos del osciloscopio de referencia).
+        for &row in &lsel[..lsel_n] {
+            let (symbol, color) = if rsel[..rsel_n].contains(&row) {
                 (g_both, both_c)
             } else {
                 (g_left, left_c)
             };
-            paint_point(frame, x, area.y + row, symbol, color);
+            paint_point(frame, x, row, symbol, color);
         }
-        // Pasada R: lo que L no pintó (los destinos compartidos ya salieron
-        // como mezcla en la pasada L).
-        for &row in &rrows[..rn] {
-            if lrows[..ln].contains(&row) {
+        for &row in &rsel[..rsel_n] {
+            if lsel[..lsel_n].contains(&row) {
                 continue;
             }
-            paint_point(frame, x, area.y + row, g_right, right_c);
+            paint_point(frame, x, row, g_right, right_c);
         }
     }
 }
@@ -526,28 +601,9 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
-    fn tint_of(c: ratatui::style::Color, base: [u8; 3]) -> u32 {
-        match c {
-            Color::Rgb(r, g, b) => {
-                (r as i32 - base[0] as i32).unsigned_abs()
-                    + (g as i32 - base[1] as i32).unsigned_abs()
-                    + (b as i32 - base[2] as i32).unsigned_abs()
-            }
-            _ => 0,
-        }
-    }
-
-    fn max_tint(buf: &ratatui::buffer::Buffer, base: [u8; 3]) -> u32 {
-        buf.content()
-            .iter()
-            .map(|c| tint_of(c.bg, base))
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// Glifos de punto del trazado estéreo (Unicode `●` / ASCII `*`).
+    /// Glifos de punto del trazado estéreo (Unicode `•` / ASCII `*`).
     fn is_point(s: &str) -> bool {
-        matches!(s, "●" | "*")
+        matches!(s, "•" | "*")
     }
 
     #[test]
@@ -614,16 +670,15 @@ mod tests {
     }
 
     #[test]
-    fn louder_state_paints_more_filled_cells() {
-        let case = |level: f32| {
-            let buf = drawing(&|f| {
-                render(
-                    f,
-                    f.area(),
-                    &active_state(level, VisualPalette::fallback()),
-                    0.0,
-                )
-            });
+    fn louder_waveform_paints_more_cells() {
+        // Misma escena salvo la amplitud de la envolvente: una señal fuerte
+        // (min y max separados ⇒ dos pistas por carril) pinta más celdas que
+        // una suave (min≈max ⇒ una sola pista por carril).
+        let case = |amp: f32| {
+            let mut st = active_state(0.9, VisualPalette::fallback());
+            st.scene.waveform = view(amp, 1);
+            st.scene.brightness = 0.0;
+            let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
             buf.content()
                 .iter()
                 .filter(|c| !c.symbol().trim().is_empty())
@@ -656,40 +711,49 @@ mod tests {
         assert!(has_accent, "una columna leve usa el acento de la portada");
     }
 
-    /// Máximo tinte de trazo sobre el plano de fondo del buffer.
-    fn first_lit_cell(buf: &ratatui::buffer::Buffer, state: &VisualState) -> Option<u32> {
-        let base = state.scene.palette.background;
-        let t = max_tint(buf, base);
-        (t > 0).then_some(t)
-    }
-
     #[test]
-    fn more_energy_brighter_trace() {
+    fn backdrop_is_flat_panel_regardless_of_energy() {
+        // Sin celdas tintadas como bloques: el fondo es el plano de la paleta
+        // en modo vivo y el techo de contraste en modo aplacado, con CUALQUIER
+        // energía (la señal la llevan solo los puntos).
         let palette =
             VisualPalette::from_cover(Some([[200u8, 30, 80], [40, 160, 240], [240, 180, 80]]));
         let mut low_s = active_state(0.05, palette);
         low_s.scene.energy = 0.0;
         let mut high = active_state(1.0, palette); // energía alta
-        high.scene.brightness = 0.0;
-
-        let buf_low = drawing(&|f| render_backdrop(f, f.area(), &low_s, false));
-        let buf_high = drawing(&|f| render_backdrop(f, f.area(), &high, false));
-        let lit_low = first_lit_cell(&buf_low, &low_s).unwrap_or(0);
-        let lit_high = first_lit_cell(&buf_high, &high).unwrap_or(0);
+        high.scene.brightness = 1.0;
+        for st in [&low_s, &high] {
+            let buf = drawing(&|f| render_backdrop(f, f.area(), st, false));
+            assert!(
+                buf.content().iter().all(|c| c.bg
+                    == Color::Rgb(
+                        palette.background[0],
+                        palette.background[1],
+                        palette.background[2]
+                    )),
+                "fondo plano de la paleta sin importar la energía"
+            );
+        }
+        let dim = drawing(&|f| render_backdrop(f, f.area(), &high, true));
+        let ceiling = palette.karaoke_bg_ceiling();
         assert!(
-            lit_high > 0,
-            "con energía el trazo tiñe el fondo por encima del plano"
+            dim.content()
+                .iter()
+                .all(|c| c.bg == Color::Rgb(ceiling[0], ceiling[1], ceiling[2])),
+            "fondo aplacado plano del techo"
         );
-        assert!(lit_high > lit_low, "más energía ⇒ más tinte de trazo");
     }
 
-    /// Distancia vertical máxima de los puntos del trazo al centro del área.
+    /// Distancia vertical máxima de los puntos del trazo al eje central.
+    ///
+    /// El área de `drawing()` (40×8) con `render()` deja un interior de 6 filas
+    /// (y=1..7) con eje en y=3.5, compartido por L y R.
     fn sweep_of(buf: &ratatui::buffer::Buffer) -> f32 {
         let mut offsets = Vec::new();
-        for y in 1..5u16 {
+        for y in 1..7u16 {
             for x in 1..39u16 {
                 if is_point(buf.cell((x, y)).unwrap().symbol()) {
-                    offsets.push((y as f32 - 3.0).abs());
+                    offsets.push((y as f32 - 3.5).abs());
                 }
             }
         }
@@ -699,8 +763,8 @@ mod tests {
     #[test]
     fn louder_waveform_trace_sweeps_farther_from_center() {
         // Misma escena, solo cambia la amplitud de la envolvente: los puntos
-        // del trazo de una señal de pico 0.9 barre más lejos del centro que la
-        // de pico 0.2 (el plot sigue pico Y valle; la ganancia es 1.0).
+        // del trazo de una señal de pico 0.9 se alejan del eje central más
+        // que los de pico 0.2 (la ganancia es 1.0).
         let mut loud = active_state(0.9, VisualPalette::fallback());
         loud.scene.waveform = view(0.9, 1);
         let buf_loud = drawing(&|f| render(f, f.area(), &loud, 0.0));
@@ -709,29 +773,37 @@ mod tests {
         let buf_quiet = drawing(&|f| render(f, f.area(), &quiet, 0.0));
         assert!(
             sweep_of(&buf_loud) > sweep_of(&buf_quiet),
-            "señal más fuerte ⇒ puntos más lejos del centro"
+            "señal más fuerte ⇒ puntos más lejos del eje central"
         );
     }
 
     #[test]
-    fn point_plot_spans_every_column_without_gaps() {
-        // Cada columna del área interior pinta al menos un punto (los canales
-        // siempre caen en una celda; una columna sin datos cae al centro).
-        let st = active_state(0.9, VisualPalette::fallback());
-        let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
-        for x in 1..39u16 {
-            assert!(
-                (1..5u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol())),
-                "la columna {x} del trazo tiene al menos un punto"
-            );
-        }
+    fn scatter_leaves_gaps_for_redundant_signal() {
+        // Anti-línea-punteada: una señal constante no fuerza un punto por
+        // columna; el thinning espacia los puntos redundantes y deja columnas
+        // VACÍAS, sin perder la amplitud (todos los puntos en la misma fila).
+        let st = plain_state(WaveformView {
+            left: WaveformEnvelope::from_window(&[0.5; 2048]),
+            right: WaveformEnvelope::from_window(&[0.5; 2048]),
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let cols_with_points = (0..40u16)
+            .filter(|&x| (0..8u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol())))
+            .count();
+        assert!(cols_with_points > 0, "la señal constante sigue visible");
+        assert!(
+            cols_with_points < 40,
+            "pero no ocupa todas las columnas ({cols_with_points}/40): hay huecos"
+        );
     }
 
     #[test]
     fn stereo_channels_render_as_distinct_point_sets() {
-        // L fuerte, R débil (amplitudes distintas): ambas curvas son
-        // visibles a la vez con puntos `●`, cada una con su propio color
-        // de canal y su propio resplandor de fondo.
+        // L fuerte, R débil (amplitudes distintas): ambas curvas coexisten en
+        // el plano compartido con puntos `•`, cada una con su propio color de
+        // canal; donde coinciden se ve la mezcla. L barre más lejos del eje.
         let mut st = active_state(0.9, VisualPalette::fallback());
         st.scene.waveform = stereo_view(0.9, 0.5, 3);
         let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
@@ -752,12 +824,16 @@ mod tests {
 
         let mut l_count = 0usize;
         let mut r_count = 0usize;
+        let mut l_far = 0usize;
         for x in 1..39u16 {
-            for y in 1..5u16 {
+            for y in 1..7u16 {
                 let cell = buf.cell((x, y)).unwrap();
                 if is_point(cell.symbol()) {
                     if cell.fg == left_color {
                         l_count += 1;
+                        if (y as f32 - 3.5).abs() > 1.5 {
+                            l_far += 1;
+                        }
                     }
                     if cell.fg == right_color {
                         r_count += 1;
@@ -767,8 +843,10 @@ mod tests {
         }
         assert!(l_count > 0, "L llega al trazo con color de canal L");
         assert!(r_count > 0, "R llega al trazo con color de canal R");
-        // Con amplitudes distintas, cada canal tiene más puntos exclusivos
-        // que de mezcla: la proporción de puntos propios debe ser razonable.
+        assert!(
+            l_far > 0,
+            "L (0.9) alcanza filas lejos del eje que R (0.5) no"
+        );
         assert!(
             l_count + r_count >= 10,
             "conjuntos de puntos lo suficientemente grandes: L={l_count} R={r_count}"
@@ -776,10 +854,10 @@ mod tests {
     }
 
     #[test]
-    fn channel_collision_paints_both_with_mixed_color() {
-        // L y R idénticos (contenido mono): en la mayoría de columnas ambos
-        // caen a la misma celda → punto `●` con color de mezcla `both_c`,
-        // sin perder ninguna curva.
+    fn mono_content_overlaps_with_mixed_color() {
+        // Contenido mono (L y R idénticos): ambas curvas caen en las mismas
+        // celdas y se pintan con el tinte de mezcla — la coincidencia se ve
+        // como trazos superpuestos, sin perder ningún canal.
         let st = active_state(0.9, VisualPalette::fallback());
         let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
         let channels = st.scene.palette.channel_colors();
@@ -796,40 +874,37 @@ mod tests {
         }
         let both_color = to_color(mix_c(left_rgb, right_rgb, 0.5));
 
-        let has_both = buf
+        let mixed = buf
             .content()
             .iter()
-            .any(|c| is_point(c.symbol()) && c.fg == both_color);
+            .filter(|c| is_point(c.symbol()) && c.fg == both_color)
+            .count();
         assert!(
-            has_both,
-            "canales solapados pinta punto `●` con color de mezcla"
+            mixed > 0,
+            "canales idénticos se superponen con color de mezcla"
         );
     }
-
     #[test]
-    fn min_and_max_of_a_column_are_drawn_separately() {
-        // Onda cuadrada ±0.9 en L (cada bucket conserva valle Y pico), R mudo:
-        // el plot llega tanto a la fila alta (pico) como a la baja (valle) en
-        // la misma columna.
+    fn square_wave_reaches_both_edges_of_shared_plane() {
+        // Onda cuadrada ±0.9 en ambos canales sobre el plano compartido:
+        // pico arriba (y=1) y valle abajo (y=6) del área interior, con el
+        // centro libre de relleno (extremos discretos superpuestos).
+        let sq = square_stereo(0.9).left;
         let mut st = active_state(0.9, VisualPalette::fallback());
-        st.scene.waveform = square_stereo(0.9);
+        st.scene.waveform = WaveformView {
+            left: sq,
+            right: sq,
+            gain: 1.0,
+        };
         let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
-        // Filas bajas del área interior (bottom = fila 4) y filas altas (= 1).
-        let top_filled = (1..39u16).any(|x| is_point(buf.cell((x, 1)).unwrap().symbol()));
-        let bottom_filled = (1..39u16).any(|x| is_point(buf.cell((x, 4)).unwrap().symbol()));
-        assert!(top_filled, "el pico de la onda cuadrada pinta arriba");
-        assert!(bottom_filled, "el valle de la onda cuadrada pinta abajo");
-        // Y, como L domina y R calla, hay columnas con DSOs puntos: los dos
-        // extremos de la columa en la misma columna.
-        let columns_with_two = (1..39u16)
-            .filter(|&x| {
-                (1..5u16)
-                    .filter(|&y| is_point(buf.cell((x, y)).unwrap().symbol()))
-                    .count()
-                    >= 2
-            })
-            .count();
-        assert!(columns_with_two > 0, "min y max conviven en la columna");
+        assert!(
+            (1..39u16).any(|x| is_point(buf.cell((x, 1)).unwrap().symbol())),
+            "el pico llega al borde superior"
+        );
+        assert!(
+            (1..39u16).any(|x| is_point(buf.cell((x, 6)).unwrap().symbol())),
+            "el valle llega al borde inferior"
+        );
     }
 
     #[test]
@@ -846,24 +921,32 @@ mod tests {
         let unicode =
             drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
         assert!(
-            unicode.content().iter().any(|c| matches!(c.symbol(), "●")),
-            "el tema Unicode usa puntos `●`"
+            unicode.content().iter().any(|c| matches!(c.symbol(), "•")),
+            "el tema Unicode usa puntos `•`"
         );
     }
 
     #[test]
-    fn silence_keeps_the_trace_on_the_center_baseline() {
-        // Con la escena inactiva el trazo es una línea base centrada: todos los
-        // puntos caen en la fila central del área interior (sin NaN ni saltos).
+    fn silence_keeps_sparse_center_baseline() {
+        // Escena inactiva: ambos canales reposan en el eje central compartido
+        // (y=3..4) como puntos ESPACIADOS (thinning), sin NaN ni saltos y sin
+        // pintar una línea sólida: el silencio se lee como silencio.
         let buf = drawing(&|f| render(f, f.area(), &VisualState::inactive(), 0.0));
-        let rows: Vec<u16> = (1..39u16)
-            .filter_map(|x| (1..5u16).find(|&y| is_point(buf.cell((x, y)).unwrap().symbol())))
-            .collect();
-        assert_eq!(rows.len(), 38, "la línea base pinta todas las columnas");
-        assert!(
-            rows.iter().all(|&y| y == 2 || y == 3),
-            "todos los puntos en la banda central: {rows:?}"
-        );
+        let mut cols = 0usize;
+        for x in 1..39u16 {
+            if (1..7u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol())) {
+                cols += 1;
+            }
+            // Nada en los bordes del plano.
+            for y in [1u16, 6] {
+                assert!(
+                    !is_point(buf.cell((x, y)).unwrap().symbol()),
+                    "en silencio los bordes quedan vacíos (x={x}, y={y})"
+                );
+            }
+        }
+        assert!(cols > 0, "la línea base central visible");
+        assert!(cols < 38, "pero espaciada, no sólida ({cols}/38)");
     }
 
     #[test]
@@ -883,11 +966,11 @@ mod tests {
 
     #[test]
     fn bars_grow_into_two_rows_when_room() {
-        // En un terminal con área interior de 6 filas, la franja del EQ ocupa
-        // las DOS filas inferiores: la base siempre tiene barra y las fuertes
-        // suben a la fila de arriba (crecimiento desde la base).
+        // La franja EQ vive en `render_bars_only` (Now Playing), NUNCA dentro
+        // del bloque del osciloscopio: con 6 filas interiores ocupa las DOS
+        // inferiores (la base siempre tiene barra y las fuertes suben).
         let st = active_state(1.0, VisualPalette::fallback());
-        let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
+        let buf = drawing(&|f| render_bars_only(f, f.area(), &st));
         // Barras del EQ: columnas x 1..=38 sobre las filas y 5..=6.
         let is_bar = |x: u16, y: u16| {
             let c = buf.cell((x, y)).unwrap();
@@ -910,11 +993,11 @@ mod tests {
     #[test]
     fn bars_only_expanded_fills_height_without_trace_points() {
         // Modo Now Playing: solo barras, ampliadas a todo el interior, sin
-        // ningún punto `●` del osciloscopio.
+        // ningún punto `•` del osciloscopio.
         let st = active_state(1.0, VisualPalette::fallback());
         let buf = drawing(&|f| render_bars_only(f, f.area(), &st));
         assert!(
-            buf.content().iter().all(|c| c.symbol() != "●"),
+            buf.content().iter().all(|c| c.symbol() != "•"),
             "ni un solo punto del osciloscopio en el modo barras"
         );
         // Con señal fuerte las barras llegan hasta la fila superior interior.
@@ -967,29 +1050,34 @@ mod tests {
     }
 
     #[test]
-    fn subdued_dims_the_trace_for_legibility() {
+    fn subdued_backdrop_is_flat_ceiling_for_lyrics() {
+        // El modo aplacado (banda de letras/mensajes) es un plano EXACTO del
+        // techo de contraste: sin moteado por columna que se lea como bloques
+        // superpuestos al texto, y con el color contra el que se resolvió el
+        // karaoke (contraste por construcción).
         let palette = VisualPalette::fallback();
         let st = active_state(0.9, palette);
-        let full = drawing(&|f| render_backdrop(f, f.area(), &st, false));
         let dim = drawing(&|f| render_backdrop(f, f.area(), &st, true));
-        let sum_rgb = |c: Color| -> u32 {
-            match c {
-                Color::Rgb(r, g, b) => u32::from(r) + u32::from(g) + u32::from(b),
-                _ => 0,
-            }
-        };
-        let dimmer = full
-            .content()
-            .iter()
-            .zip(dim.content().iter())
-            .all(|(c1, c2)| sum_rgb(c2.bg) <= sum_rgb(c1.bg));
-        assert!(dimmer, "sin excepción, el fondo aplacado es más oscuro");
+        let ceiling = palette.karaoke_bg_ceiling();
+        let expected = Color::Rgb(ceiling[0], ceiling[1], ceiling[2]);
         assert!(
-            dim.content()
+            dim.content().iter().all(|c| c.symbol() == " "),
+            "sin glifos heredados ni puntos del trazo"
+        );
+        assert!(
+            dim.content().iter().all(|c| c.bg == expected),
+            "fondo plano del techo en TODA la banda (sin bandas de glow)"
+        );
+        // El modo vivo también es plano (fondo de la paleta): la señal la
+        // llevan solo los puntos, nunca celdas tintadas que se lean como
+        // bloques por encima o por debajo del trazo.
+        let full = drawing(&|f| render_backdrop(f, f.area(), &st, false));
+        let base = palette.background;
+        assert!(
+            full.content()
                 .iter()
-                .zip(full.content().iter())
-                .any(|(c2, c1)| sum_rgb(c2.bg) < sum_rgb(c1.bg)),
-            "y al menos una celda se atenúa de verdad"
+                .all(|c| c.bg == Color::Rgb(base[0], base[1], base[2])),
+            "el modo vivo también es fondo plano de la paleta"
         );
     }
 
@@ -998,13 +1086,89 @@ mod tests {
         let st = active_state(0.9, VisualPalette::fallback());
         let buf = drawing(&|f| render_backdrop(f, f.area(), &st, false));
         // La capa ambiental resetea los glifos a blanco (mata los fantasmas del
-        // frame anterior: bloques de barras, puntos viejos) y solo tiñe el
-        // fondo, así el texto superior (karaoke) o el trazo posterior parten
+        // frame anterior: bloques de barras, puntos viejos) y deja un fondo
+        // plano, así el texto superior (karaoke) o el trazo posterior parten
         // de una capa limpia.
         assert!(
             buf.content().iter().all(|c| c.symbol() == " "),
             "backdrop deja la capa en blanco (sin símbolos heredados)"
         );
+    }
+
+    #[test]
+    fn visual_band_contains_zero_block_cells() {
+        // Barrido completo del modo visual con señal fuerte: ningún símbolo de
+        // bloque y ningún fondo tintado — todo lo que no sea cromado del marco
+        // es punto del trazo o fondo plano de la paleta.
+        const BLOCKS: [&str; 8] = ["█", "▇", "▆", "▅", "▄", "▃", "▂", "▁"];
+        let st = active_state(0.9, VisualPalette::fallback());
+        let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
+        let base = VisualPalette::fallback().background;
+        let base_bg = Color::Rgb(base[0], base[1], base[2]);
+        for (i, c) in buf.content().iter().enumerate() {
+            let x = (i as u16) % 40;
+            let y = (i as u16) / 40;
+            let interior = x > 0 && x < 39 && y > 0 && y < 7;
+            assert!(
+                !BLOCKS.contains(&c.symbol()),
+                "bloque en ({x},{y}): {:?}",
+                c.symbol()
+            );
+            if interior {
+                assert!(
+                    is_point(c.symbol()) || c.symbol().trim().is_empty(),
+                    "interior: solo puntos o vacío ({x},{y}={:?})",
+                    c.symbol()
+                );
+                assert_eq!(c.bg, base_bg, "fondo plano tras los puntos ({x},{y})");
+            }
+        }
+        assert!(
+            buf.content().iter().any(|c| is_point(c.symbol())),
+            "el trazo sigue visible (puntos presentes)"
+        );
+    }
+
+    #[test]
+    fn subdued_trace_uses_dimmed_palette_colors() {
+        // El trazo tras las letras usa los colores de canal fundidos hacia el
+        // techo (derivados de la portada), nunca a plena intensidad: visible
+        // sin competir con el texto. El fondo no se toca. Constantes opuestas
+        // para que cada punto conserve su color propio (sin mezcla).
+        let st = plain_state(WaveformView {
+            left: WaveformEnvelope::from_window(&[0.9; 2048]),
+            right: WaveformEnvelope::from_window(&[-0.9; 2048]),
+            gain: 1.0,
+        });
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_trace_subdued(f, f.area(), &st))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let palette = VisualPalette::fallback();
+        let ceiling = palette.karaoke_bg_ceiling();
+        let channels = palette.channel_colors();
+        let dim_l = to_color(mix_c(channels.left, ceiling, SUBDUED_TRACE_DIM));
+        let dim_r = to_color(mix_c(channels.right, ceiling, SUBDUED_TRACE_DIM));
+        let full_l = to_color(channels.left);
+        let full_r = to_color(channels.right);
+        let mut dim_count = 0usize;
+        for c in buf.content().iter() {
+            if is_point(c.symbol()) {
+                assert!(
+                    c.fg == dim_l || c.fg == dim_r,
+                    "punto atenuado con color fundido: {:?}",
+                    c.fg
+                );
+                assert!(
+                    c.fg != full_l && c.fg != full_r,
+                    "nunca a plena intensidad tras las letras"
+                );
+                dim_count += 1;
+            }
+        }
+        assert!(dim_count > 0, "puntos atenuados visibles tras las letras");
     }
 
     #[test]
@@ -1035,34 +1199,516 @@ mod tests {
     }
 
     #[test]
-    fn wide_terminals_never_gap_columns() {
-        // Un ancho mayor que WAVEFORM_BUCKETS debe pintar el trazo sin huecos:
-        // cada columna cae en ≥1 bucket y ninguna queda en blanco.
-        let backend = TestBackend::new(WAVEFORM_BUCKETS as u16 + 40, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                render_backdrop(
-                    f,
-                    f.area(),
-                    &active_state(1.0, VisualPalette::fallback()),
-                    false,
-                )
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let base = VisualPalette::fallback().background;
-        let col_hits: Vec<bool> = (0..buf.area.width)
-            .map(|x| (0..buf.area.height).any(|y| tint_of(buf.cell((x, y)).unwrap().bg, base) > 0))
-            .collect();
+    fn bucket_column_mapping_covers_every_bucket_at_any_width() {
+        // El mapeo buckets→columnas cubre sin huecos en ambas direcciones, en
+        // terminales estrechas y anchas: cada columna toca ≥1 bucket y cada
+        // bucket llega a ≥1 columna (el thinning posterior decide qué puntos
+        // se emiten, nunca el mapeo).
+        for w in [1usize, 17, 38, 100, 128, 200, WAVEFORM_BUCKETS + 40] {
+            let mut bucket_hit = [false; WAVEFORM_BUCKETS];
+            for col in 0..w {
+                let (lo, hi) = column_bucket_range(w, col);
+                assert!(hi > lo, "columna {col} no vacía con ancho {w}");
+                assert!(hi <= WAVEFORM_BUCKETS, "rango acotado con ancho {w}");
+                bucket_hit[lo..hi].fill(true);
+            }
+            assert!(
+                bucket_hit.iter().all(|h| *h),
+                "todos los buckets llegan a alguna columna con ancho {w}"
+            );
+        }
+    }
+
+    /// Estado mínimo sin brillo para asserts de color puros (sin el
+    /// blanqueado del 12% que aplica `brightness`).
+    fn plain_state(waveform: WaveformView) -> VisualState {
+        let mut st = active_state(0.9, VisualPalette::fallback());
+        st.scene.waveform = waveform;
+        st.scene.energy = 0.0;
+        st.scene.brightness = 0.0;
+        st
+    }
+
+    #[test]
+    fn projection_fixes_endpoints_sign_and_order() {
+        // La proyección es transparente en lo esencial: 0→0, ±1→±1, impar,
+        // monótona y acotada a [-1, 1] (nunca expande picos ni crea valores
+        // fuera de rango).
+        assert_eq!(project_amplitude(0.0), 0.0);
+        assert!((project_amplitude(1.0) - 1.0).abs() < 1e-6);
+        assert!((project_amplitude(-1.0) + 1.0).abs() < 1e-6);
+        let mut prev = f32::NEG_INFINITY;
+        let mut v = -1.0f32;
+        while v <= 1.0 {
+            let p = project_amplitude(v);
+            assert!((-1.0..=1.0).contains(&p), "acotada: {p}");
+            assert!(p > prev, "monótona en {v}");
+            assert_eq!(p.signum(), v.signum(), "conserva el signo en {v}");
+            prev = p;
+            v += 0.05;
+        }
+        // Fuera de rango se clampéa antes de proyectar.
+        assert_eq!(project_amplitude(99.0), project_amplitude(1.0));
+        assert_eq!(project_amplitude(-99.0), project_amplitude(-1.0));
+    }
+
+    #[test]
+    fn projection_expands_mid_levels_without_moving_peaks() {
+        // Niveles típicos (0.2–0.5) ganan desviación vertical real; los picos
+        // (±1) quedan fijos: la forma se abre sin recortar extremos.
+        for v in [0.2f32, 0.3, 0.5] {
+            assert!(
+                project_amplitude(v) > v,
+                "nivel medio {v} se expande: {}",
+                project_amplitude(v)
+            );
+            assert!(project_amplitude(-v) < -v, "simétrico en negativo para {v}");
+        }
         assert!(
-            col_hits.first().copied().unwrap(),
-            "columna inicial pintada"
+            (project_amplitude(0.3) - 0.59).abs() < 0.02,
+            "0.3 ⇒ ~0.59: {}",
+            project_amplitude(0.3)
         );
-        assert!(col_hits.last().copied().unwrap(), "columna final pintada");
+    }
+
+    #[test]
+    fn moderate_sine_spans_plane_rows() {
+        // Regresión del aplastamiento: un seno de 0.3 (nivel musical típico)
+        // ocupa el plano en vez de colapsar al centro (área alta para dar
+        // resolución vertical: 14 filas).
+        let sine: Vec<f32> = (0..2048)
+            .map(|i| 0.3 * ((i as f32 / 2048.0) * std::f32::consts::TAU * 6.0).sin())
+            .collect();
+        let env = WaveformEnvelope::from_window(&sine);
+        let st = plain_state(WaveformView {
+            left: env,
+            right: WaveformEnvelope::silent(),
+            gain: 1.0,
+        });
+        let buf = drawing_size(40, 14, &|f| {
+            render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode))
+        });
+        let mut rows = std::collections::HashSet::new();
+        for x in 0..40u16 {
+            for y in 0..14u16 {
+                if is_point(buf.cell((x, y)).unwrap().symbol()) {
+                    rows.insert(y);
+                }
+            }
+        }
+        assert!(rows.len() >= 5, "el seno 0.3 barre el plano: {rows:?}");
+    }
+
+    #[test]
+    fn stereo_channels_keep_independent_dynamics() {
+        // L con seno 0.7 y R con cuadrada 0.4 sobre el eje compartido: cada
+        // canal dibuja SU forma con desviación vertical real (sin espejo);
+        // donde coinciden se ve la mezcla.
+        let sine: Vec<f32> = (0..1024)
+            .map(|i| 0.7 * ((i as f32 / 1024.0) * std::f32::consts::TAU * 5.0).sin())
+            .collect();
+        let square: Vec<f32> = (0..1024)
+            .map(|i| if i % 2 == 0 { 0.4 } else { -0.4 })
+            .collect();
+        let st = plain_state(WaveformView {
+            left: WaveformEnvelope::from_window(&sine),
+            right: WaveformEnvelope::from_window(&square),
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let palette = VisualPalette::fallback();
+        let channels = palette.channel_colors();
+        let left_color = to_color(channels.left);
+        let right_color = to_color(channels.right);
+        let mut l_rows = std::collections::HashSet::new();
+        let mut r_rows = std::collections::HashSet::new();
+        for x in 0..40u16 {
+            for y in 0..8u16 {
+                let c = buf.cell((x, y)).unwrap();
+                if is_point(c.symbol()) {
+                    if c.fg == left_color {
+                        l_rows.insert(y);
+                    }
+                    if c.fg == right_color {
+                        r_rows.insert(y);
+                    }
+                }
+            }
+        }
+        assert!(l_rows.len() >= 4, "L oscila con amplitud real: {l_rows:?}");
+        assert!(!r_rows.is_empty(), "R muestra sus extremos: {r_rows:?}");
+        assert_ne!(
+            l_rows, r_rows,
+            "canales independientes, no espejo: L={l_rows:?} R={r_rows:?}"
+        );
+    }
+
+    #[test]
+    fn amplitude_zero_maps_to_center_positive_up_negative_down() {
+        // Mapping PCM → coordenada vertical (`row_of`): el cero cae al centro,
+        // lo positivo arriba y lo negativo abajo. Es la normalización que
+        // mantiene la amplitud relativa de cada canal.
+        let h = 8usize;
+        let center = h as f32 * 0.5;
+        let scale = (center * 0.92).max(1.0);
+        let middle = row_of(0.0, center, scale, h);
         assert!(
-            col_hits.iter().all(|b| *b),
-            "el trazo no gapea en pantallas anchas"
+            middle == (h / 2) as u16 || middle == (h / 2) as u16 - 1,
+            "amplitud 0 → centro del canal: {middle}"
+        );
+        let up = row_of(0.8, center, scale, h);
+        let down = row_of(-0.8, center, scale, h);
+        assert!(up < middle, "+0.8 va a la parte superior: {up} < {middle}");
+        assert!(
+            down > middle,
+            "-0.8 va a la parte inferior: {down} > {middle}"
+        );
+    }
+
+    #[test]
+    fn normalization_minus_one_zero_plus_one_spans_vertical_range() {
+        // -1.0 / 0.0 / 1.0 cubren todo el rango vertical sin salirse.
+        let h = 10usize;
+        let center = h as f32 * 0.5;
+        let scale = (center * 0.92).max(1.0);
+        let top = row_of(1.0, center, scale, h);
+        let mid = row_of(0.0, center, scale, h);
+        let bottom = row_of(-1.0, center, scale, h);
+        assert_eq!(top, 0, "+1.0 llega a la fila superior");
+        assert_eq!(bottom, (h - 1) as u16, "-1.0 llega a la fila inferior");
+        assert!(
+            top < mid && mid < bottom,
+            "orden vertical monótono: {top} < {mid} < {bottom}"
+        );
+        // Fuera de rango se clampéa, nunca pánica ni sale del área.
+        assert_eq!(row_of(99.0, center, scale, h), 0);
+        assert_eq!(row_of(-99.0, center, scale, h), (h - 1) as u16);
+    }
+
+    #[test]
+    fn trace_never_fills_vertical_interval_between_min_and_max() {
+        // Garantía Scatter: con onda cuadrada ±0.9 superpuesta, el plano pinta
+        // SOLO los dos extremos discretos (arriba y abajo); las filas
+        // intermedias quedan vacías (sin `draw_line`, sin `fill_rect`). Además
+        // el thinning deja columnas enteras vacías: no hay línea continua.
+        let sq = square_stereo(0.9).left;
+        let st = plain_state(WaveformView {
+            left: sq,
+            right: sq,
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        // Extremos y=0..1 / y=6..7 con medio y=3..5 vacío donde hay extremos.
+        let mut checked = 0usize;
+        for x in 0..40u16 {
+            let top = (0..2u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol()));
+            let bottom = (6..8u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol()));
+            if top && bottom {
+                for y in 3..5u16 {
+                    assert!(
+                        !is_point(buf.cell((x, y)).unwrap().symbol()),
+                        "columna {x}: el intervalo no se rellena (fila {y} vacía)"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "hay columnas con pico+valle para verificar");
+        let empty_cols = (0..40u16)
+            .filter(|&x| (0..8u16).all(|y| !is_point(buf.cell((x, y)).unwrap().symbol())))
+            .count();
+        assert!(
+            empty_cols > 0,
+            "el thinning deja columnas vacías ({empty_cols})"
+        );
+    }
+
+    #[test]
+    fn trace_uses_only_point_glyphs_never_blocks_or_lines() {
+        // El trazo es Scatter puro: en el área del osciloscopio solo aparecen
+        // `•` (Unicode) o `*` (ASCII). Ni bloques de la rampa EQ
+        // (`█▁▂▃▄▅▆▇`), ni el círculo pesado `●`, ni líneas — la onda nunca se
+        // construye con rectángulos ni segmentos.
+        const BLOCKS: [&str; 9] = ["█", "▇", "▆", "▅", "▄", "▃", "▂", "▁", "●"];
+        for theme in [GlyphTheme::Unicode, GlyphTheme::Ascii] {
+            let glyphs = UiGlyphs::new(theme);
+            let st = plain_state(view(0.7, 2));
+            let buf = drawing(&|f| render_trace_points(f, f.area(), &st, glyphs));
+            for c in buf.content().iter() {
+                let s = c.symbol();
+                if s.trim().is_empty() {
+                    continue;
+                }
+                assert!(
+                    is_point(s),
+                    "símbolo inesperado «{s}» en el trazo (tema {theme:?}): solo puntos"
+                );
+                assert!(
+                    !BLOCKS.contains(&s),
+                    "bloque «{s}» en el trazo: la onda no usa bloques"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn column_downsampling_preserves_peaks_at_terminal_width() {
+        // Reducción a resolución de terminal: un transitorio en la ventana
+        // debe seguir visible tras `from_window` + fold por columna (no se
+        // promedia hasta desaparecer).
+        let mut window = [0.0f32; 2048];
+        window[500] = 0.95;
+        window[1500] = -0.95;
+        let env = WaveformEnvelope::from_window(&window);
+        // El fold de `channel_column_span` sobre un ancho típico (38 cols)
+        // conserva el extremo: alguna columna lo contiene.
+        let w = 38usize;
+        let mut seen_peak = false;
+        let mut seen_valley = false;
+        for col in 0..w {
+            let (mn, mx) = channel_column_span(&env, w, col);
+            if (mx - 0.95).abs() < 1e-6 {
+                seen_peak = true;
+            }
+            if (mn + 0.95).abs() < 1e-6 {
+                seen_valley = true;
+            }
+        }
+        assert!(seen_peak, "el pico sobrevive al fold por columna");
+        assert!(seen_valley, "el valle sobrevive al fold por columna");
+    }
+
+    #[test]
+    fn stereo_render_never_swaps_left_and_right_colors() {
+        // L fuerte con seno / R silente sobre el plano compartido: los
+        // extremos (lejos del eje) solo llevan color L; la línea base central
+        // lleva el color R de su silencio. Ningún punto extremo es R.
+        let samples_l: Vec<f32> = (0..1024)
+            .map(|i| 0.9 * ((i as f32 / 1024.0) * std::f32::consts::TAU * 5.0).sin())
+            .collect();
+        let left = WaveformEnvelope::from_window(&samples_l);
+        let st = plain_state(WaveformView {
+            left,
+            right: WaveformEnvelope::silent(),
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let channels = st.scene.palette.channel_colors();
+        let left_color = to_color(channels.left);
+        let right_color = to_color(channels.right);
+        let mut extreme_left = 0usize;
+        let mut extreme_right = 0usize;
+        let mut center_right = 0usize;
+        for x in 0..40u16 {
+            for y in [0u16, 1, 6, 7] {
+                let c = buf.cell((x, y)).unwrap();
+                if is_point(c.symbol()) {
+                    if c.fg == left_color {
+                        extreme_left += 1;
+                    }
+                    if c.fg == right_color {
+                        extreme_right += 1;
+                    }
+                }
+            }
+            for y in 3..5u16 {
+                let c = buf.cell((x, y)).unwrap();
+                if is_point(c.symbol()) && c.fg == right_color {
+                    center_right += 1;
+                }
+            }
+        }
+        assert!(extreme_left > 0, "L alcanza los extremos con su color");
+        assert_eq!(
+            extreme_right, 0,
+            "R silente nunca pinta los extremos (sin swap)"
+        );
+        assert!(center_right > 0, "R marca su base en el eje central");
+    }
+
+    #[test]
+    fn constant_signal_keeps_amplitude_without_solid_bar() {
+        // Señales constantes +0.5 (L) y -0.5 (R) sobre el eje compartido: cada
+        // una cae en UNA sola fila a su lado del eje (se conserva la amplitud
+        // con signo) pero espaciada (sin barra sólida).
+        // Prueba sobre la representación de display, no sobre el glifo.
+        let st = plain_state(WaveformView {
+            left: WaveformEnvelope::from_window(&[0.5; 2048]),
+            right: WaveformEnvelope::from_window(&[-0.5; 2048]),
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let mut rows: Vec<u16> = Vec::new();
+        for x in 0..40u16 {
+            for y in 0..8u16 {
+                if is_point(buf.cell((x, y)).unwrap().symbol()) {
+                    rows.push(y);
+                }
+            }
+        }
+        assert!(!rows.is_empty(), "constantes visibles");
+        let distinct: std::collections::HashSet<u16> = rows.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            2,
+            "dos filas (una por amplitud con signo): {distinct:?}"
+        );
+        assert!(
+            distinct.iter().any(|&y| y < 4) && distinct.iter().any(|&y| y >= 4),
+            "+0.5 arriba del eje y -0.5 abajo: {distinct:?}"
+        );
+        let cols = (0..40u16)
+            .filter(|&x| (0..8u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol())))
+            .count();
+        assert!(cols < 40, "espaciadas, no sólidas ({cols}/40)");
+    }
+
+    #[test]
+    fn alternating_samples_are_not_averaged_to_center() {
+        // Muestras alternas ±0.9 (variación máxima): el downsampling NO debe
+        // promediarlas al centro; los extremos sobreviven en cada carril.
+        let alt: Vec<f32> = (0..2048)
+            .map(|i| if i % 2 == 0 { 0.9 } else { -0.9 })
+            .collect();
+        let env = WaveformEnvelope::from_window(&alt);
+        let st = plain_state(WaveformView {
+            left: env,
+            right: env,
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        // Extremos del plano tocados, sin colapsar al centro: hay puntos fuera
+        // de la banda central (y=3..5).
+        assert!(
+            (0..40u16).any(|x| (0..3u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol()))),
+            "el pico alterno llega arriba"
+        );
+        assert!(
+            (0..40u16).any(|x| (5..8u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol()))),
+            "el valle alterno llega abajo del plano"
+        );
+        let center_only = (0..40u16).all(|x| {
+            (0..8u16)
+                .all(|y| !is_point(buf.cell((x, y)).unwrap().symbol()) || (3..5u16).contains(&y))
+        });
+        assert!(!center_only, "no colapsa al centro: hay extremos");
+    }
+
+    #[test]
+    fn slow_sine_spans_plane_rows_with_gaps() {
+        // Baja frecuencia (1 ciclo en la ventana): forma reconocible que barre
+        // varias filas del plano Y deja columnas vacías (scatter, no línea).
+        let slow: Vec<f32> = (0..2048)
+            .map(|i| 0.9 * ((i as f32 / 2048.0) * std::f32::consts::TAU).sin())
+            .collect();
+        let env = WaveformEnvelope::from_window(&slow);
+        let st = plain_state(WaveformView {
+            left: env,
+            right: WaveformEnvelope::silent(),
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let mut distinct = std::collections::HashSet::new();
+        for x in 0..40u16 {
+            for y in 0..8u16 {
+                if is_point(buf.cell((x, y)).unwrap().symbol()) {
+                    distinct.insert(y);
+                }
+            }
+        }
+        assert!(
+            distinct.len() >= 4,
+            "el seno lento barre filas del plano: {distinct:?}"
+        );
+        let mut empty = 0usize;
+        for x in 0..40u16 {
+            let mut any = false;
+            for y in 0..8u16 {
+                if is_point(buf.cell((x, y)).unwrap().symbol()) {
+                    any = true;
+                    break;
+                }
+            }
+            if !any {
+                empty += 1;
+            }
+        }
+        assert!(
+            empty > 0,
+            "con huecos entre puntos ({empty} columnas vacías)"
+        );
+    }
+
+    #[test]
+    fn mono_envelopes_overlap_with_mixed_color() {
+        // Comportamiento mono del proyecto (L=R duplicado): ambas curvas caen
+        // en las mismas celdas del plano y se ven con el tinte de mezcla.
+        // Ningún punto mono conserva un color puro de canal.
+        let samples: Vec<f32> = (0..1024)
+            .map(|i| 0.7 * ((i as f32 / 1024.0) * std::f32::consts::TAU * 3.0).sin())
+            .collect();
+        let env = WaveformEnvelope::from_window(&samples);
+        let st = plain_state(WaveformView {
+            left: env,
+            right: env,
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let palette = VisualPalette::fallback();
+        let channels = palette.channel_colors();
+        let pure_l = to_color(channels.left);
+        let pure_r = to_color(channels.right);
+        let both = to_color(mix_c(channels.left, channels.right, 0.5));
+        let mut mixed = 0usize;
+        let mut pure = 0usize;
+        for c in buf.content().iter() {
+            if is_point(c.symbol()) {
+                if c.fg == both {
+                    mixed += 1;
+                }
+                if c.fg == pure_l || c.fg == pure_r {
+                    pure += 1;
+                }
+            }
+        }
+        assert!(mixed > 0, "coincidencia visible con mezcla");
+        assert_eq!(pure, 0, "mono idéntico: ningún punto con color puro");
+    }
+
+    #[test]
+    fn point_density_adapts_to_terminal_width() {
+        // Resize: la densidad se adapta al ancho; más ancho ⇒ más puntos pero
+        // de forma acotada, y con huecos en ambos tamaños.
+        let st = plain_state(view(0.8, 1));
+        let count = |w: u16, h: u16| {
+            let buf = drawing_size(w, h, &|f| {
+                render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode))
+            });
+            let pts = buf
+                .content()
+                .iter()
+                .filter(|c| is_point(c.symbol()))
+                .count();
+            let empty_cols = (0..w)
+                .filter(|&x| (0..h).all(|y| !is_point(buf.cell((x, y)).unwrap().symbol())))
+                .count();
+            (pts, empty_cols)
+        };
+        let (p40, e40) = count(40, 8);
+        let (p100, e100) = count(100, 12);
+        assert!(p40 > 0 && p100 > 0, "puntos en ambos anchos");
+        assert!(e40 > 0 && e100 > 0, "huecos en ambos anchos");
+        assert!(p100 >= p40, "más ancho no pierde puntos ({p40} → {p100})");
+        assert!(
+            p100 <= 3 * p40,
+            "crecimiento acotado ante 2.5× ancho ({p40} → {p100})"
         );
     }
 }

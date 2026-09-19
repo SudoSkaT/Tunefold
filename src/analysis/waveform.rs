@@ -300,4 +300,90 @@ mod tests {
 
         assert_eq!(StereoWaveform::silent().peak(), 0.0);
     }
+
+    #[test]
+    fn interleaved_l0r0l1r1l2r2_splits_in_order() {
+        // Caso canónico PCM interleaved `L0 R0 L1 R1 L2 R2` (3 frames con
+        // valores distintos para detectar swaps o mezclas accidentales):
+        // L = [L0, L1, L2], R = [R0, R1, R2], en orden, sin cruzarse.
+        let (l0, l1, l2) = (0.1f32, 0.3, 0.5);
+        let (r0, r1, r2) = (-0.1f32, -0.3, -0.5);
+        let samples = [l0, r0, l1, r1, l2, r2];
+        let stereo = StereoWaveform::from_interleaved(&samples, 2);
+        // Ventana diminuta (3 muestras < 128 buckets): la muestra i cae en el
+        // bucket i, en orden — permite verificar posición, no solo picos.
+        for (i, &expected) in [l0, l1, l2].iter().enumerate() {
+            assert_eq!(
+                stereo.left.min[i], expected,
+                "L[{i}] conserva su muestra en orden"
+            );
+            assert_eq!(stereo.left.max[i], expected);
+        }
+        for (i, &expected) in [r0, r1, r2].iter().enumerate() {
+            assert_eq!(
+                stereo.right.min[i], expected,
+                "R[{i}] conserva su muestra en orden"
+            );
+            assert_eq!(stereo.right.max[i], expected);
+        }
+        // Ni mezclados (L0 con R0) ni cruzados (L con contenido de R).
+        assert_ne!(stereo.left.min[0], stereo.right.min[0]);
+        assert!((stereo.left.max[2] - l2).abs() < 1e-6);
+        assert!((stereo.right.min[2] - r2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stereo_channels_never_swapped_or_mixed() {
+        // L fuerte / R débil con valores constantes distinguibles: cada canal
+        // conserva SU amplitud; un swap accidental invertiría estos asserts.
+        let stereo = StereoWaveform::from_windows(&[0.9; 2048], &[0.15; 2048]);
+        assert!(
+            (stereo.left.peak() - 0.9).abs() < 1e-6,
+            "L conserva su pico: {}",
+            stereo.left.peak()
+        );
+        assert!(
+            (stereo.right.peak() - 0.15).abs() < 1e-6,
+            "R conserva el suyo: {}",
+            stereo.right.peak()
+        );
+        assert!(
+            stereo.left.min.iter().all(|&v| (v - 0.9).abs() < 1e-6),
+            "L no contiene muestras de R"
+        );
+        assert!(
+            stereo.right.min.iter().all(|&v| (v - 0.15).abs() < 1e-6),
+            "R no contiene muestras de L"
+        );
+    }
+
+    #[test]
+    fn downsampling_preserves_transient_peak_instead_of_averaging() {
+        // Transitorio de alta frecuencia: un único spike 1.0 entre ceros. Un
+        // `chunks().average()` lo diluiría (~1/16 ≈ 0.06); la envolvente
+        // min/max debe conservar el pico intacto en su bucket.
+        let mut window = [0.0f32; 2048];
+        window[1000] = 1.0;
+        window[1001] = -1.0;
+        let env = WaveformEnvelope::from_window(&window);
+        assert!(
+            (env.peak() - 1.0).abs() < 1e-6,
+            "el transitorio sobrevive a la reducción: {}",
+            env.peak()
+        );
+        assert!(
+            env.max.iter().any(|&v| (v - 1.0).abs() < 1e-6),
+            "el pico positivo queda en algún bucket"
+        );
+        assert!(
+            env.min.iter().any(|&v| (v + 1.0).abs() < 1e-6),
+            "el valle negativo queda en algún bucket"
+        );
+        // Y un promedio ingenuo lo habría escondido: sanity del test.
+        let naive_avg: f32 = window.iter().sum::<f32>() / window.len() as f32;
+        assert!(
+            naive_avg.abs() < 0.01,
+            "el promedio global esconde el transitorio ({naive_avg})"
+        );
+    }
 }

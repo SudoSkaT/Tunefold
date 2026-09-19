@@ -219,20 +219,26 @@ impl UiGlyphs {
     }
 
     // ------------------------------------------ osciloscopio estéreo (§8)
+    //
+    // Punto mínimo discreto (estética Scatter de scope-tui, `Marker::Dot`):
+    // `•` (U+2022) en Unicode, `*` en ASCII. Se evita a propósito `●`
+    // (U+25CF, mucho más pesado): con columnas adyacentes en la misma fila
+    // los `●●●` se fusionan en una línea gruesa/superficie, mientras que los
+    // `•••` conservan aire entre muestras y se leen como puntos discretos.
 
     /// Punto de trazo del canal IZQUIERDO (ch0).
     pub fn trace_left(self) -> &'static str {
-        self.pick("●", "*")
+        self.pick("•", "*")
     }
 
     /// Punto de trazo del canal DERECHO (ch1).
     pub fn trace_right(self) -> &'static str {
-        self.pick("●", "*")
+        self.pick("•", "*")
     }
 
     /// Punto de trazo cuando L y R comparten celda (ambos caen ahí).
     pub fn trace_both(self) -> &'static str {
-        self.pick("●", "*")
+        self.pick("•", "*")
     }
 }
 

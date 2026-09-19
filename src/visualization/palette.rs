@@ -113,13 +113,10 @@ impl VisualPalette {
 
     /// Cota superior conservadora del fondo tras el texto.
     ///
-    /// El ambient aplacado no es un plano: sus trazos iluminan celdas locales.
-    /// La celda más clara que puede producir está acotada por una mezcla de la
-    /// base aplacada con el color de la traza MÁS LUMINOSO del osciloscopio
-    /// (accent o cualquiera de los dos canales; el renderer garantiza esta
-    /// cota; ver `render.rs`). Las letras se resuelven contra este techo para
-    /// seguir legibles aunque un pico de señal pase por detrás de la línea
-    /// activa.
+    /// El ambient aplacado es un plano de EXACTAMENTE este color (el renderer
+    /// lo pinta liso en modo `subdued`, sin halo por columna). Las letras se
+    /// resuelven contra este fondo para una legibilidad exacta (χ ≥ 4.5 activa,
+    /// χ ≥ 3.0 históricas), sin depender de dónde caiga un pico de señal.
     pub fn karaoke_bg_ceiling(&self) -> [u8; 3] {
         let base = self.karaoke_subdued_bg();
         let channels = self.channel_colors();

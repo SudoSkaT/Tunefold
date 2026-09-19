@@ -208,6 +208,18 @@ pub fn render(
 
     {
         let top_area = chunks[0];
+        // El osciloscopio vive tras el texto: fondo plano + trazo atenuado de
+        // puntos (nunca bloques), y encima el contenido (letras o mensaje).
+        let trace_inner = top_area.inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let paint_ambient = |frame: &mut Frame| {
+            visualizer::render_backdrop(frame, top_area, visual, true);
+            if trace_inner.width > 0 && trace_inner.height > 0 {
+                visualizer::render_trace_subdued(frame, trace_inner, visual);
+            }
+        };
         match BandContent::resolve(mode, has_lyrics, state.synced_unavailable) {
             BandContent::Visual => {
                 visualizer::render(
@@ -218,12 +230,12 @@ pub fn render(
                 );
             }
             BandContent::Lyrics => {
-                visualizer::render_backdrop(frame, top_area, visual, true);
+                paint_ambient(frame);
                 let colors = visual.scene.palette.karaoke_colors();
                 render_karaoke_over_scene(frame, top_area, state, position, finished, colors);
             }
             BandContent::Unavailable => {
-                visualizer::render_backdrop(frame, top_area, visual, true);
+                paint_ambient(frame);
                 render_message_over_scene(
                     frame,
                     top_area,
@@ -232,7 +244,7 @@ pub fn render(
                 );
             }
             BandContent::Waiting => {
-                visualizer::render_backdrop(frame, top_area, visual, true);
+                paint_ambient(frame);
                 render_message_over_scene(
                     frame,
                     top_area,
@@ -699,6 +711,107 @@ mod tests {
         assert!(ratio(colors.current, bg) >= 4.5, "activa legible");
         assert!(ratio(colors.read, bg) >= 3.0, "leída legible");
         assert!(ratio(colors.unread, bg) >= 3.0, "no leída legible");
+    }
+
+    #[test]
+    fn loud_waveform_does_not_block_or_mottle_lyrics_band() {
+        // Con señal fuerte Y letras: la banda superior muestra el texto sobre
+        // un fondo plano del techo de contraste — sin puntos del trazo (que
+        // aquí no se pintan), sin bloques de espectro y sin moteado del glow
+        // por columna que se superponga a las letras.
+        use crate::analysis::WaveformEnvelope;
+        use crate::visualization::engine::{SceneState, WaveformView};
+
+        let samples: Vec<f32> = (0..2048)
+            .map(|i| 0.8 * ((i as f32 / 2048.0) * std::f32::consts::TAU * 6.0).sin())
+            .collect();
+        let env = WaveformEnvelope::from_window(&samples);
+        let palette = VisualPalette::fallback();
+        let visual = VisualState {
+            bars: [0.9; crate::visualization::VISUAL_BARS],
+            level: 0.9,
+            intensity: 0.9,
+            pulse: 0.5,
+            phase: 0.25,
+            active: true,
+            scene: SceneState {
+                waveform: WaveformView {
+                    left: env,
+                    right: env,
+                    gain: 1.0,
+                },
+                energy: 0.8,
+                brightness: 0.5,
+                palette,
+                active: true,
+            },
+        };
+        let sync = SyncLyrics::parse("[00:05] primera linea\n[00:10] segunda linea\n");
+        let mut state = RelatedState {
+            synced: Some(sync),
+            ..RelatedState::default()
+        };
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &mut state,
+                    Some(Duration::from_secs(7)),
+                    false,
+                    VisualContent::Auto,
+                    None,
+                    &visual,
+                    &None,
+                    &mut false,
+                    &std::collections::HashMap::new(),
+                    &Liked::default(),
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let profile = crate::ui::layout::TerminalProfile::from_rect(buf.area);
+        let band_h = crate::ui::layout::related_band_height(buf.area.height, profile);
+        assert!(band_h >= 5, "banda con sitio para letras en 60x16");
+
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            text.contains("primera linea"),
+            "la letra se ve con señal fuerte"
+        );
+
+        // Interior de la banda (sin bordes): letras + puntos atenuados del
+        // osciloscopio; nada de bloques de espectro ni moteado. El fondo es
+        // plano del techo en TODAS las celdas, también bajo el texto y los
+        // puntos (el trazo no toca el fondo).
+        const BLOCKS: [&str; 11] = ["█", "▇", "▆", "▅", "▄", "▃", "▂", "▁", "●", "░", "▒"];
+        let ceiling = palette.karaoke_bg_ceiling();
+        let expected = Color::Rgb(ceiling[0], ceiling[1], ceiling[2]);
+        let mut points = 0usize;
+        for y in 1..band_h.saturating_sub(1) {
+            for x in 1..59u16 {
+                let cell = buf.cell((x, y)).unwrap();
+                assert!(
+                    !BLOCKS.contains(&cell.symbol()),
+                    "sin bloques sobre las letras ({x},{y}={:?})",
+                    cell.symbol()
+                );
+                assert_eq!(
+                    cell.bg, expected,
+                    "fondo plano tras letras y puntos ({x},{y})"
+                );
+                if matches!(cell.symbol(), "•" | "*") {
+                    points += 1;
+                }
+            }
+        }
+        assert!(
+            points > 0,
+            "el osciloscopio sigue vivo tras las letras (puntos atenuados)"
+        );
     }
 
     #[test]
