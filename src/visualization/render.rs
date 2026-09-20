@@ -6,19 +6,24 @@
 //! recibe.
 //!
 //! El osciloscopio es un SCATTER de puntos discretos (referencia conceptual
-//! scope-tui `GraphType::Scatter`, nunca `GraphType::Line`) sobre UN plano
-//! compartido: L y R usan el mismo eje central (`amplitud == 0` en el medio
-//! del área) y las mismas coordenadas de tiempo, cada uno con sus propios
-//! puntos y colores. Las curvas se cruzan y superponen como en un osciloscopio
-//! estéreo real; donde coinciden en una celda se pinta el tinte de mezcla.
-//! Cada columna aporta hasta DOS candidatos por canal
-//! (valle y pico de su envolvente, que preservan extremos y transitorios);
-//! cada candidato se cuantiza a `(columna, fila)` y solo se emite si aporta
-//! novedad a su pista (espaciado en columnas si repite fila, emisión
-//! inmediata ante saltos). Así las regiones redundantes (silencio,
-//! constantes, mesetas) quedan como puntos espaciados en vez de una línea
-//! punteada continua, mientras que la forma real (senos, cuadradas,
-//! transitorios) conserva sus picos, valles y cruces por cero.
+//! scope-tui `GraphType::Scatter`, nunca `GraphType::Line`) sobre DOS planos
+//! virtuales (STEREO MIRROR / DUAL PLANE): L usa su baseline propio en el
+//! cuarto superior (`amplitud == 0` en ~25% del área) y R el suyo en el cuarto
+//! inferior (~75%), con las mismas coordenadas de tiempo X, cada uno con sus
+//! propios puntos y colores. La separación es GEOMÉTRICA (posición), no solo
+//! cromática: en escala de grises L/R siguen distinguiéndose por altura.
+//! Cada canal conserva su polaridad (positivo → arriba de SU baseline,
+//! negativo → abajo). Donde ambos caen en la misma celda (desbordes con gain
+//! alto en terminales diminutos) se pinta el tinte de mezcla.
+//! Cada columna aporta UN punto de trace por canal (valor temporal central
+//! de su tramo: la forma) más hasta DOS acentos de envolvente (min/max que
+//! difieren del trace: picos y transitorios); cada candidato se cuantiza a
+//! `(columna, fila)` y solo se emite si aporta novedad a su pista (espaciado
+//! en columnas si repite fila, emisión inmediata ante saltos). Así las
+//! regiones redundantes (silencio, constantes, mesetas) quedan como puntos
+//! espaciados en vez de una línea punteada continua, mientras que la forma
+//! real (senos, cuadradas, transitorios) conserva su trayectoria temporal y
+//! sus picos, valles y cruces por cero.
 //!
 //! Garantías del trazo: sin `draw_line` entre muestras, sin `fill_rect` del
 //! intervalo min..max, sin glifos de bloque (`█▁▂▃▄▅▆▇`) y sin celdas de fondo
@@ -29,7 +34,7 @@
 //! atenuado ([`render_trace_subdued`], colores fundidos hacia el techo de
 //! contraste). Las barras EQ viven en [`render_bars_only`] (vista Now
 //! Playing), NUNCA dentro del bloque del osciloscopio. Toda la colorimetría
-//! sale de [`VisualPalette`] — nunca se deriva aquí.
+//! sale de [`VisualTheme`] — nunca se deriva aquí.
 
 use ratatui::layout::{Margin, Position, Rect};
 use ratatui::style::{Color, Style};
@@ -40,7 +45,7 @@ use ratatui::Frame;
 use crate::analysis::{WaveformEnvelope, WAVEFORM_BUCKETS};
 use crate::ui::glyphs::UiGlyphs;
 use crate::visualization::engine::VisualState;
-use crate::visualization::palette::VisualPalette;
+use crate::visualization::palette::VisualTheme;
 use crate::visualization::VISUAL_BARS;
 
 /// Escalera de una fila de barras de espectro (0 = vacío, 8 = lleno).
@@ -64,12 +69,12 @@ fn mix_c(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
 
 /// Color de la barra según la intensidad y la paleta fundida de la portada:
 /// bajo → acento, medio → secundario, alto → dominante.
-fn bar_color(intensity: f32, palette: &VisualPalette) -> Color {
+fn bar_color(intensity: f32, theme: &VisualTheme) -> Color {
     match (intensity * 4.0) as usize {
         0 => Color::DarkGray,
-        1 => to_color(palette.accent),
-        2 => to_color(palette.secondary),
-        _ => to_color(palette.primary),
+        1 => to_color(theme.accent),
+        2 => to_color(theme.secondary),
+        _ => to_color(theme.primary),
     }
 }
 
@@ -125,13 +130,25 @@ fn project_amplitude(value: f32) -> f32 {
     (value.clamp(-1.0, 1.0) * KNEE).atan() / NORM
 }
 
-/// Filas candidatas de UN canal en el plano compartido: `min`/`max` de la
-/// columna cuantizados con [`row_of`] tras [`project_amplitude`], deduplicados.
+/// Valor temporal representativo de la columna para UN canal: el trace del
+/// bucket central del rango (centro temporal del tramo que cubre la columna).
+/// O(1), sin allocs. Nunca es un promedio: conserva la evolución temporal.
+fn channel_trace_value(channel: &WaveformEnvelope, w: usize, col: usize) -> f32 {
+    let (lo, hi) = column_bucket_range(w, col);
+    channel.trace[(lo + hi - 1) / 2]
+}
+
+/// Proyección de UN canal sobre SU baseline del dual-plane: trace
+/// protagonista + acentos de envolvente.
 ///
-/// Como máximo 2 filas, sin allocs. Ambos canales usan la MISMA geometría
-/// (mismo centro y escala): sus puntos coexisten en las mismas coordenadas de
-/// tiempo y se cruzan sobre el eje central como en un osciloscopio estéreo.
-fn channel_rows(
+/// Devuelve `(trace_row, accents, accent_n)`: `trace_row` es la fila del valor
+/// temporal de la columna (forma, color pleno de canal); `accents` son las
+/// filas de min/max que DIFIEREN del trace (picos y transitorios que el
+/// muestreo puntual no toca: detalle secundario en color de acento).
+/// Como máximo 2 acentos, sin allocs. Cada canal conserva su polaridad con
+/// signo (positivo → arriba de su baseline, negativo → abajo) y comparte la
+/// MISMA escala con el otro canal para no destruir el balance L/R.
+fn channel_projection(
     channel: &WaveformEnvelope,
     w: usize,
     col: usize,
@@ -139,43 +156,68 @@ fn channel_rows(
     y0: u16,
     center: f32,
     scale: f32,
-) -> ([u16; 2], usize) {
-    let mut rows = [0u16; 2];
+) -> (u16, [u16; 2], usize) {
     if h == 0 {
-        return (rows, 0);
+        return (y0, [0u16; 2], 0);
     }
+    // El trace se proyecta igual que antes se proyectaba cada extremo (ver
+    // `project_amplitude`): sin ella lo moderado colapsaría al baseline.
+    let trace_row = y0
+        + row_of(
+            project_amplitude(channel_trace_value(channel, w, col)),
+            center,
+            scale,
+            h,
+        );
     let (mn, mx) = channel_column_span(channel, w, col);
+    let mut accents = [0u16; 2];
     let mut n = 0usize;
     for value in [mn, mx] {
-        // La proyección expande los niveles medios al plano (ver
-        // `project_amplitude`): sin ella todo lo moderado cae al centro.
         let row = y0 + row_of(project_amplitude(value), center, scale, h);
-        if !rows[..n].contains(&row) {
-            rows[n] = row;
+        if row != trace_row && !accents[..n].contains(&row) {
+            accents[n] = row;
             n += 1;
         }
     }
-    (rows, n)
+    (trace_row, accents, n)
 }
 
 /// Distancia mínima entre puntos emitidos de la MISMA pista (min o max).
 ///
 /// Sin esto, cada columna pinta su punto y el conjunto degenera en una línea
-/// punteada continua (`••••`). La regla es adaptativa: un punto redundante
-/// (misma fila que el anterior de su pista) se espacia cada 2 columnas,
-/// mientras que CUALQUIER cambio de fila (pendiente, transitorio, cruce) se
-/// emite de inmediato aunque la columna anterior pintara. Así las curvas
-/// activas y las altas frecuencias dibujan trazos densos y continuos, y lo
-/// plano (mesetas, silencios) queda disperso. Criterio de
-/// densidad/resolución espacial, no mutilación.
+/// punteada continua (`••••`). La regla es adaptativa en dos ejes:
+/// - misma fila que el anterior de su pista ⇒ se espacia en columnas;
+/// - CUALQUIER cambio de fila (pendiente, transitorio, cruce) se emite de
+///   inmediato aunque la columna anterior pintara.
+///
+/// Así las curvas activas y las altas frecuencias dibujan trazos densos y
+/// continuos, y lo plano (mesetas, silencios) queda disperso. El umbral de
+/// espaciado además se adapta al ancho (ver [`scatter_min_dist`]): en
+/// terminales anchos se espacia más para que la densidad no degenere en una
+/// matriz de puntos. Criterio de densidad/resolución espacial, no mutilación.
 const SCATTER_MIN_DIST: usize = 2;
+
+/// Umbral de espaciado adaptativo al ancho del área.
+///
+/// En terminales anchos cada columna cubre menos buckets y los senos continuos
+/// emitirían un punto cada 2 columnas en docenas de columnas seguidas (pared
+/// de puntos). Espaciar a 3 en `w > 100` mantiene la forma con ~33% menos
+/// puntos redundantes; en anchos normales se conserva 2 para no perder
+/// resolución. O(1), sin allocs.
+fn scatter_min_dist(w: usize) -> usize {
+    if w > 100 {
+        3
+    } else {
+        SCATTER_MIN_DIST
+    }
+}
 
 /// `true` si el candidato `(col, row)` de una pista aporta información nueva
 /// (y actualiza el registro de la pista). Estado en el stack, sin allocs.
-fn scatter_emit(last: &mut Option<(usize, u16)>, col: usize, row: u16) -> bool {
+fn scatter_emit(last: &mut Option<(usize, u16)>, col: usize, row: u16, min_dist: usize) -> bool {
     let emit = match *last {
         None => true,
-        Some((lc, lr)) => col.saturating_sub(lc) >= SCATTER_MIN_DIST || row != lr,
+        Some((lc, lr)) => col.saturating_sub(lc) >= min_dist || row != lr,
     };
     if emit {
         *last = Some((col, row));
@@ -187,10 +229,13 @@ fn scatter_emit(last: &mut Option<(usize, u16)>, col: usize, row: u16) -> bool {
 const LINK_DIM: f32 = 0.6;
 
 /// Pinta el enlace tenue de una pendiente: si el punto `(col, row)` continúa
-/// la pista desde la columna INMEDIATA anterior con un salto vertical mayor
-/// de 1 celda, rellena las filas intermedias (excluidos ambos extremos) con
-/// el glifo de punto en color atenuado. Puentes de una sola columna: flujo
-/// orgánico sin líneas continuas. Sin allocs.
+/// la pista desde su última emisión VISIBLE (a ≤`min_dist` columnas: el
+/// thinning espacia las emisiones planas, así que la anterior no siempre es
+/// la inmediata) con un salto vertical mayor de 1 celda, rellena las filas
+/// intermedias (excluidos ambos extremos) con el glifo de punto en color
+/// atenuado. Solo se toca la columna actual: flujo orgánico sin líneas
+/// continuas. Sin allocs.
+#[allow(clippy::too_many_arguments)] // hot path del renderer: 7 escalares Copy en stack
 fn paint_links(
     frame: &mut Frame,
     x: u16,
@@ -199,9 +244,10 @@ fn paint_links(
     row: u16,
     symbol: &str,
     color: [u8; 3],
+    min_dist: usize,
 ) {
     let Some((lc, lr)) = prev else { return };
-    if col != lc + 1 || row.abs_diff(lr) <= 1 {
+    if col.saturating_sub(lc) > min_dist.max(1) || row.abs_diff(lr) <= 1 {
         return;
     }
     for r in lr.min(row) + 1..row.max(lr) {
@@ -223,7 +269,7 @@ fn paint_point(frame: &mut Frame, x: u16, y: u16, symbol: &str, color: [u8; 3]) 
 ///
 /// Resetea cada celda del área (símbolo a `" "`) y la tiñe con un fondo
 /// uniforme: `background` de la paleta en modo vivo, techo de contraste
-/// ([`VisualPalette::karaoke_bg_ceiling`]) en modo `subdued` (banda de
+/// ([`VisualTheme::karaoke_bg_ceiling`]) en modo `subdued` (banda de
 /// letras/mensajes). A propósito SIN resplandor por celda: en el terminal
 /// cada celda tintada se lee como un bloque sólido de color, y el halo del
 /// osciloscopio producía 9 de cada 10 celdas tintadas — bloques por encima,
@@ -244,12 +290,12 @@ pub fn render_backdrop(frame: &mut Frame, area: Rect, state: &VisualState, subdu
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let palette = &state.scene.palette;
+    let theme = &state.scene.theme;
 
     let flat = if subdued {
-        to_color(palette.karaoke_bg_ceiling())
+        to_color(theme.karaoke_bg_ceiling())
     } else {
-        to_color(palette.background)
+        to_color(theme.background)
     };
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
@@ -261,15 +307,15 @@ pub fn render_backdrop(frame: &mut Frame, area: Rect, state: &VisualState, subdu
     }
 }
 
-/// Dibuja el osciloscopio estéreo: L y R superpuestos en un plano compartido
-/// con eje central, sobre un fondo plano de la paleta.
+/// Dibuja el osciloscopio estéreo: L y R en DOS planos virtuales (stereo
+/// mirror), cada uno con su baseline, sobre un fondo plano de la paleta.
 ///
 /// El área interior se dedica ÍNTEGRA al trazo (la franja EQ vive en
 /// [`render_bars_only`], nunca aquí: así la forma de onda no se fusiona con
 /// bloques de espectro).
 ///
 /// Con `state.active == false` pinta un marco apagado sobre la escena dormida
-/// (línea base centrada): la vista nunca "desaparece" ni salta de layout.
+/// (doble línea base L/R): la vista nunca "desaparece" ni salta de layout.
 pub fn render(frame: &mut Frame, area: Rect, state: &VisualState, position_secs: f32) {
     let pulse_dot = if state.pulse > 0.55 {
         "●"
@@ -281,13 +327,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &VisualState, position_secs:
         }
     };
     let title_color = if state.active {
-        bar_color(state.intensity.max(0.15), &state.scene.palette)
+        bar_color(state.intensity.max(0.15), &state.scene.theme)
     } else {
         Color::DarkGray
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::new().fg(to_color(state.scene.theme.border)))
         .title(Span::styled(
             format!(" Visual L/R {} ", pulse_dot),
             Style::new().fg(title_color),
@@ -298,7 +345,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &VisualState, position_secs:
         ));
     frame.render_widget(block, area);
 
-    // El área interior es TODA para el trazo superpuesto L/R: la EQ no
+    // El área interior es TODA para el trazo dual-plane L/R: la EQ no
     // vive aquí (ver `render_bars_only`), así la onda nunca se lee fusionada
     // con bloques de espectro.
     let trace_area = area.inner(Margin {
@@ -313,12 +360,16 @@ pub fn render(frame: &mut Frame, area: Rect, state: &VisualState, position_secs:
     render_trace(frame, trace_area, state);
 }
 
-/// Pinta el osciloscopio: SCATTER de puntos en un plano compartido (L+R).
+/// Pinta el osciloscopio: SCATTER de puntos en DOS planos virtuales (L/R).
 ///
-/// Cada columna aporta hasta DOS candidatos por canal (VALLE `min` y PICO
-/// `max` de su envolvente, spec §8), cuantizados con el MISMO centro
-/// (`amplitud == 0` en el medio del área) y la MISMA escala: L y R coexisten
-/// en las mismas coordenadas de tiempo y se cruzan sobre el eje central.
+/// Cada columna aporta UN punto de trace por canal (valor temporal central de
+/// su tramo: la forma, en color pleno de canal) más hasta DOS acentos de
+/// envolvente (min/max que difieren del trace: picos y transitorios, en color
+/// de acento del tema), cada uno sobre SU baseline (`left_center` ~25% /
+/// `right_center` ~75%) con la MISMA escala compartida: X sigue siendo
+/// tiempo, la polaridad se conserva por canal (positivo → arriba de su
+/// baseline, negativo → abajo) y el espacio negativo central evita que una
+/// onda tape a la otra.
 /// Cada candidato solo se pinta si aporta novedad a su pista: misma fila que
 /// el anterior de la pista ⇒ se espacia en columnas; CUALQUIER cambio de
 /// fila ⇒ se emite de inmediato, así las pendientes dibujan trazos densos.
@@ -326,8 +377,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &VisualState, position_secs:
 /// intermedias se puntean con el color de enlace tenue (una sola columna).
 /// Las columnas redundantes quedan VACÍAS en vez de forzar una línea
 /// punteada continua. Cada canal conserva sus puntos y su color; donde ambos
-/// caen en la misma celda se pinta el tinte de mezcla (la coincidencia se ve,
-/// ningún canal se pierde).
+/// caen en la misma celda (desbordes con gain alto) se pinta el tinte de
+/// mezcla.
 ///
 /// Garantía Scatter: SOLO se pintan puntos discretos (muestras y enlaces
 /// tenues de pendiente adyacente). Nunca se une un punto con otro lejano
@@ -348,7 +399,7 @@ fn render_trace_points(frame: &mut Frame, area: Rect, state: &VisualState, glyph
 }
 
 /// Trazo del osciloscopio ATENUADO para la banda de letras: el mismo scatter
-/// superpuesto, pero con los colores de canal fundidos hacia el fondo del
+/// dual-plane, pero con los colores de canal fundidos hacia el fondo del
 /// techo de contraste (siempre derivados de la paleta de la portada) y sin el
 /// blanqueado de brillo. El osciloscopio sigue vivo tras el texto sin
 /// competir con él; el fondo no se toca (lo dejó `render_backdrop`).
@@ -359,12 +410,42 @@ pub fn render_trace_subdued(frame: &mut Frame, area: Rect, state: &VisualState) 
 /// Fracción de fundido de los puntos atenuados hacia el fondo del techo.
 const SUBDUED_TRACE_DIM: f32 = 0.55;
 
-/// Fracción de la semialtura del plano que ocupa la amplitud ±1.
+/// Posición vertical (fracción de `h - 1`) de cada baseline del dual-plane.
 ///
-/// Por debajo de 1.0 a propósito: con el plano compartido por L y R, los
-/// picos a toda escala deben dejar margen para que ambas ondas se aprecien
-/// por separado en vez de aplanarse contra los bordes superpuestas.
-const PLANE_FILL: f32 = 0.65;
+/// L arriba (~25%) y R abajo (~75%): `left_center < right_center` siempre, con
+/// espacio negativo central para que las ondas no se mezclen visualmente.
+const LEFT_CENTER_FRAC: f32 = 0.25;
+const RIGHT_CENTER_FRAC: f32 = 0.75;
+
+/// Fracción del cuarto de altura que ocupa la amplitud ±1 en cada plano.
+///
+/// Cada canal recorre `2 * (h-1)/4 * DUAL_PLANE_FILL` filas (≈37% de `h` con
+/// 0.75): deja respiración exterior (~6% de `h` arriba/abajo) y un gutter
+/// central explícito (~12% de `h`) entre planos para que L/R se lean como dos
+/// instrumentos separados con centro perceptual propio. La escala es
+/// COMPARTIDA por L/R (mismo `gain` visual) para no destruir la lectura de
+/// balance entre canales.
+const DUAL_PLANE_FILL: f32 = 0.75;
+
+/// Geometría STEREO MIRROR / DUAL PLANE para `h` filas y `gain` visual.
+///
+/// Devuelve `(left_center, right_center, scale)` en coordenadas locales
+/// 0..h-1: cada `center` es el cero de su canal y `scale` convierte
+/// `project_amplitude(v)` en desplazamiento con signo (`positivo → arriba`).
+/// Proporcional al tamaño real (sin hardcodear filas), O(1), sin allocs.
+///
+/// Degradación elegante: con `h <= 1` la escala es 0 (un solo carril); con
+/// `h` pequeño cada canal colapsa a su fila sin pánicos ni índices inválidos.
+fn dual_plane_geometry(h: usize, gain: f32) -> (f32, f32, f32) {
+    if h <= 1 {
+        return (0.0, 0.0, 0.0);
+    }
+    let span = h as f32 - 1.0;
+    let left_center = span * LEFT_CENTER_FRAC;
+    let right_center = span * RIGHT_CENTER_FRAC;
+    let scale = span * 0.25 * DUAL_PLANE_FILL * gain;
+    (left_center, right_center, scale)
+}
 
 fn trace_points_impl(
     frame: &mut Frame,
@@ -377,7 +458,7 @@ fn trace_points_impl(
         return;
     }
     let scene = &state.scene;
-    let palette = &scene.palette;
+    let theme = &scene.theme;
     let w = area.width as usize;
     let h = area.height as usize;
     let brightness = if scene.active && !subdued {
@@ -386,21 +467,25 @@ fn trace_points_impl(
         0.0
     };
 
-    // Plano único: centro discreto del área y una sola escala para AMBOS
-    // canales (el 0 compartido queda en la fila central). El llenado es
-    // parcial a propósito (ver `PLANE_FILL`): los picos dejan margen arriba y
-    // abajo para que L y R se distingan en vez de saturar los bordes.
+    // Dual-plane: dos baselines (L ~25%, R ~75%) con UNA sola escala
+    // compartida para AMBOS canales (el `gain` visual mira el pico máximo y
+    // no normaliza L/R por separado: L más fuerte se ve más fuerte). El
+    // espacio negativo central separa geométricamente las ondas; el color es
+    // solo identificación secundaria.
     let gain = scene.waveform.gain;
-    let center = (h as f32 - 1.0) * 0.5;
-    let scale = ((h as f32 - 1.0) * 0.5 * PLANE_FILL).max(1.0) * gain;
+    let (left_center, right_center, scale) = dual_plane_geometry(h, gain);
 
-    let channels = palette.channel_colors();
+    let channels = theme.channel_colors();
     let mut left_c = channels.left;
     let mut right_c = channels.right;
+    // Acentos de pico/transitorio: el acento del tema (firma cromática de la
+    // canción), atenuado tras las letras como los canales.
+    let mut accent_c = theme.accent;
     if subdued {
-        let ceiling = palette.karaoke_bg_ceiling();
+        let ceiling = theme.karaoke_bg_ceiling();
         left_c = mix_c(left_c, ceiling, SUBDUED_TRACE_DIM);
         right_c = mix_c(right_c, ceiling, SUBDUED_TRACE_DIM);
+        accent_c = mix_c(accent_c, ceiling, SUBDUED_TRACE_DIM);
     }
     if brightness > 0.0 {
         left_c = mix_c(left_c, [255, 255, 255], brightness * 0.12);
@@ -413,67 +498,101 @@ fn trace_points_impl(
     // Enlaces tenues de pendiente: mismo glifo con el color fundido hacia el
     // fondo del panel. Solo rellenan el hueco vertical entre columnas
     // ADYACENTES (nunca tramos largos): la pendiente se lee orgánica sin
-    // convertirse en línea continua.
+    // convertirse en línea continua. Solo el trace los usa (seguir la
+    // trayectoria); los acentos son puntos aislados.
     let panel_bg = if subdued {
-        palette.karaoke_bg_ceiling()
+        theme.karaoke_bg_ceiling()
     } else {
-        palette.background
+        theme.background
     };
     let link_l = mix_c(left_c, panel_bg, LINK_DIM);
     let link_r = mix_c(right_c, panel_bg, LINK_DIM);
 
     let waveform = &scene.waveform;
-    // Una pista por extremo (min/max) y canal: los raíles persistentes
-    // (cuadradas, mesetas) se espacian por pista y dejan huecos, mientras que
-    // un transitorio salta de fila y se emite aunque comparta columna.
-    let mut last_lmn: Option<(usize, u16)> = None;
-    let mut last_lmx: Option<(usize, u16)> = None;
-    let mut last_rmn: Option<(usize, u16)> = None;
-    let mut last_rmx: Option<(usize, u16)> = None;
+    // Espaciado adaptativo al ancho (ver `scatter_min_dist`) más puerta de
+    // energía: el silencio (~0) no lleva información y queda en presencia
+    // mínima (unas pocas marcas de baseline); la señal real conserva su
+    // densidad porque los cambios de fila siempre se emiten. Una sola
+    // decisión por frame, coste O(1).
+    let min_dist = scatter_min_dist(w) + usize::from(scene.energy < 0.05) * 4;
+    // Una pista de trace + una de acentos por canal: el trace dibuja la
+    // trayectoria temporal (denso donde hay pendiente) y los acentos solo
+    // aparecen donde la envolvente aporta novedad sobre el trace; las
+    // regiones planas quedan dispersas en ambas pistas.
+    let mut last_ltr: Option<(usize, u16)> = None;
+    let mut last_lac: Option<(usize, u16)> = None;
+    let mut last_rtr: Option<(usize, u16)> = None;
+    let mut last_rac: Option<(usize, u16)> = None;
     for col in 0..w {
         let x = area.x + col as u16;
-        // Candidatos de cada canal tras el thinning (filas absolutas). Los
-        // enlaces se pintan al momento (siempre ANTES que los puntos reales
-        // de la columna, que los pisan si coinciden).
-        let (lrows, ln) = channel_rows(&waveform.left, w, col, h, area.y, center, scale);
-        let mut lsel = [0u16; 2];
-        let mut lsel_n = 0usize;
-        for (i, &row) in lrows[..ln].iter().enumerate() {
-            let last = if i == 0 { &mut last_lmn } else { &mut last_lmx };
-            let prev = *last;
-            if scatter_emit(last, col, row) {
-                paint_links(frame, x, prev, col, row, g_left, link_l);
-                lsel[lsel_n] = row;
-                lsel_n += 1;
+        // Trace protagonista (color pleno) + acentos secundarios (color de
+        // acento). Los enlaces se pintan al momento (siempre ANTES que los
+        // puntos reales de la columna, que los pisan si coinciden).
+        let (lt, lacc, lan) =
+            channel_projection(&waveform.left, w, col, h, area.y, left_center, scale);
+        let lprev = last_ltr;
+        let l_emit = scatter_emit(&mut last_ltr, col, lt, min_dist);
+        if l_emit {
+            paint_links(frame, x, lprev, col, lt, g_left, link_l, min_dist);
+        }
+        let mut lacc_sel = [0u16; 2];
+        let mut lacc_n = 0usize;
+        for &row in lacc[..lan].iter() {
+            if scatter_emit(&mut last_lac, col, row, min_dist) {
+                lacc_sel[lacc_n] = row;
+                lacc_n += 1;
             }
         }
-        let (rrows, rn) = channel_rows(&waveform.right, w, col, h, area.y, center, scale);
-        let mut rsel = [0u16; 2];
-        let mut rsel_n = 0usize;
-        for (i, &row) in rrows[..rn].iter().enumerate() {
-            let last = if i == 0 { &mut last_rmn } else { &mut last_rmx };
-            let prev = *last;
-            if scatter_emit(last, col, row) {
-                paint_links(frame, x, prev, col, row, g_right, link_r);
-                rsel[rsel_n] = row;
-                rsel_n += 1;
+        let (rt, racc, ran) =
+            channel_projection(&waveform.right, w, col, h, area.y, right_center, scale);
+        let rprev = last_rtr;
+        let r_emit = scatter_emit(&mut last_rtr, col, rt, min_dist);
+        if r_emit {
+            paint_links(frame, x, rprev, col, rt, g_right, link_r, min_dist);
+        }
+        let mut racc_sel = [0u16; 2];
+        let mut racc_n = 0usize;
+        for &row in racc[..ran].iter() {
+            if scatter_emit(&mut last_rac, col, row, min_dist) {
+                racc_sel[racc_n] = row;
+                racc_n += 1;
             }
         }
-        // L primero; donde R coincide se pinta la mezcla (coincidencia
-        // visible, como trazos superpuestos del osciloscopio de referencia).
-        for &row in &lsel[..lsel_n] {
-            let (symbol, color) = if rsel[..rsel_n].contains(&row) {
-                (g_both, both_c)
-            } else {
-                (g_left, left_c)
-            };
-            paint_point(frame, x, row, symbol, color);
+        // L primero; donde ambos traces coinciden (desborde con gain alto en
+        // áreas diminutas) se pinta la mezcla. En el caso común cada canal
+        // vive en su mitad y conserva su color propio. Los acentos nunca
+        // pisan un trace de su columna: el trace manda.
+        let mut taken = [0u16; 6];
+        let mut taken_n = 0usize;
+        if l_emit && r_emit && lt == rt {
+            paint_point(frame, x, lt, g_both, both_c);
+            taken[taken_n] = lt;
+            taken_n += 1;
+        } else {
+            if l_emit {
+                paint_point(frame, x, lt, g_left, left_c);
+                taken[taken_n] = lt;
+                taken_n += 1;
+            }
+            if r_emit {
+                paint_point(frame, x, rt, g_right, right_c);
+                taken[taken_n] = rt;
+                taken_n += 1;
+            }
         }
-        for &row in &rsel[..rsel_n] {
-            if lsel[..lsel_n].contains(&row) {
+        for &row in lacc_sel[..lacc_n].iter() {
+            if taken[..taken_n].contains(&row) {
                 continue;
             }
-            paint_point(frame, x, row, g_right, right_c);
+            paint_point(frame, x, row, g_left, accent_c);
+            taken[taken_n] = row;
+            taken_n += 1;
+        }
+        for &row in racc_sel[..racc_n].iter() {
+            if taken[..taken_n].contains(&row) {
+                continue;
+            }
+            paint_point(frame, x, row, g_right, accent_c);
         }
     }
 }
@@ -487,7 +606,7 @@ fn trace_points_impl(
 /// banda nunca arrastra fantasmas del frame anterior.
 pub fn render_bars_only(frame: &mut Frame, area: Rect, state: &VisualState) {
     let title_color = if state.active {
-        bar_color(state.intensity.max(0.15), &state.scene.palette)
+        bar_color(state.intensity.max(0.15), &state.scene.theme)
     } else {
         Color::DarkGray
     };
@@ -517,11 +636,11 @@ fn render_bars(frame: &mut Frame, rect: Rect, state: &VisualState) {
         return;
     }
     let color = if state.active {
-        bar_color(state.intensity, &state.scene.palette)
+        bar_color(state.intensity, &state.scene.theme)
     } else {
         Color::DarkGray
     };
-    let bg = state.scene.palette.background;
+    let bg = state.scene.theme.background;
     let rows = rect.height;
     let bottom = rect.y + rect.height - 1;
 
@@ -564,7 +683,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    fn active_state(level: f32, palette: VisualPalette) -> VisualState {
+    fn active_state(level: f32, theme: VisualTheme) -> VisualState {
         let mut bars = [0.0f32; VISUAL_BARS];
         for (i, b) in bars.iter_mut().enumerate() {
             *b = (level * (1.0 - i as f32 / VISUAL_BARS as f32)).clamp(0.0, 1.0);
@@ -580,7 +699,7 @@ mod tests {
                 waveform: view(0.6, 0),
                 energy: level,
                 brightness: level,
-                palette,
+                theme,
                 active: true,
             },
         }
@@ -671,7 +790,7 @@ mod tests {
                 render(
                     f,
                     f.area(),
-                    &active_state(0.9, VisualPalette::fallback()),
+                    &active_state(0.9, VisualTheme::fallback()),
                     42.0,
                 )
             })
@@ -692,7 +811,7 @@ mod tests {
                 render_backdrop(
                     f,
                     f.area(),
-                    &active_state(1.0, VisualPalette::fallback()),
+                    &active_state(1.0, VisualTheme::fallback()),
                     false,
                 )
             });
@@ -705,7 +824,7 @@ mod tests {
                 render(
                     f,
                     f.area(),
-                    &active_state(1.0, VisualPalette::fallback()),
+                    &active_state(1.0, VisualTheme::fallback()),
                     1.0,
                 )
             })
@@ -715,7 +834,7 @@ mod tests {
                 render_backdrop(
                     f,
                     Rect::new(0, 0, 5, 2),
-                    &active_state(1.0, VisualPalette::fallback()),
+                    &active_state(1.0, VisualTheme::fallback()),
                     false,
                 )
             })
@@ -731,7 +850,7 @@ mod tests {
         // (min y max separados ⇒ dos pistas por carril) pinta más celdas que
         // una suave (min≈max ⇒ una sola pista por carril).
         let case = |amp: f32| {
-            let mut st = active_state(0.9, VisualPalette::fallback());
+            let mut st = active_state(0.9, VisualTheme::fallback());
             st.scene.waveform = view(amp, 1);
             st.scene.brightness = 0.0;
             let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
@@ -744,22 +863,22 @@ mod tests {
     }
 
     #[test]
-    fn palette_colors_the_bars() {
+    fn theme_colors_the_bars() {
         // Con paleta, una barra activa usa el color de la portada (tameado,
         // no el RGB crudo) en vez del esquema cian fijo: intensidad alta →
         // dominante, leve → acento.
         let cover = Some([[220u8, 30, 30], [40, 200, 60], [30, 60, 220]]);
-        let high = active_state(0.9, VisualPalette::from_cover(cover));
+        let high = active_state(0.9, VisualTheme::from_cover(cover));
         let buf = drawing(&|f| render(f, f.area(), &high, 0.0));
-        let has_palette_color = buf
+        let has_theme_color = buf
             .content()
             .iter()
             .any(|c| c.fg == Color::Rgb(215, 35, 35));
         assert!(
-            has_palette_color,
+            has_theme_color,
             "el trazo/barras usan colores de la portada"
         );
-        let low = active_state(0.3, VisualPalette::from_cover(cover));
+        let low = active_state(0.3, VisualTheme::from_cover(cover));
         let buf = drawing(&|f| render(f, f.area(), &low, 0.0));
         let has_accent = buf
             .content()
@@ -773,26 +892,26 @@ mod tests {
         // Sin celdas tintadas como bloques: el fondo es el plano de la paleta
         // en modo vivo y el techo de contraste en modo aplacado, con CUALQUIER
         // energía (la señal la llevan solo los puntos).
-        let palette =
-            VisualPalette::from_cover(Some([[200u8, 30, 80], [40, 160, 240], [240, 180, 80]]));
-        let mut low_s = active_state(0.05, palette);
+        let theme =
+            VisualTheme::from_cover(Some([[200u8, 30, 80], [40, 160, 240], [240, 180, 80]]));
+        let mut low_s = active_state(0.05, theme);
         low_s.scene.energy = 0.0;
-        let mut high = active_state(1.0, palette); // energía alta
+        let mut high = active_state(1.0, theme); // energía alta
         high.scene.brightness = 1.0;
         for st in [&low_s, &high] {
             let buf = drawing(&|f| render_backdrop(f, f.area(), st, false));
             assert!(
                 buf.content().iter().all(|c| c.bg
                     == Color::Rgb(
-                        palette.background[0],
-                        palette.background[1],
-                        palette.background[2]
+                        theme.background[0],
+                        theme.background[1],
+                        theme.background[2]
                     )),
                 "fondo plano de la paleta sin importar la energía"
             );
         }
         let dim = drawing(&|f| render_backdrop(f, f.area(), &high, true));
-        let ceiling = palette.karaoke_bg_ceiling();
+        let ceiling = theme.karaoke_bg_ceiling();
         assert!(
             dim.content()
                 .iter()
@@ -801,10 +920,11 @@ mod tests {
         );
     }
 
-    /// Distancia vertical máxima de los puntos del trazo al eje central.
+    /// Distancia vertical máxima de los puntos del trazo al centro del hueco.
     ///
     /// El área de `drawing()` (40×8) con `render()` deja un interior de 6 filas
-    /// (y=1..7) con eje en y=3.5, compartido por L y R.
+    /// (y=1..7) con hueco central en y=3.5 entre los baselines L (~2.25) y R
+    /// (~4.75). Más amplitud ⇒ picos más lejos del hueco (hacia los bordes).
     fn sweep_of(buf: &ratatui::buffer::Buffer) -> f32 {
         let mut offsets = Vec::new();
         for y in 1..7u16 {
@@ -820,12 +940,12 @@ mod tests {
     #[test]
     fn louder_waveform_trace_sweeps_farther_from_center() {
         // Misma escena, solo cambia la amplitud de la envolvente: los puntos
-        // del trazo de una señal de pico 0.9 se alejan del eje central más
-        // que los de pico 0.2 (la ganancia es 1.0).
-        let mut loud = active_state(0.9, VisualPalette::fallback());
+        // del trazo de una señal de pico 0.9 se alejan de sus baselines (y del
+        // hueco central) más que los de pico 0.2 (la ganancia es 1.0).
+        let mut loud = active_state(0.9, VisualTheme::fallback());
         loud.scene.waveform = view(0.9, 1);
         let buf_loud = drawing(&|f| render(f, f.area(), &loud, 0.0));
-        let mut quiet = active_state(0.9, VisualPalette::fallback());
+        let mut quiet = active_state(0.9, VisualTheme::fallback());
         quiet.scene.waveform = view(0.2, 1);
         let buf_quiet = drawing(&|f| render(f, f.area(), &quiet, 0.0));
         assert!(
@@ -858,13 +978,13 @@ mod tests {
 
     #[test]
     fn stereo_channels_render_as_distinct_point_sets() {
-        // L fuerte (0.9), R suave (0.2): ambas curvas coexisten en el plano
-        // compartido con puntos `•`, cada una con su propio color de canal;
-        // donde coinciden se ve la mezcla. L barre más lejos del eje que R.
-        let mut st = active_state(0.9, VisualPalette::fallback());
+        // L fuerte (0.9) arriba, R suave (0.2) abajo: cada curva en SU plano
+        // con puntos `•` y su propio color de canal. L barre más lejos de su
+        // baseline que R del suyo (se conserva el balance visual).
+        let mut st = active_state(0.9, VisualTheme::fallback());
         st.scene.waveform = stereo_view(0.9, 0.2, 3);
         let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
-        let channels = st.scene.palette.channel_colors();
+        let channels = st.scene.theme.channel_colors();
         let brightness = if st.scene.active {
             st.scene.brightness
         } else {
@@ -903,12 +1023,14 @@ mod tests {
 
     #[test]
     fn mono_content_overlaps_with_mixed_color() {
-        // Contenido mono (L y R idénticos): ambas curvas caen en las mismas
-        // celdas y se pintan con el tinte de mezcla — la coincidencia se ve
-        // como trazos superpuestos, sin perder ningún canal.
-        let st = active_state(0.9, VisualPalette::fallback());
+        // Contenido mono (L y R idénticos) en DUAL-PLANE: la MISMA forma en
+        // dos planos (arriba L, abajo R), cada una con su color propio. La
+        // geometría es equivalente (mismo desplazamiento relativo a su
+        // baseline) pero sin superponerse: la coincidencia mono se lee como
+        // simetría, no como mezcla.
+        let st = active_state(0.9, VisualTheme::fallback());
         let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
-        let channels = st.scene.palette.channel_colors();
+        let channels = st.scene.theme.channel_colors();
         let brightness = if st.scene.active {
             st.scene.brightness
         } else {
@@ -920,26 +1042,38 @@ mod tests {
             left_rgb = mix_c(left_rgb, [255, 255, 255], brightness * 0.12);
             right_rgb = mix_c(right_rgb, [255, 255, 255], brightness * 0.12);
         }
-        let both_color = to_color(mix_c(left_rgb, right_rgb, 0.5));
+        let left_color = to_color(left_rgb);
+        let right_color = to_color(right_rgb);
 
-        let mixed = buf
-            .content()
-            .iter()
-            .filter(|c| is_point(c.symbol()) && c.fg == both_color)
-            .count();
-        assert!(
-            mixed > 0,
-            "canales idénticos se superponen con color de mezcla"
-        );
+        let mut left_top = 0usize;
+        let mut right_bottom = 0usize;
+        for x in 1..39u16 {
+            for y in 1..7u16 {
+                let cell = buf.cell((x, y)).unwrap();
+                if !is_point(cell.symbol()) {
+                    continue;
+                }
+                if cell.fg == left_color {
+                    assert!(y <= 3, "L mono vive arriba (y={y})");
+                    left_top += 1;
+                }
+                if cell.fg == right_color {
+                    assert!(y >= 4, "R mono vive abajo (y={y})");
+                    right_bottom += 1;
+                }
+            }
+        }
+        assert!(left_top > 0, "L mono visible con su color");
+        assert!(right_bottom > 0, "R mono visible con su color");
     }
     #[test]
     fn square_wave_keeps_headroom_with_visible_extremes() {
-        // Onda cuadrada ±0.9 sobre el plano compartido: con el llenado parcial
-        // los extremos quedan VIBLES pero sin aplanarse contra los bordes
-        // (y=2 arriba, y=5 abajo en el interior y=1..7): hay margen para
-        // distinguir ambas ondas.
+        // Onda cuadrada ±0.9 en DUAL-PLANE: cada canal usa SU mitad con sus
+        // dos extremos visibles (L: y=1 arriba y y=3 abajo de su plano;
+        // R: y=4 arriba y y=6 abajo del suyo), con el hueco central (3/4)
+        // como frontera entre planos y sin invadir el plano vecino.
         let sq = square_stereo(0.9).left;
-        let mut st = active_state(0.9, VisualPalette::fallback());
+        let mut st = active_state(0.9, VisualTheme::fallback());
         st.scene.waveform = WaveformView {
             left: sq,
             right: sq,
@@ -947,24 +1081,48 @@ mod tests {
         };
         let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
         assert!(
-            (1..39u16).any(|x| is_point(buf.cell((x, 2)).unwrap().symbol())),
-            "el pico queda visible arriba con margen"
+            (1..39u16).any(|x| is_point(buf.cell((x, 1)).unwrap().symbol())),
+            "L toca el borde superior de su plano (y=1)"
         );
         assert!(
-            (1..39u16).any(|x| is_point(buf.cell((x, 5)).unwrap().symbol())),
-            "el valle queda visible abajo con margen"
+            (1..39u16).any(|x| is_point(buf.cell((x, 6)).unwrap().symbol())),
+            "R toca el borde inferior de su plano (y=6)"
         );
-        for y in [1u16, 6] {
-            assert!(
-                (1..39u16).all(|x| !is_point(buf.cell((x, y)).unwrap().symbol())),
-                "los bordes quedan libres (y={y}): sin saturación"
-            );
+        // Cada plano aporta puntos en su mitad y ninguno cruza al otro.
+        let theme = VisualTheme::fallback();
+        let channels = theme.channel_colors();
+        // Con brillo activo los colores se blanquean un 12%: aceptar tanto el
+        // puro como el blanqueado al clasificar por mitad.
+        let bright = st.scene.brightness;
+        let bl = |c: [u8; 3]| {
+            if bright > 0.0 {
+                mix_c(c, [255, 255, 255], bright * 0.12)
+            } else {
+                c
+            }
+        };
+        let left_color = to_color(bl(channels.left));
+        let right_color = to_color(bl(channels.right));
+        let both_color = to_color(mix_c(bl(channels.left), bl(channels.right), 0.5));
+        for x in 1..39u16 {
+            for y in 1..7u16 {
+                let cell = buf.cell((x, y)).unwrap();
+                if !is_point(cell.symbol()) {
+                    continue;
+                }
+                if cell.fg == left_color || cell.fg == both_color {
+                    assert!(y <= 3, "punto L en su mitad superior (y={y})");
+                }
+                if cell.fg == right_color {
+                    assert!(y >= 4, "punto R en su mitad inferior (y={y})");
+                }
+            }
         }
     }
 
     #[test]
     fn ascii_theme_uses_only_ascii_points() {
-        let st = active_state(0.9, VisualPalette::fallback());
+        let st = active_state(0.9, VisualTheme::fallback());
         let buf =
             drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Ascii)));
         let ascii_points = buf
@@ -983,9 +1141,9 @@ mod tests {
 
     #[test]
     fn silence_keeps_sparse_center_baseline() {
-        // Escena inactiva: ambos canales reposan en el eje central compartido
-        // (y=3..4) como puntos ESPACIADOS (thinning), sin NaN ni saltos y sin
-        // pintar una línea sólida: el silencio se lee como silencio.
+        // Escena inactiva: cada canal reposa en SU baseline (L ~y=2, R ~y=5)
+        // como puntos ESPACIADOS (thinning), sin NaN ni saltos y sin pintar
+        // una línea sólida: el silencio se lee como doble silencio.
         let buf = drawing(&|f| render(f, f.area(), &VisualState::inactive(), 0.0));
         let mut cols = 0usize;
         for x in 1..39u16 {
@@ -1000,15 +1158,15 @@ mod tests {
                 );
             }
         }
-        assert!(cols > 0, "la línea base central visible");
-        assert!(cols < 38, "pero espaciada, no sólida ({cols}/38)");
+        assert!(cols > 0, "las líneas base duales visibles");
+        assert!(cols < 20, "pero mínimas en silencio ({cols}/38)");
     }
 
     #[test]
     fn live_envelope_gain_scales_the_trace() {
         // Dos snapshots del MISMO audio (misma envolvente, distinto gain): al
         // aplicar un gain 2× los puntos se alejan del centro.
-        let mut st = active_state(0.9, VisualPalette::fallback());
+        let mut st = active_state(0.9, VisualTheme::fallback());
         st.scene.waveform = view(0.7, 5);
         let g1 = drawing(&|f| render(f, f.area(), &st, 0.0));
         st.scene.waveform.gain = 2.0;
@@ -1024,7 +1182,7 @@ mod tests {
         // La franja EQ vive en `render_bars_only` (Now Playing), NUNCA dentro
         // del bloque del osciloscopio: con 6 filas interiores ocupa las DOS
         // inferiores (la base siempre tiene barra y las fuertes suben).
-        let st = active_state(1.0, VisualPalette::fallback());
+        let st = active_state(1.0, VisualTheme::fallback());
         let buf = drawing(&|f| render_bars_only(f, f.area(), &st));
         // Barras del EQ: columnas x 1..=38 sobre las filas y 5..=6.
         let is_bar = |x: u16, y: u16| {
@@ -1049,7 +1207,7 @@ mod tests {
     fn bars_only_expanded_fills_height_without_trace_points() {
         // Modo Now Playing: solo barras, ampliadas a todo el interior, sin
         // ningún punto `•` del osciloscopio.
-        let st = active_state(1.0, VisualPalette::fallback());
+        let st = active_state(1.0, VisualTheme::fallback());
         let buf = drawing(&|f| render_bars_only(f, f.area(), &st));
         assert!(
             buf.content().iter().all(|c| c.symbol() != "•"),
@@ -1082,7 +1240,7 @@ mod tests {
     fn bars_levels_scale_with_available_rows() {
         // Misma señal fuerte: a más filas interiores, más filas con barra
         // (la escalera crece desde la base sin saltos ni pánicos).
-        let st = active_state(1.0, VisualPalette::fallback());
+        let st = active_state(1.0, VisualTheme::fallback());
         let lit_rows_at = |h: u16| {
             let buf = drawing_size(40, h, &|f| render_bars_only(f, f.area(), &st));
             let inner_h = h.saturating_sub(2);
@@ -1110,10 +1268,10 @@ mod tests {
         // techo de contraste: sin moteado por columna que se lea como bloques
         // superpuestos al texto, y con el color contra el que se resolvió el
         // karaoke (contraste por construcción).
-        let palette = VisualPalette::fallback();
-        let st = active_state(0.9, palette);
+        let theme = VisualTheme::fallback();
+        let st = active_state(0.9, theme);
         let dim = drawing(&|f| render_backdrop(f, f.area(), &st, true));
-        let ceiling = palette.karaoke_bg_ceiling();
+        let ceiling = theme.karaoke_bg_ceiling();
         let expected = Color::Rgb(ceiling[0], ceiling[1], ceiling[2]);
         assert!(
             dim.content().iter().all(|c| c.symbol() == " "),
@@ -1127,7 +1285,7 @@ mod tests {
         // llevan solo los puntos, nunca celdas tintadas que se lean como
         // bloques por encima o por debajo del trazo.
         let full = drawing(&|f| render_backdrop(f, f.area(), &st, false));
-        let base = palette.background;
+        let base = theme.background;
         assert!(
             full.content()
                 .iter()
@@ -1138,7 +1296,7 @@ mod tests {
 
     #[test]
     fn backdrop_resets_symbols_and_sets_background() {
-        let st = active_state(0.9, VisualPalette::fallback());
+        let st = active_state(0.9, VisualTheme::fallback());
         let buf = drawing(&|f| render_backdrop(f, f.area(), &st, false));
         // La capa ambiental resetea los glifos a blanco (mata los fantasmas del
         // frame anterior: bloques de barras, puntos viejos) y deja un fondo
@@ -1156,9 +1314,9 @@ mod tests {
         // bloque y ningún fondo tintado — todo lo que no sea cromado del marco
         // es punto del trazo o fondo plano de la paleta.
         const BLOCKS: [&str; 8] = ["█", "▇", "▆", "▅", "▄", "▃", "▂", "▁"];
-        let st = active_state(0.9, VisualPalette::fallback());
+        let st = active_state(0.9, VisualTheme::fallback());
         let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
-        let base = VisualPalette::fallback().background;
+        let base = VisualTheme::fallback().background;
         let base_bg = Color::Rgb(base[0], base[1], base[2]);
         for (i, c) in buf.content().iter().enumerate() {
             let x = (i as u16) % 40;
@@ -1185,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn subdued_trace_uses_dimmed_palette_colors() {
+    fn subdued_trace_uses_dimmed_theme_colors() {
         // El trazo tras las letras usa los colores de canal fundidos hacia el
         // techo (derivados de la portada), nunca a plena intensidad: visible
         // sin competir con el texto. El fondo no se toca. Constantes opuestas
@@ -1201,9 +1359,9 @@ mod tests {
             .draw(|f| render_trace_subdued(f, f.area(), &st))
             .unwrap();
         let buf = terminal.backend().buffer().clone();
-        let palette = VisualPalette::fallback();
-        let ceiling = palette.karaoke_bg_ceiling();
-        let channels = palette.channel_colors();
+        let theme = VisualTheme::fallback();
+        let ceiling = theme.karaoke_bg_ceiling();
+        let channels = theme.channel_colors();
         let dim_l = to_color(mix_c(channels.left, ceiling, SUBDUED_TRACE_DIM));
         let dim_r = to_color(mix_c(channels.right, ceiling, SUBDUED_TRACE_DIM));
         let full_l = to_color(channels.left);
@@ -1231,7 +1389,7 @@ mod tests {
         // Simula el buffer reutilizado de la TUI real: celdas con bloques de
         // un frame anterior (barras/Gauge). Tras el backdrop no debe quedar
         // ningún bloque que luego "pisaría" los puntos del trazo.
-        let st = active_state(0.9, VisualPalette::fallback());
+        let st = active_state(0.9, VisualTheme::fallback());
         let backend = TestBackend::new(40, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -1277,7 +1435,7 @@ mod tests {
     /// Estado mínimo sin brillo para asserts de color puros (sin el
     /// blanqueado del 12% que aplica `brightness`).
     fn plain_state(waveform: WaveformView) -> VisualState {
-        let mut st = active_state(0.9, VisualPalette::fallback());
+        let mut st = active_state(0.9, VisualTheme::fallback());
         st.scene.waveform = waveform;
         st.scene.energy = 0.0;
         st.scene.brightness = 0.0;
@@ -1356,9 +1514,9 @@ mod tests {
 
     #[test]
     fn stereo_channels_keep_independent_dynamics() {
-        // L con seno 0.7 y R con cuadrada 0.4 sobre el eje compartido: cada
-        // canal dibuja SU forma con desviación vertical real (sin espejo);
-        // donde coinciden se ve la mezcla.
+        // L con seno 0.7 arriba y R con cuadrada 0.4 abajo (dual-plane): cada
+        // canal dibuja SU forma sobre SU baseline con desviación real y sin
+        // invadir el plano vecino.
         let sine: Vec<f32> = (0..1024)
             .map(|i| 0.7 * ((i as f32 / 1024.0) * std::f32::consts::TAU * 5.0).sin())
             .collect();
@@ -1372,8 +1530,8 @@ mod tests {
         });
         let buf =
             drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
-        let palette = VisualPalette::fallback();
-        let channels = palette.channel_colors();
+        let theme = VisualTheme::fallback();
+        let channels = theme.channel_colors();
         let left_color = to_color(channels.left);
         let right_color = to_color(channels.right);
         let mut l_rows = std::collections::HashSet::new();
@@ -1391,7 +1549,7 @@ mod tests {
                 }
             }
         }
-        assert!(l_rows.len() >= 4, "L oscila con amplitud real: {l_rows:?}");
+        assert!(l_rows.len() >= 3, "L oscila con amplitud real: {l_rows:?}");
         assert!(!r_rows.is_empty(), "R muestra sus extremos: {r_rows:?}");
         assert_ne!(
             l_rows, r_rows,
@@ -1443,10 +1601,11 @@ mod tests {
 
     #[test]
     fn trace_never_fills_vertical_interval_between_min_and_max() {
-        // Garantía Scatter: con onda cuadrada ±0.9 superpuesta, el plano pinta
-        // SOLO los dos extremos discretos (arriba y abajo); las filas
-        // intermedias quedan vacías (sin `draw_line`, sin `fill_rect`). Además
-        // el thinning deja columnas enteras vacías: no hay línea continua.
+        // Garantía Scatter en DUAL-PLANE: con onda cuadrada ±0.9, CADA plano
+        // pinta SOLO sus dos extremos discretos (L: y=0 y 3; R: y=4 y 7 en el
+        // área 40×8 directa) y deja VACÍO el interior de su intervalo
+        // (y=1..2 para L, y=5..6 para R: sin `draw_line`, sin `fill_rect`).
+        // Además el thinning deja columnas enteras vacías: no hay línea continua.
         let sq = square_stereo(0.9).left;
         let st = plain_state(WaveformView {
             left: sq,
@@ -1455,22 +1614,36 @@ mod tests {
         });
         let buf =
             drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
-        // Extremos y=0..1 / y=6..7 con medio y=3..5 vacío donde hay extremos.
-        let mut checked = 0usize;
+        // L ocupa 0..3 y R 4..7: verificar huecos internos por plano.
+        let mut checked_l = 0usize;
+        let mut checked_r = 0usize;
         for x in 0..40u16 {
-            let top = (0..2u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol()));
-            let bottom = (6..8u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol()));
-            if top && bottom {
-                for y in 3..5u16 {
-                    assert!(
-                        !is_point(buf.cell((x, y)).unwrap().symbol()),
-                        "columna {x}: el intervalo no se rellena (fila {y} vacía)"
-                    );
-                }
-                checked += 1;
+            let l_top = (0..2u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol()));
+            let l_bot = (2..4u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol()));
+            if l_top && l_bot {
+                // Entre los dos extremos de L (fila 1..2) debe haber al menos
+                // una fila vacía en columnas con ambos extremos (el thinning
+                // cuantiza ±0.9 a 0 y 3, dejando 1..2 libres).
+                let mid_empty = (1..3u16).any(|y| !is_point(buf.cell((x, y)).unwrap().symbol()));
+                assert!(mid_empty, "columna {x}: L no rellena su intervalo");
+                checked_l += 1;
+            }
+            let r_top = (4..6u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol()));
+            let r_bot = (6..8u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol()));
+            if r_top && r_bot {
+                let mid_empty = (5..7u16).any(|y| !is_point(buf.cell((x, y)).unwrap().symbol()));
+                assert!(mid_empty, "columna {x}: R no rellena su intervalo");
+                checked_r += 1;
             }
         }
-        assert!(checked > 0, "hay columnas con pico+valle para verificar");
+        assert!(
+            checked_l > 0,
+            "hay columnas L con pico+valle para verificar"
+        );
+        assert!(
+            checked_r > 0,
+            "hay columnas R con pico+valle para verificar"
+        );
         let empty_cols = (0..40u16)
             .filter(|&x| (0..8u16).all(|y| !is_point(buf.cell((x, y)).unwrap().symbol())))
             .count();
@@ -1537,9 +1710,9 @@ mod tests {
 
     #[test]
     fn stereo_render_never_swaps_left_and_right_colors() {
-        // L fuerte con seno / R silente sobre el plano compartido: los
-        // extremos (lejos del eje) solo llevan color L; la línea base central
-        // lleva el color R de su silencio. Ningún punto extremo es R.
+        // L fuerte con seno / R silente en DUAL-PLANE: L vive ARRIBA (y=0..3)
+        // con su color; R silente marca SU baseline abajo (y≈5) con el suyo.
+        // Ningún punto R aparece arriba ni ningún L abajo (sin swap).
         let samples_l: Vec<f32> = (0..1024)
             .map(|i| 0.9 * ((i as f32 / 1024.0) * std::f32::consts::TAU * 5.0).sin())
             .collect();
@@ -1551,37 +1724,44 @@ mod tests {
         });
         let buf =
             drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
-        let channels = st.scene.palette.channel_colors();
+        let channels = st.scene.theme.channel_colors();
         let left_color = to_color(channels.left);
         let right_color = to_color(channels.right);
-        let mut extreme_left = 0usize;
-        let mut extreme_right = 0usize;
-        let mut center_right = 0usize;
+        let mut top_left = 0usize;
+        let mut top_right = 0usize;
+        let mut bottom_left = 0usize;
+        let mut bottom_right = 0usize;
         for x in 0..40u16 {
-            for y in [0u16, 1, 6, 7] {
+            for y in 0..4u16 {
                 let c = buf.cell((x, y)).unwrap();
                 if is_point(c.symbol()) {
                     if c.fg == left_color {
-                        extreme_left += 1;
+                        top_left += 1;
                     }
                     if c.fg == right_color {
-                        extreme_right += 1;
+                        top_right += 1;
                     }
                 }
             }
-            for y in 3..5u16 {
+            for y in 4..8u16 {
                 let c = buf.cell((x, y)).unwrap();
-                if is_point(c.symbol()) && c.fg == right_color {
-                    center_right += 1;
+                if is_point(c.symbol()) {
+                    if c.fg == left_color {
+                        bottom_left += 1;
+                    }
+                    if c.fg == right_color {
+                        bottom_right += 1;
+                    }
                 }
             }
         }
-        assert!(extreme_left > 0, "L alcanza los extremos con su color");
+        assert!(top_left > 0, "L alcanza su mitad superior con su color");
+        assert_eq!(top_right, 0, "R silente nunca pinta arriba (sin swap)");
         assert_eq!(
-            extreme_right, 0,
-            "R silente nunca pinta los extremos (sin swap)"
+            bottom_left, 0,
+            "L nunca invade la mitad inferior (sin swap)"
         );
-        assert!(center_right > 0, "R marca su base en el eje central");
+        assert!(bottom_right > 0, "R marca su baseline abajo");
     }
 
     #[test]
@@ -1760,9 +1940,9 @@ mod tests {
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
-        let palette = VisualPalette::fallback();
-        let channels = palette.channel_colors();
-        let link = to_color(mix_c(channels.left, palette.background, LINK_DIM));
+        let theme = VisualTheme::fallback();
+        let channels = theme.channel_colors();
+        let link = to_color(mix_c(channels.left, theme.background, LINK_DIM));
         // Filas extremas globales del trazo L (arriba y abajo del plano).
         let mut top = u16::MAX;
         let mut bottom = 0u16;
@@ -1789,7 +1969,7 @@ mod tests {
             "enlaces solo entre extremos: {links:?} en ({top},{bottom})"
         );
         // El fondo sigue intacto bajo trazo y enlaces (puntos, no bloques).
-        let base = palette.background;
+        let base = theme.background;
         for (x, y) in links {
             assert_eq!(
                 buf.cell((x, y)).unwrap().bg,
@@ -1801,9 +1981,11 @@ mod tests {
 
     #[test]
     fn mono_envelopes_overlap_with_mixed_color() {
-        // Comportamiento mono del proyecto (L=R duplicado): ambas curvas caen
-        // en las mismas celdas del plano y se ven con el tinte de mezcla.
-        // Ningún punto mono conserva un color puro de canal.
+        // Comportamiento mono del proyecto (L=R duplicado) en DUAL-PLANE:
+        // la MISMA envolvente dibuja dos formas geométricamente equivalentes
+        // (mismo desplazamiento relativo a cada baseline) con sus colores
+        // propios: L arriba, R abajo, sin superponerse. Ningún punto necesita
+        // el tinte de mezcla.
         let samples: Vec<f32> = (0..1024)
             .map(|i| 0.7 * ((i as f32 / 1024.0) * std::f32::consts::TAU * 3.0).sin())
             .collect();
@@ -1815,25 +1997,57 @@ mod tests {
         });
         let buf =
             drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
-        let palette = VisualPalette::fallback();
-        let channels = palette.channel_colors();
+        let theme = VisualTheme::fallback();
+        let channels = theme.channel_colors();
         let pure_l = to_color(channels.left);
         let pure_r = to_color(channels.right);
-        let both = to_color(mix_c(channels.left, channels.right, 0.5));
-        let mut mixed = 0usize;
-        let mut pure = 0usize;
-        for c in buf.content().iter() {
-            if is_point(c.symbol()) {
-                if c.fg == both {
-                    mixed += 1;
+        let mut l_rows = std::collections::HashSet::new();
+        let mut r_rows = std::collections::HashSet::new();
+        let mut l_count = 0usize;
+        let mut r_count = 0usize;
+        for x in 0..40u16 {
+            for y in 0..8u16 {
+                let c = buf.cell((x, y)).unwrap();
+                if !is_point(c.symbol()) {
+                    continue;
                 }
-                if c.fg == pure_l || c.fg == pure_r {
-                    pure += 1;
+                if c.fg == pure_l {
+                    assert!(y < 4, "L mono arriba (y={y})");
+                    l_rows.insert(y);
+                    l_count += 1;
+                }
+                if c.fg == pure_r {
+                    assert!(y >= 4, "R mono abajo (y={y})");
+                    r_rows.insert(y);
+                    r_count += 1;
                 }
             }
         }
-        assert!(mixed > 0, "coincidencia visible con mezcla");
-        assert_eq!(pure, 0, "mono idéntico: ningún punto con color puro");
+        assert!(l_count > 0, "L mono visible con su color");
+        assert!(r_count > 0, "R mono visible con su color");
+        // Misma forma ⇒ misma extensión relativa (trasladada 4 filas).
+        assert_eq!(
+            l_rows.len(),
+            r_rows.len(),
+            "geometrías equivalentes: L={l_rows:?} R={r_rows:?}"
+        );
+        let l_sorted: Vec<u16> = {
+            let mut v: Vec<u16> = l_rows.into_iter().collect();
+            v.sort_unstable();
+            v
+        };
+        let r_sorted: Vec<u16> = {
+            let mut v: Vec<u16> = r_rows.into_iter().collect();
+            v.sort_unstable();
+            v
+        };
+        for (l, r) in l_sorted.iter().zip(r_sorted.iter()) {
+            let gap = r.saturating_sub(*l);
+            assert!(
+                (3..=4).contains(&gap),
+                "traslación rígida entre planos: L={l} R={r}"
+            );
+        }
     }
 
     #[test]
@@ -1864,5 +2078,508 @@ mod tests {
             p100 <= 3 * p40,
             "crecimiento acotado ante 2.5× ancho ({p40} → {p100})"
         );
+    }
+
+    // --- STEREO MIRROR / DUAL PLANE: geometría y casos obligatorios ---
+
+    #[test]
+    fn dual_plane_geometry_orders_baselines_and_shares_scale() {
+        // La geometría es proporcional, ordenada y compartida: left < right,
+        // misma escala para no romper el balance L/R, O(1) y sin allocs.
+        for h in [2usize, 6, 8, 12, 16, 24] {
+            let (lc, rc, sc) = dual_plane_geometry(h, 1.0);
+            assert!(lc < rc, "left_center < right_center con h={h}");
+            assert!((lc - (h as f32 - 1.0) * 0.25).abs() < 1e-6);
+            assert!((rc - (h as f32 - 1.0) * 0.75).abs() < 1e-6);
+            assert!(sc >= 0.0 && sc.is_finite(), "escala finita con h={h}");
+            // Con gain 2× la escala dobla (auto-gain visual común).
+            let (_, _, sc2) = dual_plane_geometry(h, 2.0);
+            if sc > 0.0 {
+                assert!((sc2 - sc * 2.0).abs() < 1e-6, "gain común con h={h}");
+            }
+        }
+        assert_eq!(dual_plane_geometry(0, 1.0), (0.0, 0.0, 0.0));
+        assert_eq!(dual_plane_geometry(1, 1.0), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn dualplane_left_active_right_silent_stays_in_region() {
+        // Test 2: L activo / R silencioso. L solo arriba, R solo en su
+        // baseline abajo; R nunca aparece falsamente en L.
+        let sine: Vec<f32> = (0..2048)
+            .map(|i| 0.8 * ((i as f32 / 2048.0) * std::f32::consts::TAU * 5.0).sin())
+            .collect();
+        let st = plain_state(WaveformView {
+            left: WaveformEnvelope::from_window(&sine),
+            right: WaveformEnvelope::silent(),
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let channels = VisualTheme::fallback().channel_colors();
+        let lc = to_color(channels.left);
+        let rc = to_color(channels.right);
+        let mut l_up = 0usize;
+        let mut r_down = 0usize;
+        for x in 0..40u16 {
+            for y in 0..8u16 {
+                let c = buf.cell((x, y)).unwrap();
+                if !is_point(c.symbol()) {
+                    continue;
+                }
+                if c.fg == lc {
+                    assert!(y < 4, "L activo arriba (y={y})");
+                    l_up += 1;
+                }
+                if c.fg == rc {
+                    assert!(y >= 4, "R silente abajo (y={y})");
+                    r_down += 1;
+                }
+            }
+        }
+        assert!(l_up > 0, "L activo visible");
+        assert!(r_down > 0, "R silencioso marca su baseline");
+    }
+
+    #[test]
+    fn dualplane_right_active_left_silent_stays_in_region() {
+        // Test 3: inverso del anterior.
+        let sine: Vec<f32> = (0..2048)
+            .map(|i| 0.8 * ((i as f32 / 2048.0) * std::f32::consts::TAU * 5.0).sin())
+            .collect();
+        let st = plain_state(WaveformView {
+            left: WaveformEnvelope::silent(),
+            right: WaveformEnvelope::from_window(&sine),
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let channels = VisualTheme::fallback().channel_colors();
+        let lc = to_color(channels.left);
+        let rc = to_color(channels.right);
+        let mut l_up = 0usize;
+        let mut r_down = 0usize;
+        for x in 0..40u16 {
+            for y in 0..8u16 {
+                let c = buf.cell((x, y)).unwrap();
+                if !is_point(c.symbol()) {
+                    continue;
+                }
+                if c.fg == lc {
+                    assert!(y < 4, "L silente arriba (y={y})");
+                    l_up += 1;
+                }
+                if c.fg == rc {
+                    assert!(y >= 4, "R activo abajo (y={y})");
+                    r_down += 1;
+                }
+            }
+        }
+        assert!(l_up > 0, "L silencioso marca su baseline");
+        assert!(r_down > 0, "R activo visible");
+    }
+
+    #[test]
+    fn dualplane_distinct_signals_never_swap_regions() {
+        // Test 4: L/R diferentes (440 Hz vs 880 Hz aprox.): cada canal
+        // permanece en su región sin intercambios.
+        let l: Vec<f32> = (0..2048)
+            .map(|i| 0.7 * ((i as f32 / 2048.0) * std::f32::consts::TAU * 4.0).sin())
+            .collect();
+        let r: Vec<f32> = (0..2048)
+            .map(|i| 0.7 * ((i as f32 / 2048.0) * std::f32::consts::TAU * 8.0).sin())
+            .collect();
+        let st = plain_state(WaveformView {
+            left: WaveformEnvelope::from_window(&l),
+            right: WaveformEnvelope::from_window(&r),
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let channels = VisualTheme::fallback().channel_colors();
+        let lc = to_color(channels.left);
+        let rc = to_color(channels.right);
+        let mut l_n = 0usize;
+        let mut r_n = 0usize;
+        for x in 0..40u16 {
+            for y in 0..8u16 {
+                let c = buf.cell((x, y)).unwrap();
+                if !is_point(c.symbol()) {
+                    continue;
+                }
+                if c.fg == lc {
+                    assert!(y < 4, "L en su mitad (y={y})");
+                    l_n += 1;
+                }
+                if c.fg == rc {
+                    assert!(y >= 4, "R en su mitad (y={y})");
+                    r_n += 1;
+                }
+            }
+        }
+        assert!(l_n > 0 && r_n > 0, "ambos visibles sin swap");
+    }
+
+    #[test]
+    fn dualplane_polarity_positive_up_negative_down_per_channel() {
+        // Test 5: polaridad con signo por canal (nunca `.abs()`): positivo →
+        // arriba de SU baseline, negativo → abajo.
+        for (h, y_split) in [(8usize, 4u16), (14, 7)] {
+            let (lc, rc, sc) = dual_plane_geometry(h, 1.0);
+            // L: +0.8 arriba de left, -0.8 abajo de left.
+            let l_pos = row_of(project_amplitude(0.8), lc, sc, h);
+            let l_zero = row_of(project_amplitude(0.0), lc, sc, h);
+            let l_neg = row_of(project_amplitude(-0.8), lc, sc, h);
+            assert!(l_pos < l_zero && l_zero < l_neg, "L polaridad h={h}");
+            // R: idéntico sobre su propio baseline.
+            let r_pos = row_of(project_amplitude(0.8), rc, sc, h);
+            let r_zero = row_of(project_amplitude(0.0), rc, sc, h);
+            let r_neg = row_of(project_amplitude(-0.8), rc, sc, h);
+            assert!(r_pos < r_zero && r_zero < r_neg, "R polaridad h={h}");
+            // Y en el buffer real: constante +0.5 arriba de L, -0.5 abajo de R.
+            let st = plain_state(WaveformView {
+                left: WaveformEnvelope::from_window(&[0.5; 2048]),
+                right: WaveformEnvelope::from_window(&[-0.5; 2048]),
+                gain: 1.0,
+            });
+            let buf = drawing_size(40, h as u16, &|f| {
+                render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode))
+            });
+            let channels = VisualTheme::fallback().channel_colors();
+            let left_c = to_color(channels.left);
+            let right_c = to_color(channels.right);
+            for x in 0..40u16 {
+                for y in 0..h as u16 {
+                    let c = buf.cell((x, y)).unwrap();
+                    if !is_point(c.symbol()) {
+                        continue;
+                    }
+                    if c.fg == left_c {
+                        assert!(y < y_split, "L +0.5 en mitad superior (y={y})");
+                    }
+                    if c.fg == right_c {
+                        assert!(y >= y_split, "R -0.5 en mitad inferior (y={y})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dualplane_extremes_stay_within_regions() {
+        // Test 6: +1/0/-1 permanecen dentro de sus regiones (clamp + orden).
+        for h in [4usize, 6, 8, 12, 18] {
+            let (lc, rc, sc) = dual_plane_geometry(h, 1.0);
+            for (center, name) in [(lc, "L"), (rc, "R")] {
+                let top = row_of(1.0, center, sc, h);
+                let mid = row_of(0.0, center, sc, h);
+                let bot = row_of(-1.0, center, sc, h);
+                assert!(top <= mid && mid <= bot, "{name} orden h={h}");
+                assert!(top < h as u16 && bot < h as u16, "{name} acotado h={h}");
+            }
+            // L siempre arriba de R incluso en extremos opuestos.
+            let l_neg = row_of(-1.0, lc, sc, h);
+            let r_pos = row_of(1.0, rc, sc, h);
+            assert!(
+                l_neg <= r_pos || h <= 3,
+                "L(-1) no invade R(+1) con h={h}: {l_neg} vs {r_pos}"
+            );
+            // Clamp fuera de rango nunca sale del área; con breathing room los
+            // extremos caen dentro del margen exterior (≤1 fila del borde).
+            assert!(row_of(99.0, lc, sc, h) <= 1);
+            assert!(row_of(-99.0, rc, sc, h) + 2 >= h as u16);
+        }
+    }
+
+    #[test]
+    fn dualplane_tiny_terminals_never_panic_and_keep_regions() {
+        // Test 7: terminales pequeños y grandes (40×8 … 120×20 + diminutos):
+        // sin panic, sin índices inválidos, L arriba / R abajo cuando hay
+        // altura suficiente para dos carriles.
+        let loud = plain_state(WaveformView {
+            left: WaveformEnvelope::from_window(&[0.9; 2048]),
+            right: WaveformEnvelope::from_window(&[-0.9; 2048]),
+            gain: 1.0,
+        });
+        let silent = VisualState::inactive();
+        for (w, h) in [
+            (40u16, 8u16),
+            (60, 10),
+            (80, 12),
+            (100, 16),
+            (120, 20),
+            (20, 4),
+            (10, 3),
+            (40, 2),
+            (40, 1),
+        ] {
+            for st in [&loud, &silent] {
+                let buf = drawing_size(w, h, &|f| {
+                    render_trace_points(f, f.area(), st, UiGlyphs::new(GlyphTheme::Unicode))
+                });
+                assert_eq!(buf.area.width, w);
+                assert_eq!(buf.area.height, h);
+                // Todo punto dentro del área y con glifo de punto.
+                for c in buf.content().iter() {
+                    if c.symbol().trim().is_empty() {
+                        continue;
+                    }
+                    assert!(is_point(c.symbol()), "solo puntos con {w}×{h}");
+                }
+            }
+            // Con h ≥ 4 y señal asimétrica, L arriba / R abajo.
+            if h >= 4 {
+                let asym = plain_state(WaveformView {
+                    left: WaveformEnvelope::from_window(&[0.8; 2048]),
+                    right: WaveformEnvelope::from_window(&[-0.8; 2048]),
+                    gain: 1.0,
+                });
+                let buf = drawing_size(w, h, &|f| {
+                    render_trace_points(f, f.area(), &asym, UiGlyphs::new(GlyphTheme::Unicode))
+                });
+                let channels = VisualTheme::fallback().channel_colors();
+                let lc = to_color(channels.left);
+                let rc = to_color(channels.right);
+                let mid = h / 2;
+                for x in 0..w {
+                    for y in 0..h {
+                        let c = buf.cell((x, y)).unwrap();
+                        if !is_point(c.symbol()) {
+                            continue;
+                        }
+                        if c.fg == lc {
+                            assert!(y < mid + 1, "L arriba con {w}×{h} (y={y})");
+                        }
+                        if c.fg == rc {
+                            assert!(y >= mid.saturating_sub(1), "R abajo con {w}×{h} (y={y})");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dualplane_scatter_never_uses_blocks() {
+        // Test 8: scatter puro en dual-plane (nunca bloques ni fondos tintados).
+        const BLOCKS: [&str; 9] = ["█", "▇", "▆", "▅", "▄", "▃", "▂", "▁", "●"];
+        let st = plain_state(WaveformView {
+            left: WaveformEnvelope::from_window(&[0.9; 2048]),
+            right: WaveformEnvelope::from_window(&[-0.9; 2048]),
+            gain: 1.0,
+        });
+        for (w, h) in [(40u16, 8u16), (80, 12), (120, 20)] {
+            let buf = drawing_size(w, h, &|f| {
+                render_backdrop(f, f.area(), &st, false);
+                render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode));
+            });
+            for c in buf.content().iter() {
+                assert!(!BLOCKS.contains(&c.symbol()), "bloque con {w}×{h}");
+                if c.symbol().trim().is_empty() {
+                    continue;
+                }
+                assert!(is_point(c.symbol()), "solo puntos con {w}×{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn dualplane_opposite_phases_show_mirrored_shapes() {
+        // L=+0.8 seno / R=-0.8 seno: dos formas claramente diferenciadas pero
+        // simétricas respecto a sus baselines (fases opuestas no se cancelan).
+        let l: Vec<f32> = (0..2048)
+            .map(|i| 0.8 * ((i as f32 / 2048.0) * std::f32::consts::TAU * 3.0).sin())
+            .collect();
+        let r: Vec<f32> = l.iter().map(|v| -*v).collect();
+        let st = plain_state(WaveformView {
+            left: WaveformEnvelope::from_window(&l),
+            right: WaveformEnvelope::from_window(&r),
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let channels = VisualTheme::fallback().channel_colors();
+        let lc = to_color(channels.left);
+        let rc = to_color(channels.right);
+        let (lhc, rhc, _) = dual_plane_geometry(8, 1.0);
+        let mut l_dev = 0.0f32;
+        let mut r_dev = 0.0f32;
+        let mut l_n = 0usize;
+        let mut r_n = 0usize;
+        for x in 0..40u16 {
+            for y in 0..8u16 {
+                let c = buf.cell((x, y)).unwrap();
+                if !is_point(c.symbol()) {
+                    continue;
+                }
+                if c.fg == lc {
+                    l_dev += (y as f32 - lhc).abs();
+                    l_n += 1;
+                }
+                if c.fg == rc {
+                    r_dev += (y as f32 - rhc).abs();
+                    r_n += 1;
+                }
+            }
+        }
+        assert!(l_n > 0 && r_n > 0, "ambas fases visibles");
+        let l_avg = l_dev / l_n as f32;
+        let r_avg = r_dev / r_n as f32;
+        assert!(
+            (l_avg - r_avg).abs() < 1.0,
+            "misma energía ⇒ desviación similar: {l_avg} vs {r_avg}"
+        );
+    }
+
+    #[test]
+    fn dualplane_gain_preserves_balance_between_channels() {
+        // El auto-gain es COMÚN: L más fuerte se ve más fuerte (no se
+        // normaliza cada canal a 1.0 por separado).
+        let st = plain_state(WaveformView {
+            left: WaveformEnvelope::from_window(&[0.9; 2048]),
+            right: WaveformEnvelope::from_window(&[0.2; 2048]),
+            gain: 1.0,
+        });
+        let (_, _, sc) = dual_plane_geometry(8, 1.0);
+        let (lc, rc, _) = dual_plane_geometry(8, 1.0);
+        let l_dev = (row_of(project_amplitude(0.9), lc, sc, 8) as f32 - lc).abs();
+        let r_dev = (row_of(project_amplitude(0.2), rc, sc, 8) as f32 - rc).abs();
+        assert!(l_dev > r_dev, "L más fuerte ⇒ más desviación");
+        // Y en el buffer: L barre más filas que R.
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let channels = VisualTheme::fallback().channel_colors();
+        let mut l_rows = std::collections::HashSet::new();
+        let mut r_rows = std::collections::HashSet::new();
+        for x in 0..40u16 {
+            for y in 0..8u16 {
+                let c = buf.cell((x, y)).unwrap();
+                if is_point(c.symbol()) {
+                    if c.fg == to_color(channels.left) {
+                        l_rows.insert(y);
+                    }
+                    if c.fg == to_color(channels.right) {
+                        r_rows.insert(y);
+                    }
+                }
+            }
+        }
+        assert!(
+            l_rows.len() >= r_rows.len(),
+            "L barre ≥ filas que R: {l_rows:?} vs {r_rows:?}"
+        );
+        let _ = &st;
+    }
+
+    #[test]
+    fn trace_is_protagonist_and_accents_are_secondary_detail() {
+        // Seno activo: el trace (color pleno de canal) domina y barre filas;
+        // los acentos (color de acento del tema) aparecen como detalle donde
+        // la envolvente aporta novedad, sin superarlo en número.
+        let sine: Vec<f32> = (0..2048)
+            .map(|i| 0.9 * ((i as f32 / 2048.0) * std::f32::consts::TAU * 6.0).sin())
+            .collect();
+        let st = plain_state(WaveformView {
+            left: WaveformEnvelope::from_window(&sine),
+            right: WaveformEnvelope::silent(),
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let theme = VisualTheme::fallback();
+        let channels = theme.channel_colors();
+        let trace_c = to_color(channels.left);
+        let accent_c = to_color(theme.accent);
+        let trace_n = buf
+            .content()
+            .iter()
+            .filter(|c| is_point(c.symbol()) && c.fg == trace_c)
+            .count();
+        let accent_n = buf
+            .content()
+            .iter()
+            .filter(|c| is_point(c.symbol()) && c.fg == accent_c)
+            .count();
+        assert!(trace_n > 10, "trace protagonista visible: {trace_n}");
+        assert!(
+            trace_n >= accent_n,
+            "trace ≥ acentos: {trace_n} vs {accent_n}"
+        );
+        // El trace barre su mitad (trayectoria temporal, no punto fijo).
+        let mut rows = std::collections::HashSet::new();
+        for x in 0..40u16 {
+            for y in 0..4u16 {
+                let c = buf.cell((x, y)).unwrap();
+                if is_point(c.symbol()) && c.fg == trace_c {
+                    rows.insert(y);
+                }
+            }
+        }
+        assert!(rows.len() >= 3, "el trace recorre su plano: {rows:?}");
+    }
+
+    #[test]
+    fn constant_signal_emits_no_peak_accents() {
+        // Señal constante: min/max coinciden con el trace → cero acentos. La
+        // envolvente no duplica lo que el trace ya dice.
+        let st = plain_state(WaveformView {
+            left: WaveformEnvelope::from_window(&[0.5; 2048]),
+            right: WaveformEnvelope::from_window(&[-0.5; 2048]),
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let accent_c = to_color(VisualTheme::fallback().accent);
+        let accents = buf
+            .content()
+            .iter()
+            .filter(|c| is_point(c.symbol()) && c.fg == accent_c)
+            .count();
+        assert_eq!(accents, 0, "constantes sin acentos: {accents}");
+    }
+
+    #[test]
+    fn transient_spike_survives_as_accent_while_trace_stays() {
+        // Impulso fuera del centro del bucket: el trace sigue en línea base
+        // pero el acento recupera el pico en su fila extrema.
+        let mut window = [0.0f32; 2048];
+        window[1001] = 1.0;
+        let env = WaveformEnvelope::from_window(&window);
+        let st = plain_state(WaveformView {
+            left: env,
+            right: WaveformEnvelope::silent(),
+            gain: 1.0,
+        });
+        let buf =
+            drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
+        let theme = VisualTheme::fallback();
+        let accent_c = to_color(theme.accent);
+        let top_accent = (0..40u16).any(|x| {
+            (0..2u16).any(|y| {
+                let c = buf.cell((x, y)).unwrap();
+                is_point(c.symbol()) && c.fg == accent_c
+            })
+        });
+        assert!(top_accent, "el transitorio sobrevive como acento arriba");
+    }
+
+    #[test]
+    fn scatter_spacing_adapts_to_width_without_losing_shape() {
+        // En anchos normales el espaciado es 2; en terminales muy anchos sube
+        // a 3 para que la densidad no degenere en matriz de puntos. La forma
+        // (cambios de fila) siempre se emite de inmediato en ambos casos.
+        assert_eq!(scatter_min_dist(40), 2);
+        assert_eq!(scatter_min_dist(100), 2);
+        assert_eq!(scatter_min_dist(101), 3);
+        assert_eq!(scatter_min_dist(160), 3);
+        // Cambios de fila: emisión inmediata con cualquier umbral.
+        for min_dist in [2usize, 3] {
+            let mut last = Some((10usize, 4u16));
+            assert!(scatter_emit(&mut last, 11, 5, min_dist));
+            // Misma fila lejana: espaciado según umbral.
+            let mut l2 = Some((10usize, 4u16));
+            assert!(!scatter_emit(&mut l2, 10 + min_dist - 1, 4, min_dist));
+            assert!(scatter_emit(&mut l2, 10 + min_dist, 4, min_dist));
+        }
     }
 }

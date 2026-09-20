@@ -18,7 +18,7 @@ use super::glyphs::GLYPHS;
 use super::layout::{dashboard_layout, TerminalProfile};
 use crate::ui::related::RelatedState;
 use crate::ui::widgets::{progress_bar, song_card};
-use crate::visualization::palette::VisualPalette;
+use crate::visualization::palette::VisualTheme;
 use crate::visualization::render as visualizer;
 use crate::visualization::VisualState;
 
@@ -58,7 +58,7 @@ pub fn render(
     // La banda del visual en Now Playing es SOLO barras del espectro,
     // ampliadas a toda la banda (el osciloscopio de puntos vive solo en la
     // vista Related / Shift+2). La paleta de la portada ya la fundió el motor
-    // en `visual.scene.palette`. Con el análisis inactivo el renderer pinta la
+    // en `visual.scene.theme`. Con el análisis inactivo el renderer pinta la
     // banda apagada.
     visualizer::render_bars_only(frame, chunks[1], visual);
     progress_bar::render(frame, chunks[2], playback, frame_anim);
@@ -80,6 +80,7 @@ pub fn render(
         click,
         stats,
         liked_state,
+        &visual.scene.theme,
     );
 
     render_controls(
@@ -92,7 +93,7 @@ pub fn render(
         repeat,
         frame_anim,
         liked,
-        &visual.scene.palette,
+        &visual.scene.theme,
     );
 }
 
@@ -113,7 +114,7 @@ fn render_controls(
     repeat: crate::playback::queue::RepeatMode,
     frame_anim: u64,
     liked: bool,
-    palette: &VisualPalette,
+    theme: &VisualTheme,
 ) {
     let state = match playback.state {
         PlaybackState::Playing => format!(
@@ -151,26 +152,26 @@ fn render_controls(
     let heart_style = if liked {
         Style::new().fg(Color::Rgb(
             if pulse {
-                palette.primary[0]
+                theme.primary[0]
             } else {
-                palette.accent[0]
+                theme.accent[0]
             },
             if pulse {
-                palette.primary[1]
+                theme.primary[1]
             } else {
-                palette.accent[1]
+                theme.accent[1]
             },
             if pulse {
-                palette.primary[2]
+                theme.primary[2]
             } else {
-                palette.accent[2]
+                theme.accent[2]
             },
         ))
     } else {
         Style::new().fg(Color::Rgb(
-            palette.secondary[0],
-            palette.secondary[1],
-            palette.secondary[2],
+            theme.secondary[0],
+            theme.secondary[1],
+            theme.secondary[2],
         ))
     };
     let heart = Span::styled(

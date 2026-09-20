@@ -8,25 +8,25 @@
 //!   wall-clock.
 //! - El pulso decae por EVENTO recibido (~15 Hz de features): determinista
 //!   frente al flujo de eventos.
-//! - Osciloscopio real: la escena es la envolvente min/max ESTÉREO del PCM
-//!   ([`StereoWaveform`], ~86 Hz) decimada a `WAVEFORM_BUCKETS` por canal; la
-//!   ganancia se auto-ajusta por frame (1/peak) con suavizado para que el
-//!   trazo nunca "salte" entre ventanas.
+//! - Osciloscopio real: la escena es el trace temporal + envolvente min/max
+//!   ESTÉREO del PCM ([`StereoWaveform`], ~86 Hz) decimados a
+//!   `WAVEFORM_BUCKETS` por canal; la ganancia se auto-ajusta por frame
+//!   (1/peak) con suavizado para que el trazo nunca "salte" entre ventanas.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::analysis::{AudioFeatures, StereoWaveform, WaveformEnvelope};
-use crate::visualization::palette::VisualPalette;
+use crate::visualization::palette::VisualTheme;
 use crate::visualization::params::{ParameterMapper, VisualParameters};
 use crate::visualization::VISUAL_BARS;
 
 /// Vista de forma de onda ESTÉREO lista para el renderer (por valor, `Copy`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WaveformView {
-    /// Envolvente del canal izquierdo (ch0), amplitude sin normalizar (~-1..1).
+    /// Trace + envolvente del canal izquierdo (ch0), sin normalizar (~-1..1).
     pub left: WaveformEnvelope,
-    /// Envolvente del canal derecho (ch1).
+    /// Trace + envolvente del canal derecho (ch1).
     pub right: WaveformEnvelope,
     /// Ganancia automática suavizada (1/peak acotada): el renderer multiplica
     /// la amplitud por este factor en AMBOS canales.
@@ -50,14 +50,14 @@ impl WaveformView {
 /// escena ya calculada por el motor (spec §10).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SceneState {
-    /// Envolvente decimada lista para el trazo (min/max + auto-gain).
+    /// Trace + envolvente decimados listos para el trazo (+ auto-gain).
     pub waveform: WaveformView,
     /// Energía continua 0..1 (suavizada, RMS).
     pub energy: f32,
     /// Brillo 0..1 (agudos, con aporte del pulso de beat).
     pub brightness: f32,
-    /// Paleta fundida del track actual (el renderer solo la consume).
-    pub palette: VisualPalette,
+    /// Tema fundido del track actual (el renderer solo lo consume).
+    pub theme: VisualTheme,
     /// `true` cuando hay features frescas (análisis activo y sonando).
     pub active: bool,
 }
@@ -94,7 +94,7 @@ impl VisualState {
                 waveform: WaveformView::baseline(),
                 energy: 0.0,
                 brightness: 0.0,
-                palette: VisualPalette::fallback(),
+                theme: VisualTheme::fallback(),
                 active: false,
             },
         }
@@ -107,8 +107,8 @@ pub struct VisualEngine {
     prev_pulse: f32,
     /// Última posición vista (para detectar seeks: salto brusco ⇒ sin suavizar).
     last_position: Option<Duration>,
-    /// Paleta fundida actual (se acerca a la del track en cada frame).
-    palette: VisualPalette,
+    /// Tema fundido actual (se acerca al del track en cada frame).
+    theme: VisualTheme,
     /// Vista de forma de onda actual: se mantiene hasta que llegue una envolvente
     /// nueva, así el trazo "respira" sin parpadear entre frames.
     waveform_view: WaveformView,
@@ -140,7 +140,7 @@ impl VisualEngine {
             prev_bars: [0.0; VISUAL_BARS],
             prev_pulse: 0.0,
             last_position: None,
-            palette: VisualPalette::fallback(),
+            theme: VisualTheme::fallback(),
             waveform_view: WaveformView::baseline(),
             last_envelope: None,
             smooth_energy: 0.0,
@@ -153,16 +153,16 @@ impl VisualEngine {
     /// `features` = último snapshot del bus (`None` ⇒ visual inactivo).
     /// `envelope` = envolvente del MISMO frame (`None` ⇒ mantener el trazo
     /// anterior). La fase usa EXCLUSIVAMENTE `position` — pasarla desde el
-    /// PositionClock. `palette` es la paleta del track en curso (del
-    /// `DecodedThumb`); el motor la funde internamente con la anterior.
+    /// PositionClock. `theme` es el tema del track en curso (de la
+    /// `DecodedThumb`); el motor lo funde internamente con el anterior.
     pub fn update(
         &mut self,
         features: Option<&Arc<AudioFeatures>>,
         envelope: Option<&Arc<StereoWaveform>>,
         position: Duration,
-        palette: &VisualPalette,
+        theme: &VisualTheme,
     ) -> VisualState {
-        self.palette = self.palette.mix(palette, PALETTE_RATE);
+        self.theme = self.theme.mix(theme, PALETTE_RATE);
         let Some(f) = features else {
             // Inactivo: resetear memoria para no arrastrar picos viejos y
             // dejar la escena en línea base lista para fluir al volver.
@@ -184,7 +184,7 @@ impl VisualEngine {
                     waveform: WaveformView::baseline(),
                     energy: 0.0,
                     brightness: 0.0,
-                    palette: self.palette,
+                    theme: self.theme,
                     active: false,
                 },
             };
@@ -259,7 +259,7 @@ impl VisualEngine {
                 waveform: self.waveform_view,
                 energy: self.smooth_energy.clamp(0.0, 1.0),
                 brightness: (self.smooth_brightness + pulse * 0.3).clamp(0.0, 1.0),
-                palette: self.palette,
+                theme: self.theme,
                 active: true,
             },
         }
@@ -308,10 +308,10 @@ mod tests {
         }))
     }
 
-    const FALLBACK: VisualPalette = VisualPalette::fallback();
+    const FALLBACK: VisualTheme = VisualTheme::fallback();
 
-    fn pal(cover: Option<[[u8; 3]; 3]>) -> VisualPalette {
-        VisualPalette::from_cover(cover)
+    fn pal(cover: Option<[[u8; 3]; 3]>) -> VisualTheme {
+        VisualTheme::from_cover(cover)
     }
 
     #[test]
@@ -539,17 +539,14 @@ mod tests {
         let f = Arc::new(features(0.6, 0.2, 0.0, false, 0.0));
         let warm = pal(Some([[200u8, 40, 40], [40, 200, 60], [30, 60, 220]]));
         // Primeros frames hacia "warm": se acerca, nunca salta.
-        let first = e
-            .update(Some(&f), None, Duration::ZERO, &warm)
-            .scene
-            .palette;
-        assert_eq!(first, e.palette);
+        let first = e.update(Some(&f), None, Duration::ZERO, &warm).scene.theme;
+        assert_eq!(first, e.theme);
         assert_ne!(first, warm, "la fusión es gradual, no teleport");
         for _ in 0..40 {
             e.update(Some(&f), None, Duration::from_millis(66), &warm);
         }
-        let near_warm = e.palette;
-        let d = |a: &VisualPalette, b: &VisualPalette| {
+        let near_warm = e.theme;
+        let d = |a: &VisualTheme, b: &VisualTheme| {
             a.primary
                 .iter()
                 .zip(b.primary.iter())
@@ -559,7 +556,7 @@ mod tests {
         assert!(d(&near_warm, &warm) <= 3, "converge al track nuevo");
         // Y la escena expone ESA paleta al renderer.
         let s = e.update(Some(&f), None, Duration::ZERO, &warm);
-        assert_eq!(s.scene.palette, e.palette);
+        assert_eq!(s.scene.theme, e.theme);
     }
 
     // BandRatios referenciado para mantener import vivo si evoluciona.

@@ -1,22 +1,38 @@
-//! Envolvente ESTÉREO de forma de onda (min/max por canal) extraída de las
-//! ventanas L/R del análisis, publicada junto a las features al consumidor
-//! visual (spec §20).
+//! Envolvente ESTÉREO de forma de onda (trace temporal + min/max por canal)
+//! extraída de las ventanas L/R del análisis, publicada junto a las features
+//! al consumidor visual (spec §20).
 //!
 //! La escena ambiental es un osciloscopio REAL: la forma de onda muestreada de
 //! cada canal del PCM. Por cada hop (~86 Hz) se reduce la ventana deslizante
-//! de cada canal (2048 muestras ≈ 46 ms) a `WAVEFORM_BUCKETS` pares min/max.
-//! El UI decima esos buckets al ancho de terminal sin re-rankear y pinta los
-//! puntos del trazo columna a columna, conservando el pico y el valle.
+//! de cada canal (2048 muestras ≈ 46 ms) a `WAVEFORM_BUCKETS` tríos por canal:
+//!
+//! - `trace`: muestra temporal representativa del bucket (su muestra central).
+//!   Es el TRAZO principal: conserva la evolución temporal (subidas, bajadas,
+//!   cruces por cero) para que el ojo pueda seguir una trayectoria.
+//! - `min`/`max`: envolvente del bucket. Es información AUXILIAR: protege
+//!   transitorios y picos que el trace puntual podría no tocar, y el renderer
+//!   la pinta como detalle secundario.
+//!
+//! El UI decima esos buckets al ancho de terminal sin re-rankear y pinta el
+//! trace columna a columna, con los extremos como acentos cuando aportan
+//! novedad sobre el trace.
 
 use std::sync::{Arc, RwLock};
 
-/// Nº de buckets (pares min/max por canal). Fijo para que el consumidor decime
-/// sin realojar: 128 cubren pantallas típicas de extremo a extremo.
+/// Nº de buckets (tríos trace/min/max por canal). Fijo para que el consumidor
+/// decime sin realojar: 128 cubren pantallas típicas de extremo a extremo.
 pub const WAVEFORM_BUCKETS: usize = 128;
 
-/// Envolvente de UN canal (valores de amplitud sin normalizar, ~-1..1).
+/// Envolvente de UN canal: trace temporal + envolvente min/max (valores de
+/// amplitud sin normalizar, ~-1..1).
+///
+/// `Copy`, tamaño fijo en stack, sin allocations: barata de publicar (~86 Hz)
+/// y de copiar al estado visual.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WaveformEnvelope {
+    /// Muestra temporal representativa por bucket (la central de su tramo).
+    /// Es la forma de onda reducida; NUNCA es `(min+max)/2`.
+    pub trace: [f32; WAVEFORM_BUCKETS],
     /// Mínimo (valle) por bucket.
     pub min: [f32; WAVEFORM_BUCKETS],
     /// Máximo (pico) por bucket.
@@ -24,16 +40,19 @@ pub struct WaveformEnvelope {
 }
 
 impl WaveformEnvelope {
-    /// Reduce la ventana mono `window` a `WAVEFORM_BUCKETS` pares min/max.
+    /// Reduce la ventana mono `window` a `WAVEFORM_BUCKETS` tríos trace/min/max.
     ///
     /// Cada bucket absorbe un tramo consecutivo: `len/128` muestras, con las
     /// primeras `len%128` tomando una extra (distribución uniforme, sin
-    /// superponer ventanas).
+    /// superponer ventanas). El trace es la muestra CENTRAL del tramo
+    /// (temporalmente representativa, O(1) por bucket); min/max barren el
+    /// tramo para no perder transitorios.
     pub fn from_window(window: &[f32]) -> Self {
+        let mut trace = [0.0f32; WAVEFORM_BUCKETS];
         let mut min = [0.0f32; WAVEFORM_BUCKETS];
         let mut max = [0.0f32; WAVEFORM_BUCKETS];
         if window.is_empty() {
-            return Self { min, max };
+            return Self { trace, min, max };
         }
         let per = window.len() / WAVEFORM_BUCKETS;
         let rem = window.len() % WAVEFORM_BUCKETS;
@@ -44,6 +63,7 @@ impl WaveformEnvelope {
                 continue;
             }
             let hi = idx + len;
+            trace[bucket] = window[idx + len / 2];
             min[bucket] = window[idx..hi]
                 .iter()
                 .copied()
@@ -54,12 +74,13 @@ impl WaveformEnvelope {
                 .fold(f32::NEG_INFINITY, f32::max);
             idx = hi;
         }
-        Self { min, max }
+        Self { trace, min, max }
     }
 
     /// Envolvente plana para cortes/arranques (trazo en línea base).
     pub fn silent() -> Self {
         Self {
+            trace: [0.0; WAVEFORM_BUCKETS],
             min: [0.0; WAVEFORM_BUCKETS],
             max: [0.0; WAVEFORM_BUCKETS],
         }
@@ -75,11 +96,12 @@ impl WaveformEnvelope {
     }
 }
 
-/// Forma de onda ESTÉREO: envolventes min/max independientes por canal.
+/// Forma de onda ESTÉREO: trace temporal + envolventes min/max
+/// independientes por canal.
 ///
-/// Es el payload del [`WaveformBus`]. El renderer conserva pico Y valle de
-/// cada canal; dos curvas distintas pueden pintarse en la misma columna sin
-/// perderse (una se dibuja sobre la otra con su glifo de mezcla).
+/// Es el payload del [`WaveformBus`]. El renderer sigue el trace de cada
+/// canal como trazo principal y conserva pico Y valle como acentos; dos
+/// canales distintos pueden pintarse en sus planos sin perderse.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StereoWaveform {
     /// Canal izquierdo (ch0).
@@ -355,6 +377,136 @@ mod tests {
             stereo.right.min.iter().all(|&v| (v - 0.15).abs() < 1e-6),
             "R no contiene muestras de L"
         );
+    }
+
+    #[test]
+    fn trace_follows_sine_with_sign_changes_and_zero_crossings() {
+        // TRACE CRÍTICO (§41): un seno debe producir un trace que sube, baja
+        // y cruza cero — evolución temporal, no una envolvente abstracta.
+        let sine: Vec<f32> = (0..2048)
+            .map(|i| 0.8 * ((i as f32 / 2048.0) * std::f32::consts::TAU * 6.0).sin())
+            .collect();
+        let env = WaveformEnvelope::from_window(&sine);
+        assert!(
+            env.trace.iter().any(|&v| v > 0.5),
+            "el trace alcanza picos +"
+        );
+        assert!(
+            env.trace.iter().any(|&v| v < -0.5),
+            "el trace alcanza valles -"
+        );
+        // Cruces por cero entre buckets consecutivos (cambios de signo).
+        let crossings = env
+            .trace
+            .windows(2)
+            .filter(|w| w[0].signum() != w[1].signum())
+            .count();
+        assert!(
+            crossings >= 8,
+            "el trace cruza cero como el seno: {crossings}"
+        );
+        // No es constante ni una envolvente centrada: varía de verdad.
+        let distinct: std::collections::HashSet<u32> = env
+            .trace
+            .iter()
+            .map(|v| (v * 100.0) as i32 as u32)
+            .collect();
+        assert!(
+            distinct.len() > 20,
+            "trace con resolución temporal: {}",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn trace_is_a_real_sample_not_the_envelope_midpoint() {
+        // El trace es una muestra temporal REAL del tramo, no (min+max)/2:
+        // en un seno el centro del tramo cae en el interior (min < trace <
+        // max) en la mayoría de buckets, mientras que el midpoint de una
+        // envolvente simétrica sería ~0.
+        let sine: Vec<f32> = (0..2048)
+            .map(|i| 0.8 * ((i as f32 / 2048.0) * std::f32::consts::TAU * 6.0).sin())
+            .collect();
+        let env = WaveformEnvelope::from_window(&sine);
+        let interior = (0..WAVEFORM_BUCKETS)
+            .filter(|&b| env.min[b] < env.trace[b] && env.trace[b] < env.max[b])
+            .count();
+        assert!(
+            interior > WAVEFORM_BUCKETS / 2,
+            "trace interior a la envolvente en {interior}/128 buckets"
+        );
+        // Y coincide con una muestra real de la ventana (la central del tramo).
+        assert!(
+            sine.contains(&env.trace[10]),
+            "el trace es una muestra de la ventana"
+        );
+    }
+
+    #[test]
+    fn envelope_catches_what_trace_misses_impulse() {
+        // Roles complementarios: un impulso fuera del centro del bucket NO lo
+        // toca el trace (sigue en línea base) pero la envolvente lo conserva.
+        let mut window = [0.0f32; 2048];
+        window[1000] = 1.0;
+        let env = WaveformEnvelope::from_window(&window);
+        // Bucket 62 cubre 992..1008, centro = índice 1000 → ¡SÍ lo toca!
+        // Usar índice 1001 (no central): trace en base, envolvente con pico.
+        let mut window2 = [0.0f32; 2048];
+        window2[1001] = 1.0;
+        let env2 = WaveformEnvelope::from_window(&window2);
+        let b = 1001 / 16;
+        assert_eq!(env2.max[b], 1.0, "la envolvente conserva el impulso");
+        assert!(
+            env2.trace[b].abs() < 1e-6,
+            "el trace puntual no lo toca: {}",
+            env2.trace[b]
+        );
+        let _ = env;
+    }
+
+    #[test]
+    fn trace_follows_ramp_monotonically() {
+        // Rampa creciente: el trace debe ser (casi) monótono creciente.
+        let ramp: Vec<f32> = (0..2048).map(|i| i as f32 / 2048.0 * 2.0 - 1.0).collect();
+        let env = WaveformEnvelope::from_window(&ramp);
+        let mut violations = 0;
+        for w in env.trace.windows(2) {
+            if w[1] < w[0] - 1e-6 {
+                violations += 1;
+            }
+        }
+        assert_eq!(
+            violations, 0,
+            "trace monótono en rampa: {violations} fallos"
+        );
+        assert!(env.trace[0] < -0.9 && env.trace[WAVEFORM_BUCKETS - 1] > 0.9);
+    }
+
+    #[test]
+    fn trace_alternates_on_square_wave() {
+        // Onda cuadrada con semiperiodo no alineado a buckets: el trace toma
+        // ambos extremos siguiendo la forma, y min/max cubren ambos.
+        let sq: Vec<f32> = (0..2048)
+            .map(|i| if (i / 5) % 2 == 0 { 0.9 } else { -0.9 })
+            .collect();
+        let env = WaveformEnvelope::from_window(&sq);
+        assert!(
+            env.trace.iter().all(|&v| v.abs() > 0.8),
+            "trace en extremos"
+        );
+        assert!(env.trace.iter().any(|&v| v > 0.0), "trace toca +");
+        assert!(env.trace.iter().any(|&v| v < 0.0), "trace toca -");
+        assert!(env.min.iter().all(|&v| (v + 0.9).abs() < 1e-6));
+        assert!(env.max.iter().all(|&v| (v - 0.9).abs() < 1e-6));
+    }
+
+    #[test]
+    fn trace_of_tiny_window_preserves_sample_order() {
+        // Ventana diminuta: cada muestra cae en su bucket, también el trace.
+        let env = WaveformEnvelope::from_window(&[0.5, -0.5]);
+        assert_eq!(env.trace[0], 0.5);
+        assert_eq!(env.trace[1], -0.5);
+        assert!(env.trace[2..].iter().all(|v| *v == 0.0));
     }
 
     #[test]

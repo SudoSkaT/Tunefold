@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! AudioFeatures ──▶ ParameterMapper ──▶ VisualParameters ──▶ VisualEngine
-//! PlaybackPosition ────────┐                    VisualPalette ─┘        │
+//! PlaybackPosition ────────┐                    VisualTheme ─┘        │
 //!                          ▼                       (de la portada)      ▼
 //!                                              VisualState (barras+escena)
 //!                                                                       ▼
@@ -24,7 +24,7 @@ pub mod params;
 pub mod render;
 
 pub use engine::{VisualEngine, VisualState};
-pub use palette::{ChannelColors, VisualPalette};
+pub use palette::{ChannelColors, CoverColorMatrix, VisualTheme};
 pub use params::{MapperConfig, ParameterMapper};
 
 /// Nº de barras del espectro TUI v0.

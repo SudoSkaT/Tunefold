@@ -401,6 +401,7 @@ mod tests {
             height,
             rgba,
             palette,
+            matrix: None,
         }))
     }
 

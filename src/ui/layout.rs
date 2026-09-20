@@ -186,18 +186,83 @@ pub fn dashboard_layout(body: Rect, profile: TerminalProfile) -> DashboardLayout
     }
 }
 
-/// Altura de la banda superior de Related (visual/letras) según el perfil.
-/// La banda se conserva siempre (mínimo 3 filas); el resto del cuerpo va a la
-/// lista de tracks.
-pub fn related_band_height(body_h: u16, profile: TerminalProfile) -> u16 {
+/// Ancho máximo del contenido centrado de Related (banda visual +
+/// recomendaciones).
+///
+/// En terminales muy anchos el waveform no debe estirarse indefinidamente: más
+/// allá de ~100 columnas cada columna cubre <1 bucket y el trazo gana puntos
+/// redundantes en vez de detalle. El espacio sobrante queda como breathing
+/// room lateral y la composición se percibe centrada.
+pub const RELATED_MAX_WIDTH: u16 = 100;
+
+/// Composición vertical de la vista Related: banda visual + gap + lista.
+///
+/// Jerarquía objetivo (~40% visual+letras / ~30% recomendaciones del viewport,
+/// resto breathing + casco): la banda tiene tope para no convertirse en un
+/// waveform gigante y la lista conserva un mínimo funcional con scroll
+/// interno. En terminales diminutos los mínimos mandan sobre la proporción.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelatedComposition {
+    /// Altura de la banda superior (visual/letras).
+    pub band: u16,
+    /// Fila de aire entre banda y lista (0 en terminales bajos).
+    pub gap: u16,
+    /// Altura de la lista de recomendaciones.
+    pub list: u16,
+}
+
+/// Calcula la composición de Related para un cuerpo de `body_h` filas.
+///
+/// - La banda persigue ~60% del cuerpo (≃40% del viewport con casco de 4) con
+///   topes por perfil para no devorar la lista.
+/// - El gap (1 fila) solo aparece con `body_h >= 20` y sitio sobrante.
+/// - La lista se queda con el resto (mínimo 1 fila: scroll interno).
+pub fn related_composition(body_h: u16, profile: TerminalProfile) -> RelatedComposition {
     let (min, max) = match profile {
-        TerminalProfile::Large => (6, 18),
-        TerminalProfile::Medium => (5, 14),
+        TerminalProfile::Large => (6, 16),
+        TerminalProfile::Medium => (5, 13),
         TerminalProfile::Small => (4, 10),
         TerminalProfile::Tiny => (3, 8),
     };
-    let raw = body_h.saturating_sub(7);
-    raw.clamp(min, max).min(body_h.saturating_sub(3))
+    if body_h == 0 {
+        return RelatedComposition {
+            band: 0,
+            gap: 0,
+            list: 0,
+        };
+    }
+    let target = ((body_h as u32 * 60) / 100) as u16;
+    let gap: u16 = if body_h >= 20 { 1 } else { 0 };
+    // Reserva mínima de la lista (2 filas: borde + 1 item) más el gap.
+    let reserve = 2 + gap;
+    let max_by_room = body_h.saturating_sub(reserve);
+    let band = target.clamp(min, max).min(max_by_room).max(1).min(body_h);
+    let list = body_h.saturating_sub(band + gap);
+    RelatedComposition { band, gap, list }
+}
+
+/// Altura de la banda superior de Related (visual/letras) según el perfil.
+/// La banda se conserva siempre (mínimo 3 filas); el resto del cuerpo va a la
+/// lista de tracks.
+///
+/// Wrapper de compatibilidad sobre [`related_composition`].
+pub fn related_band_height(body_h: u16, profile: TerminalProfile) -> u16 {
+    related_composition(body_h, profile).band
+}
+/// Centra `area` horizontalmente con ancho máximo `max`.
+/// Devuelve el mismo área si ya cabe; si no, un rectángulo centrado de ancho
+/// `max` con la misma `y`/`height`. Sin allocs, O(1).
+pub fn centered_width(area: Rect, max: u16) -> Rect {
+    if area.width <= max {
+        return area;
+    }
+    let dx = (area.width - max) / 2;
+    Rect {
+        x: area.x + dx,
+        y: area.y,
+        width: max,
+        height: area.height,
+    }
 }
 
 #[cfg(test)]
@@ -283,5 +348,75 @@ mod tests {
             assert!((3..=18).contains(&band), "banda {profile:?}@{h}: {band}");
             assert!(band + 2 <= h, "siempre queda sitio para la lista");
         }
+    }
+
+    #[test]
+    fn related_composition_hits_target_proportions() {
+        // Composición objetivo ~55% banda / resto lista del cuerpo (≈40/30 del
+        // viewport con casco): la banda persigue la proporción con topes y la
+        // lista conserva el resto con scroll interno.
+        let cases: &[(u16, TerminalProfile)] = &[
+            (16, TerminalProfile::Small),  // 60x20
+            (20, TerminalProfile::Medium), // 80x24
+            (26, TerminalProfile::Large),  // 100x30 / 120x30
+            (36, TerminalProfile::Large),  // 140x40
+            (46, TerminalProfile::Large),  // 160x50
+        ];
+        for (body_h, profile) in cases {
+            let c = related_composition(*body_h, *profile);
+            assert_eq!(
+                c.band + c.gap + c.list,
+                *body_h,
+                "la composición llena el cuerpo sin huecos ni solapes"
+            );
+            // Banda ≈40-60% del cuerpo (proporción, no rigidez matemática);
+            // en cuerpos enormes manda el tope para no crear un waveform
+            // gigante y el resto es lista con scroll + breathing.
+            if *body_h > 30 {
+                assert_eq!(c.band, 16, "banda topada en cuerpo {body_h}: {c:?}");
+            } else {
+                let frac = c.band as f32 / *body_h as f32;
+                assert!(
+                    (0.35..=0.65).contains(&frac),
+                    "banda ~55% del cuerpo {body_h}: {c:?}"
+                );
+            }
+            // Lista ≈30%+ del cuerpo (mínimo funcional con scroll).
+            assert!(
+                c.list as f32 / *body_h as f32 >= 0.25 || c.list >= 5,
+                "recomendaciones visibles en cuerpo {body_h}: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn related_composition_caps_band_and_keeps_list() {
+        // En terminales grandes la banda NO crece indefinidamente (tope 14) y
+        // la lista conserva filas suficientes para varias recomendaciones.
+        let c = related_composition(46, TerminalProfile::Large);
+        assert!(c.band <= 16, "banda topada: {c:?}");
+        assert!(c.list >= 10, "lista amplia: {c:?}");
+        assert_eq!(c.gap, 1, "breathing entre secciones: {c:?}");
+        // En terminales bajos no hay gap y los mínimos mandan.
+        let tiny = related_composition(10, TerminalProfile::Tiny);
+        assert_eq!(tiny.gap, 0);
+        assert!(tiny.band >= 3 && tiny.list >= 1, "mínimos: {tiny:?}");
+        assert_eq!(tiny.band + tiny.list, 10);
+    }
+
+    #[test]
+    fn centered_width_caps_and_centers_content() {
+        // Ancho normal: intacto. Ancho excesivo: centrado a RELATED_MAX_WIDTH.
+        let area = Rect::new(0, 0, 60, 20);
+        assert_eq!(centered_width(area, RELATED_MAX_WIDTH), area);
+        let wide = Rect::new(0, 0, 160, 50);
+        let c = centered_width(wide, RELATED_MAX_WIDTH);
+        assert_eq!(c.width, RELATED_MAX_WIDTH);
+        assert_eq!(c.x, (160 - RELATED_MAX_WIDTH) / 2, "centrado: {c:?}");
+        assert_eq!(c.y, 0);
+        assert_eq!(c.height, 50);
+        // Sin solape vertical: banda + gap + lista particionan el cuerpo.
+        let comp = related_composition(46, TerminalProfile::Large);
+        assert_eq!(comp.band + comp.gap + comp.list, 46);
     }
 }

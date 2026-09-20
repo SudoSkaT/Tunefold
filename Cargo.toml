@@ -1,6 +1,6 @@
 [package]
 name = "tunefold"
-version = "1.7.3"
+version = "1.7.32"
 edition = "2021"
 description = "TUI music player and recommendation engine. The YouTube/YouTube Music provider is an optional, GPL-3.0 component built with `--features youtube`."
 license = "GPL-3.0"

@@ -20,7 +20,7 @@ use crate::infrastructure::storage::TrackListeningStats;
 use crate::infrastructure::storage::{HistoryEntry, PlaylistRow};
 use crate::playback::clamp_seek_target;
 use crate::recommendation::RecommendationSession;
-use crate::visualization::{ParameterMapper, VisualEngine, VisualPalette};
+use crate::visualization::{ParameterMapper, VisualEngine, VisualTheme};
 
 use super::backend::BackendCommand;
 use super::event::{BackendEvent, UiEvent};
@@ -1271,10 +1271,10 @@ impl App {
         &mut self,
         fresh: Option<&Arc<AudioFeatures>>,
         position: Duration,
-        palette: &VisualPalette,
+        theme: &VisualTheme,
     ) -> crate::visualization::VisualState {
         self.visual
-            .update(fresh, self.waveform.as_ref(), position, palette)
+            .update(fresh, self.waveform.as_ref(), position, theme)
     }
 
     fn render_view(&mut self, frame: &mut Frame, area: Rect) {
@@ -1294,10 +1294,10 @@ impl App {
                     .filter(|t| t.elapsed() < std::time::Duration::from_millis(900))
                     .and_then(|_| self.features.clone());
                 let position = self.karaoke_now();
-                // La paleta de la portada entra al MOTOR: el engine la funde con
-                // la anterior y la escena la expone ya mezclada al renderer.
-                let palette = VisualPalette::from_cover(self.cover_palette());
-                let state = self.make_visual_state(fresh.as_ref(), position, &palette);
+                // El tema de la portada entra al MOTOR: el engine lo funde con
+                // el anterior y la escena lo expone ya mezclado al renderer.
+                let theme = self.cover_theme();
+                let state = self.make_visual_state(fresh.as_ref(), position, &theme);
                 let is_liked = self
                     .now_playing
                     .as_ref()
@@ -1330,8 +1330,8 @@ impl App {
                     .features_at
                     .filter(|t| t.elapsed() < std::time::Duration::from_millis(900))
                     .and_then(|_| self.features.clone());
-                let palette = VisualPalette::from_cover(self.cover_palette());
-                let visual = self.make_visual_state(fresh.as_ref(), position, &palette);
+                let theme = self.cover_theme();
+                let visual = self.make_visual_state(fresh.as_ref(), position, &theme);
                 related::render(
                     frame,
                     area,
@@ -1367,30 +1367,37 @@ impl App {
                     settings::render(frame, area, settings);
                 }
             }
-            View::Playlists => playlists::render(
-                frame,
-                area,
-                &mut self.playlist_view,
-                &self.playlists,
-                self.now_playing.as_ref().map(|t| t.identifier()).as_deref(),
-                &self.mouse_pos,
-                &mut self.mouse_click,
-                &self.listening_stats,
-                &self.liked,
-            ),
+            View::Playlists => {
+                let theme = self.cover_theme();
+                playlists::render(
+                    frame,
+                    area,
+                    &mut self.playlist_view,
+                    &self.playlists,
+                    self.now_playing.as_ref().map(|t| t.identifier()).as_deref(),
+                    &self.mouse_pos,
+                    &mut self.mouse_click,
+                    &self.listening_stats,
+                    &self.liked,
+                    &theme,
+                )
+            }
         }
     }
 
-    /// Paleta de tres colores dominantes de la portada del track en curso, si
-    /// la miniatura ya está decodificada. Se usa para colorear el karaoke.
-    fn cover_palette(&self) -> Option<[[u8; 3]; 3]> {
+    /// Tema visual del track en curso, derivado de la matriz cromática de su
+    /// portada si ya está decodificada (si no, el tema de respaldo). Alimenta
+    /// al motor visual, que lo funde con el anterior.
+    fn cover_theme(&self) -> VisualTheme {
         self.now_playing
             .as_ref()
             .and_then(|t| self.thumbnails.get(&t.identifier()))
             .and_then(|state| match state {
-                ThumbnailState::Loaded(img) => img.palette,
+                ThumbnailState::Loaded(img) => img.matrix,
                 _ => None,
             })
+            .map(|m| VisualTheme::from_matrix(&m))
+            .unwrap_or_else(VisualTheme::fallback)
     }
 
     /// ¿Está este track en L1K3D? Fuente única para todas las vistas.

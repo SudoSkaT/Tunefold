@@ -16,6 +16,7 @@ use crate::infrastructure::storage::{PlaylistRow, TrackListeningStats};
 use super::liked::Liked;
 use super::navigation::ListSelection;
 use super::related::{render_tracks_list, RelatedState};
+use crate::visualization::palette::VisualTheme;
 
 /// Sub-estado de presentación de la vista Playlists.
 ///
@@ -252,6 +253,7 @@ pub fn render(
     click: &mut bool,
     stats: &std::collections::HashMap<String, TrackListeningStats>,
     liked: &Liked,
+    theme: &VisualTheme,
 ) {
     if let Some(detail) = state.detail.as_mut() {
         let count = detail.tracks.tracks.len();
@@ -272,6 +274,7 @@ pub fn render(
             click,
             stats,
             liked,
+            theme,
         );
         return;
     }

@@ -3,7 +3,7 @@ use ratatui::Terminal;
 use std::error::Error;
 use tunefold::analysis::WaveformEnvelope;
 use tunefold::visualization::engine::{SceneState, VisualState, WaveformView};
-use tunefold::visualization::palette::VisualPalette;
+use tunefold::visualization::palette::VisualTheme;
 use tunefold::visualization::render::render;
 use tunefold::visualization::VISUAL_BARS;
 
@@ -35,7 +35,7 @@ fn punchy_view() -> WaveformView {
     }
 }
 
-fn state(palette: VisualPalette) -> VisualState {
+fn state(theme: VisualTheme) -> VisualState {
     let mut bars = [0.0f32; VISUAL_BARS];
     for (i, b) in bars.iter_mut().enumerate() {
         *b = 0.85 * (1.0 - i as f32 / VISUAL_BARS as f32).max(0.2);
@@ -51,17 +51,17 @@ fn state(palette: VisualPalette) -> VisualState {
             waveform: punchy_view(),
             energy: 0.7,
             brightness: 0.4,
-            palette,
+            theme,
             active: true,
         },
     }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let palette = VisualPalette::fallback();
+    let theme = VisualTheme::fallback();
     for (w, h) in [(120, 40), (100, 30), (80, 24), (70, 20), (60, 15)] {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| render(f, f.area(), &state(palette), 42.0))
+        term.draw(|f| render(f, f.area(), &state(theme), 42.0))
             .unwrap();
         let buf = term.backend().buffer().clone();
         let mut out = String::new();

@@ -137,7 +137,7 @@ fn main() {
     let mut engine = VisualEngine::new(ParameterMapper::default());
     let mut pos_ms = 0u64;
     let envelope = Arc::new(StereoWaveform::from_windows(&[0.5; 2048], &[0.5; 2048]));
-    let palette = tunefold::visualization::VisualPalette::from_cover(Some([
+    let theme = tunefold::visualization::VisualTheme::from_cover(Some([
         [220, 60, 120],
         [60, 160, 240],
         [240, 180, 90],
@@ -148,7 +148,7 @@ fn main() {
             Some(&feats),
             Some(&envelope),
             Duration::from_millis(pos_ms),
-            &palette,
+            &theme,
         ));
     });
 
@@ -156,7 +156,7 @@ fn main() {
         Some(&feats),
         Some(&envelope),
         Duration::from_secs(3),
-        &palette,
+        &theme,
     );
     bench("render TUI completo (80×5)", vis_budget, || {
         let backend = ratatui::backend::TestBackend::new(80, 5);

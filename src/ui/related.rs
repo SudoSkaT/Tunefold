@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
+use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
@@ -19,6 +19,7 @@ use ratatui::Frame;
 use crate::domain::lyrics::SyncLyrics;
 use crate::domain::track::Track;
 use crate::infrastructure::storage::TrackListeningStats;
+use crate::visualization::palette::VisualTheme;
 
 use super::liked::Liked;
 use super::widgets::karaoke::KaraokeScroller;
@@ -201,21 +202,29 @@ pub fn render(
     liked: &Liked,
 ) {
     let has_lyrics = state.synced.as_ref().filter(|s| !s.is_empty()).is_some();
-    // La banda superior es una sección permanente de la vista (relacionadas,
-    // letras o visual) y se conserva en TODO perfil: solo cambia su altura
-    // (`layout::related_band_height`), nunca su presencia. En perfiles bajos
-    // se reduce hasta 3 filas y el resto del espacio va a la lista.
+    // Composición global de la vista (jerarquía 40/30/30 del viewport):
+    // banda visual+letras con tope, 1 fila de breathing entre secciones en
+    // terminales altos, y lista de recomendaciones con el resto. El contenido
+    // se centra horizontalmente con ancho máximo (ver `RELATED_MAX_WIDTH`)
+    // para no estirar el waveform indefinidamente en terminales muy anchos.
     let profile = super::layout::TerminalProfile::from_rect(area);
-    let band_height = super::layout::related_band_height(area.height, profile);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(band_height), Constraint::Min(0)])
-        .split(area)
-        .to_vec();
+    let comp = super::layout::related_composition(area.height, profile);
+    let band_area = super::layout::centered_width(
+        Rect::new(area.x, area.y, area.width, comp.band),
+        super::layout::RELATED_MAX_WIDTH,
+    );
+    let list_area = super::layout::centered_width(
+        Rect::new(
+            area.x,
+            area.y + comp.band + comp.gap,
+            area.width,
+            area.height.saturating_sub(comp.band + comp.gap),
+        ),
+        super::layout::RELATED_MAX_WIDTH,
+    );
 
     {
-        let top_area = chunks[0];
+        let top_area = band_area;
         // El osciloscopio vive tras el texto: fondo plano + trazo atenuado de
         // puntos (nunca bloques), y encima el contenido (letras o mensaje).
         let trace_inner = top_area.inner(Margin {
@@ -239,7 +248,7 @@ pub fn render(
             }
             BandContent::Lyrics => {
                 paint_ambient(frame);
-                let colors = visual.scene.palette.karaoke_colors();
+                let colors = visual.scene.theme.karaoke_colors();
                 render_karaoke_over_scene(frame, top_area, state, position, finished, colors);
             }
             BandContent::Unavailable => {
@@ -263,7 +272,7 @@ pub fn render(
         }
     }
 
-    let tracks_area = chunks.last().copied().unwrap_or(area);
+    let tracks_area = list_area;
     render_tracks_list(
         frame,
         tracks_area,
@@ -275,6 +284,7 @@ pub fn render(
         click,
         stats,
         liked,
+        &visual.scene.theme,
     );
 }
 
@@ -342,9 +352,13 @@ fn render_message_over_scene(frame: &mut Frame, area: Rect, title: &str, text: &
 /// Now Playing. Acepta ratón para seleccionar la fila bajo el cursor; el
 /// scroll de la lista lo gestiona `ListState` automáticamente.
 ///
+/// `theme` viste el panel (borde, título y selección) con la identidad
+/// cromática de la canción en curso: toda la interfaz pertenece al mismo
+/// `VisualTheme` que el osciloscopio y las letras.
+///
 /// `current_key` identifica el track en curso (doblete contextual `▶`); el
 /// origen de cada fila y el juego de "nuevas" (green badge) viven en el estado.
-#[allow(clippy::too_many_arguments)] // ratón/estadísticas/liked son datos del render
+#[allow(clippy::too_many_arguments)] // ratón/estadísticas/liked/tema son datos del render
 pub fn render_tracks_list(
     frame: &mut Frame,
     area: Rect,
@@ -356,11 +370,24 @@ pub fn render_tracks_list(
     click: &mut bool,
     stats: &std::collections::HashMap<String, TrackListeningStats>,
     liked: &Liked,
+    theme: &VisualTheme,
 ) {
+    let border = Style::new().fg(Color::Rgb(
+        theme.border[0],
+        theme.border[1],
+        theme.border[2],
+    ));
+    let title_style = Style::new()
+        .fg(Color::Rgb(theme.title[0], theme.title[1], theme.title[2]))
+        .add_modifier(Modifier::BOLD);
     if state.tracks.is_empty() {
         frame.render_widget(
-            Paragraph::new(Line::from(empty))
-                .block(Block::default().borders(Borders::ALL).title(title)),
+            Paragraph::new(Line::from(empty)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border)
+                    .title(Span::styled(title, title_style)),
+            ),
             area,
         );
         return;
@@ -452,10 +479,19 @@ pub fn render_tracks_list(
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border)
+                .title(Span::styled(title, title_style)),
+        )
         .highlight_style(
             Style::new()
-                .bg(Color::DarkGray)
+                .bg(Color::Rgb(
+                    theme.selection[0],
+                    theme.selection[1],
+                    theme.selection[2],
+                ))
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ");
@@ -466,13 +502,13 @@ pub fn render_tracks_list(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::visualization::palette::VisualPalette;
+    use crate::visualization::palette::VisualTheme;
     use crate::visualization::VisualState;
     use ratatui::backend::TestBackend;
 
     fn visual_with_palette(cover: Option<[[u8; 3]; 3]>) -> VisualState {
         let mut s = VisualState::inactive();
-        s.scene.palette = VisualPalette::from_cover(cover);
+        s.scene.theme = VisualTheme::from_cover(cover);
         s
     }
 
@@ -614,7 +650,7 @@ mod tests {
         // Los estados adoptan la paleta de la portada YA resuelta por contraste
         // (la activa conserva el tinte cuando cumple; las demás se iluminan si
         // el tercer color azul puro no alcanzaba 3:1 sobre la escena aplacada).
-        let colors = VisualPalette::from_cover(cover).karaoke_colors();
+        let colors = VisualTheme::from_cover(cover).karaoke_colors();
         // En posición 12s: "uno" (ya leído), "dos" (en lectura), "tres" (no leído).
         let buf = render_state(
             Some(sync),
@@ -712,7 +748,7 @@ mod tests {
     fn karaoke_colors_resolve_for_contrast() {
         // La resolución adapta los tres estados garantizando contraste contra
         // el techo del fondo (χ ≥ 4.5 activo, χ ≥ 3.0 históricos).
-        let p = VisualPalette::fallback();
+        let p = VisualTheme::fallback();
         let colors = p.karaoke_colors();
         let bg = p.karaoke_bg_ceiling();
         let ratio = crate::visualization::palette::contrast_ratio;
@@ -734,7 +770,7 @@ mod tests {
             .map(|i| 0.8 * ((i as f32 / 2048.0) * std::f32::consts::TAU * 6.0).sin())
             .collect();
         let env = WaveformEnvelope::from_window(&samples);
-        let palette = VisualPalette::fallback();
+        let theme = VisualTheme::fallback();
         let visual = VisualState {
             bars: [0.9; crate::visualization::VISUAL_BARS],
             level: 0.9,
@@ -750,7 +786,7 @@ mod tests {
                 },
                 energy: 0.8,
                 brightness: 0.5,
-                palette,
+                theme,
                 active: true,
             },
         };
@@ -796,7 +832,7 @@ mod tests {
         // plano del techo en TODAS las celdas, también bajo el texto y los
         // puntos (el trazo no toca el fondo).
         const BLOCKS: [&str; 11] = ["█", "▇", "▆", "▅", "▄", "▃", "▂", "▁", "●", "░", "▒"];
-        let ceiling = palette.karaoke_bg_ceiling();
+        let ceiling = theme.karaoke_bg_ceiling();
         let expected = Color::Rgb(ceiling[0], ceiling[1], ceiling[2]);
         let mut points = 0usize;
         for y in 1..band_h.saturating_sub(1) {
