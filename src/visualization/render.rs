@@ -161,21 +161,21 @@ fn channel_rows(
 /// Distancia mínima entre puntos emitidos de la MISMA pista (min o max).
 ///
 /// Sin esto, cada columna pinta su punto y el conjunto degenera en una línea
-/// punteada continua (`••••`). Con esto, un punto solo se emite si aporta
-/// información espacial nueva: la forma (picos, valles, cruces por cero)
-/// cambia de fila y se sigue emitiendo; lo redundante (mesetas, silencios)
-/// queda espaciado. Criterio de densidad/resolución, no mutilación.
+/// punteada continua (`••••`). La regla es adaptativa: un punto redundante
+/// (misma fila que el anterior de su pista) se espacia cada 2 columnas,
+/// mientras que CUALQUIER cambio de fila (pendiente, transitorio, cruce) se
+/// emite de inmediato aunque la columna anterior pintara. Así las curvas
+/// activas y las altas frecuencias dibujan trazos densos y continuos, y lo
+/// plano (mesetas, silencios) queda disperso. Criterio de
+/// densidad/resolución espacial, no mutilación.
 const SCATTER_MIN_DIST: usize = 2;
 
-/// `true` si el candidato de una pista aporta información nueva (y actualiza
-/// el registro de la pista). Estado en el stack, sin allocs.
+/// `true` si el candidato `(col, row)` de una pista aporta información nueva
+/// (y actualiza el registro de la pista). Estado en el stack, sin allocs.
 fn scatter_emit(last: &mut Option<(usize, u16)>, col: usize, row: u16) -> bool {
     let emit = match *last {
         None => true,
-        Some((lc, lr)) => {
-            col.saturating_sub(lc) >= SCATTER_MIN_DIST
-                || row.abs_diff(lr) as usize >= SCATTER_MIN_DIST
-        }
+        Some((lc, lr)) => col.saturating_sub(lc) >= SCATTER_MIN_DIST || row != lr,
     };
     if emit {
         *last = Some((col, row));
@@ -183,8 +183,34 @@ fn scatter_emit(last: &mut Option<(usize, u16)>, col: usize, row: u16) -> bool {
     emit
 }
 
-/// Pinta el punto de trazo (símbolo y color; no toca el fondo, que lo dejó el
-/// resplandor de [`render_backdrop`]).
+/// Fracción de fundido de los enlaces de pendiente hacia el fondo del panel.
+const LINK_DIM: f32 = 0.6;
+
+/// Pinta el enlace tenue de una pendiente: si el punto `(col, row)` continúa
+/// la pista desde la columna INMEDIATA anterior con un salto vertical mayor
+/// de 1 celda, rellena las filas intermedias (excluidos ambos extremos) con
+/// el glifo de punto en color atenuado. Puentes de una sola columna: flujo
+/// orgánico sin líneas continuas. Sin allocs.
+fn paint_links(
+    frame: &mut Frame,
+    x: u16,
+    prev: Option<(usize, u16)>,
+    col: usize,
+    row: u16,
+    symbol: &str,
+    color: [u8; 3],
+) {
+    let Some((lc, lr)) = prev else { return };
+    if col != lc + 1 || row.abs_diff(lr) <= 1 {
+        return;
+    }
+    for r in lr.min(row) + 1..row.max(lr) {
+        paint_point(frame, x, r, symbol, color);
+    }
+}
+
+/// Pinta el punto de trazo (símbolo y color; no toca el fondo plano que dejó
+/// [`render_backdrop`]).
 fn paint_point(frame: &mut Frame, x: u16, y: u16, symbol: &str, color: [u8; 3]) {
     // SAFETY(ninguna): API pública de ratatui; celdas del área interior.
     if let Some(cell) = frame.buffer_mut().cell_mut(Position { x, y }) {
@@ -294,15 +320,19 @@ pub fn render(frame: &mut Frame, area: Rect, state: &VisualState, position_secs:
 /// (`amplitud == 0` en el medio del área) y la MISMA escala: L y R coexisten
 /// en las mismas coordenadas de tiempo y se cruzan sobre el eje central.
 /// Cada candidato solo se pinta si aporta novedad a su pista: misma fila que
-/// el anterior de la pista ⇒ se espacia en columnas; salto de filas ⇒ se
-/// emite siempre (picos y transitorios sobreviven). Las columnas redundantes
-/// quedan VACÍAS en vez de forzar una línea punteada continua. Cada canal
-/// conserva sus puntos y su color; donde ambos caen en la misma celda se
-/// pinta el tinte de mezcla (la coincidencia se ve, ningún canal se pierde).
+/// el anterior de la pista ⇒ se espacia en columnas; CUALQUIER cambio de
+/// fila ⇒ se emite de inmediato, así las pendientes dibujan trazos densos.
+/// Si el salto vertical entre columnas adyacentes supera 1 celda, las filas
+/// intermedias se puntean con el color de enlace tenue (una sola columna).
+/// Las columnas redundantes quedan VACÍAS en vez de forzar una línea
+/// punteada continua. Cada canal conserva sus puntos y su color; donde ambos
+/// caen en la misma celda se pinta el tinte de mezcla (la coincidencia se ve,
+/// ningún canal se pierde).
 ///
-/// Garantía Scatter: SOLO se pintan esos puntos discretos. Nunca se une un
-/// punto con el anterior (sin `draw_line`), nunca se rellena el intervalo
-/// vertical y nunca se emite un glifo de bloque en esta capa.
+/// Garantía Scatter: SOLO se pintan puntos discretos (muestras y enlaces
+/// tenues de pendiente adyacente). Nunca se une un punto con otro lejano
+/// (sin `draw_line`), nunca se rellena el intervalo vertical y nunca se
+/// emite un glifo de bloque en esta capa.
 ///
 /// Sin allocations por draw: por columna, como máximo 2 candidatos por canal
 /// y cuatro registros `(columna, fila)` en el stack. No toca el fondo (plano,
@@ -329,6 +359,13 @@ pub fn render_trace_subdued(frame: &mut Frame, area: Rect, state: &VisualState) 
 /// Fracción de fundido de los puntos atenuados hacia el fondo del techo.
 const SUBDUED_TRACE_DIM: f32 = 0.55;
 
+/// Fracción de la semialtura del plano que ocupa la amplitud ±1.
+///
+/// Por debajo de 1.0 a propósito: con el plano compartido por L y R, los
+/// picos a toda escala deben dejar margen para que ambas ondas se aprecien
+/// por separado en vez de aplanarse contra los bordes superpuestas.
+const PLANE_FILL: f32 = 0.65;
+
 fn trace_points_impl(
     frame: &mut Frame,
     area: Rect,
@@ -350,10 +387,12 @@ fn trace_points_impl(
     };
 
     // Plano único: centro discreto del área y una sola escala para AMBOS
-    // canales (el 0 compartido queda en la fila central).
+    // canales (el 0 compartido queda en la fila central). El llenado es
+    // parcial a propósito (ver `PLANE_FILL`): los picos dejan margen arriba y
+    // abajo para que L y R se distingan en vez de saturar los bordes.
     let gain = scene.waveform.gain;
     let center = (h as f32 - 1.0) * 0.5;
-    let scale = ((h as f32 - 1.0) * 0.5 * 0.92).max(1.0) * gain;
+    let scale = ((h as f32 - 1.0) * 0.5 * PLANE_FILL).max(1.0) * gain;
 
     let channels = palette.channel_colors();
     let mut left_c = channels.left;
@@ -371,6 +410,17 @@ fn trace_points_impl(
     let g_left = glyphs.trace_left();
     let g_right = glyphs.trace_right();
     let g_both = glyphs.trace_both();
+    // Enlaces tenues de pendiente: mismo glifo con el color fundido hacia el
+    // fondo del panel. Solo rellenan el hueco vertical entre columnas
+    // ADYACENTES (nunca tramos largos): la pendiente se lee orgánica sin
+    // convertirse en línea continua.
+    let panel_bg = if subdued {
+        palette.karaoke_bg_ceiling()
+    } else {
+        palette.background
+    };
+    let link_l = mix_c(left_c, panel_bg, LINK_DIM);
+    let link_r = mix_c(right_c, panel_bg, LINK_DIM);
 
     let waveform = &scene.waveform;
     // Una pista por extremo (min/max) y canal: los raíles persistentes
@@ -382,13 +432,17 @@ fn trace_points_impl(
     let mut last_rmx: Option<(usize, u16)> = None;
     for col in 0..w {
         let x = area.x + col as u16;
-        // Candidatos de cada canal tras el thinning (filas absolutas).
+        // Candidatos de cada canal tras el thinning (filas absolutas). Los
+        // enlaces se pintan al momento (siempre ANTES que los puntos reales
+        // de la columna, que los pisan si coinciden).
         let (lrows, ln) = channel_rows(&waveform.left, w, col, h, area.y, center, scale);
         let mut lsel = [0u16; 2];
         let mut lsel_n = 0usize;
         for (i, &row) in lrows[..ln].iter().enumerate() {
             let last = if i == 0 { &mut last_lmn } else { &mut last_lmx };
+            let prev = *last;
             if scatter_emit(last, col, row) {
+                paint_links(frame, x, prev, col, row, g_left, link_l);
                 lsel[lsel_n] = row;
                 lsel_n += 1;
             }
@@ -398,7 +452,9 @@ fn trace_points_impl(
         let mut rsel_n = 0usize;
         for (i, &row) in rrows[..rn].iter().enumerate() {
             let last = if i == 0 { &mut last_rmn } else { &mut last_rmx };
+            let prev = *last;
             if scatter_emit(last, col, row) {
+                paint_links(frame, x, prev, col, row, g_right, link_r);
                 rsel[rsel_n] = row;
                 rsel_n += 1;
             }
@@ -689,15 +745,16 @@ mod tests {
 
     #[test]
     fn palette_colors_the_bars() {
-        // Con paleta, una barra activa usa un color RGB de la portada en vez
-        // del esquema cian fijo: intensidad alta → dominante, leve → acento.
+        // Con paleta, una barra activa usa el color de la portada (tameado,
+        // no el RGB crudo) en vez del esquema cian fijo: intensidad alta →
+        // dominante, leve → acento.
         let cover = Some([[220u8, 30, 30], [40, 200, 60], [30, 60, 220]]);
         let high = active_state(0.9, VisualPalette::from_cover(cover));
         let buf = drawing(&|f| render(f, f.area(), &high, 0.0));
         let has_palette_color = buf
             .content()
             .iter()
-            .any(|c| c.fg == Color::Rgb(220, 30, 30));
+            .any(|c| c.fg == Color::Rgb(215, 35, 35));
         assert!(
             has_palette_color,
             "el trazo/barras usan colores de la portada"
@@ -707,7 +764,7 @@ mod tests {
         let has_accent = buf
             .content()
             .iter()
-            .any(|c| c.fg == Color::Rgb(30, 60, 220));
+            .any(|c| c.fg == Color::Rgb(35, 63, 215));
         assert!(has_accent, "una columna leve usa el acento de la portada");
     }
 
@@ -801,11 +858,11 @@ mod tests {
 
     #[test]
     fn stereo_channels_render_as_distinct_point_sets() {
-        // L fuerte, R débil (amplitudes distintas): ambas curvas coexisten en
-        // el plano compartido con puntos `•`, cada una con su propio color de
-        // canal; donde coinciden se ve la mezcla. L barre más lejos del eje.
+        // L fuerte (0.9), R suave (0.2): ambas curvas coexisten en el plano
+        // compartido con puntos `•`, cada una con su propio color de canal;
+        // donde coinciden se ve la mezcla. L barre más lejos del eje que R.
         let mut st = active_state(0.9, VisualPalette::fallback());
-        st.scene.waveform = stereo_view(0.9, 0.5, 3);
+        st.scene.waveform = stereo_view(0.9, 0.2, 3);
         let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
         let channels = st.scene.palette.channel_colors();
         let brightness = if st.scene.active {
@@ -822,34 +879,25 @@ mod tests {
         let left_color = to_color(left_rgb);
         let right_color = to_color(right_rgb);
 
-        let mut l_count = 0usize;
-        let mut r_count = 0usize;
-        let mut l_far = 0usize;
-        for x in 1..39u16 {
-            for y in 1..7u16 {
-                let cell = buf.cell((x, y)).unwrap();
-                if is_point(cell.symbol()) {
-                    if cell.fg == left_color {
-                        l_count += 1;
-                        if (y as f32 - 3.5).abs() > 1.5 {
-                            l_far += 1;
-                        }
-                    }
-                    if cell.fg == right_color {
-                        r_count += 1;
+        let sweep = |target: Color| {
+            let mut best = f32::MIN;
+            for x in 1..39u16 {
+                for y in 1..7u16 {
+                    let cell = buf.cell((x, y)).unwrap();
+                    if is_point(cell.symbol()) && cell.fg == target {
+                        best = best.max((y as f32 - 3.5).abs());
                     }
                 }
             }
-        }
-        assert!(l_count > 0, "L llega al trazo con color de canal L");
-        assert!(r_count > 0, "R llega al trazo con color de canal R");
+            best
+        };
+        let l_sweep = sweep(left_color);
+        let r_sweep = sweep(right_color);
+        assert!(l_sweep > 0.0, "L llega al trazo con color de canal L");
+        assert!(r_sweep >= 0.0, "R llega al trazo con color de canal R");
         assert!(
-            l_far > 0,
-            "L (0.9) alcanza filas lejos del eje que R (0.5) no"
-        );
-        assert!(
-            l_count + r_count >= 10,
-            "conjuntos de puntos lo suficientemente grandes: L={l_count} R={r_count}"
+            l_sweep > r_sweep,
+            "L (0.9) barre más lejos del eje que R (0.2): {l_sweep} vs {r_sweep}"
         );
     }
 
@@ -885,10 +933,11 @@ mod tests {
         );
     }
     #[test]
-    fn square_wave_reaches_both_edges_of_shared_plane() {
-        // Onda cuadrada ±0.9 en ambos canales sobre el plano compartido:
-        // pico arriba (y=1) y valle abajo (y=6) del área interior, con el
-        // centro libre de relleno (extremos discretos superpuestos).
+    fn square_wave_keeps_headroom_with_visible_extremes() {
+        // Onda cuadrada ±0.9 sobre el plano compartido: con el llenado parcial
+        // los extremos quedan VIBLES pero sin aplanarse contra los bordes
+        // (y=2 arriba, y=5 abajo en el interior y=1..7): hay margen para
+        // distinguir ambas ondas.
         let sq = square_stereo(0.9).left;
         let mut st = active_state(0.9, VisualPalette::fallback());
         st.scene.waveform = WaveformView {
@@ -898,13 +947,19 @@ mod tests {
         };
         let buf = drawing(&|f| render(f, f.area(), &st, 0.0));
         assert!(
-            (1..39u16).any(|x| is_point(buf.cell((x, 1)).unwrap().symbol())),
-            "el pico llega al borde superior"
+            (1..39u16).any(|x| is_point(buf.cell((x, 2)).unwrap().symbol())),
+            "el pico queda visible arriba con margen"
         );
         assert!(
-            (1..39u16).any(|x| is_point(buf.cell((x, 6)).unwrap().symbol())),
-            "el valle llega al borde inferior"
+            (1..39u16).any(|x| is_point(buf.cell((x, 5)).unwrap().symbol())),
+            "el valle queda visible abajo con margen"
         );
+        for y in [1u16, 6] {
+            assert!(
+                (1..39u16).all(|x| !is_point(buf.cell((x, y)).unwrap().symbol())),
+                "los bordes quedan libres (y={y}): sin saturación"
+            );
+        }
     }
 
     #[test]
@@ -1643,6 +1698,105 @@ mod tests {
             empty > 0,
             "con huecos entre puntos ({empty} columnas vacías)"
         );
+    }
+
+    #[test]
+    fn active_signal_is_denser_than_flat_signal() {
+        // La densidad sigue al contenido: un seno fuerte emite muchos más
+        // puntos que una constante (que queda espaciada), sin que ninguno de
+        // los dos llene todas las columnas como una línea sólida.
+        let sine: Vec<f32> = (0..2048)
+            .map(|i| 0.9 * ((i as f32 / 2048.0) * std::f32::consts::TAU * 6.0).sin())
+            .collect();
+        let env = WaveformEnvelope::from_window(&sine);
+        let count = |left: WaveformEnvelope, right: WaveformEnvelope| {
+            let st = plain_state(WaveformView {
+                left,
+                right,
+                gain: 1.0,
+            });
+            let buf = drawing(&|f| {
+                render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode))
+            });
+            buf.content()
+                .iter()
+                .filter(|c| is_point(c.symbol()))
+                .count()
+        };
+        let active = count(env, WaveformEnvelope::silent());
+        let flat = count(
+            WaveformEnvelope::from_window(&[0.5; 2048]),
+            WaveformEnvelope::silent(),
+        );
+        assert!(
+            active > flat * 3 / 2,
+            "señal activa ({active}) más densa que plana ({flat})"
+        );
+    }
+
+    #[test]
+    fn steep_step_paints_dim_link_cells_between() {
+        // Escalón (+0.9 → -0.9 a mitad de ventana): la columna del salto une
+        // ambos extremos con puntos de enlace TENUES (mismo glifo, color
+        // fundido), sin tocar el fondo y sin extenderse a más columnas.
+        let mut step = [0.9f32; 2048];
+        for v in step.iter_mut().skip(1000) {
+            *v = -0.9;
+        }
+        let env = WaveformEnvelope::from_window(&step);
+        let st = plain_state(WaveformView {
+            left: env,
+            right: WaveformEnvelope::silent(),
+            gain: 1.0,
+        });
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                // Composición real: fondo plano + trazo (el enlace nunca debe
+                // teñir el fondo, solo su propio glifo).
+                render_backdrop(f, f.area(), &st, false);
+                render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let palette = VisualPalette::fallback();
+        let channels = palette.channel_colors();
+        let link = to_color(mix_c(channels.left, palette.background, LINK_DIM));
+        // Filas extremas globales del trazo L (arriba y abajo del plano).
+        let mut top = u16::MAX;
+        let mut bottom = 0u16;
+        for y in 0..8u16 {
+            for x in 0..40u16 {
+                if is_point(buf.cell((x, y)).unwrap().symbol()) {
+                    top = top.min(y);
+                    bottom = bottom.max(y);
+                }
+            }
+        }
+        assert!(top < bottom, "el escalón toca ambos extremos");
+        // Celdas de enlace: color fundido, estrictamente entre extremos.
+        let links: Vec<(u16, u16)> = (0..40u16)
+            .flat_map(|x| (0..8u16).map(move |y| (x, y)))
+            .filter(|&(x, y)| {
+                let c = buf.cell((x, y)).unwrap();
+                is_point(c.symbol()) && c.fg == link
+            })
+            .collect();
+        assert!(!links.is_empty(), "el salto pinta enlaces tenues");
+        assert!(
+            links.iter().all(|&(_, y)| y > top && y < bottom),
+            "enlaces solo entre extremos: {links:?} en ({top},{bottom})"
+        );
+        // El fondo sigue intacto bajo trazo y enlaces (puntos, no bloques).
+        let base = palette.background;
+        for (x, y) in links {
+            assert_eq!(
+                buf.cell((x, y)).unwrap().bg,
+                Color::Rgb(base[0], base[1], base[2]),
+                "el enlace no tiñe el fondo ({x},{y})"
+            );
+        }
     }
 
     #[test]

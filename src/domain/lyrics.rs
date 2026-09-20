@@ -28,10 +28,20 @@ impl SyncLyrics {
     /// Soporta `[mm:ss]`, `[mm:ss.xx]`, `[hh:mm:ss.xx]`, con o sin fracción, y
     /// varias marcas por línea (`[00:12.34][00:15.67] texto`). Las etiquetas de
     /// metadatos (`[ti:...]`, `[ar:...]`) y las líneas sin marca se ignoran.
+    ///
+    /// Etiqueta `[offset:±ms]` (estándar LRC, en milisegundos con signo): se
+    /// aplica a TODAS las líneas (saturando en cero). Sin ella las letras con
+    /// desplazamiento global sonarían sistemáticamente adelantadas o
+    /// atrasadas; antes se ignoraba en silencio.
     pub fn parse(input: &str) -> SyncLyrics {
         let mut lines = Vec::new();
+        let mut offset_ms: i64 = 0;
         for raw in input.lines() {
             let mut rest = raw.trim();
+            if let Some(off) = strip_offset(rest) {
+                offset_ms = off;
+                continue;
+            }
             let mut times = Vec::new();
             while let Some((time, tail)) = strip_timestamp(rest) {
                 times.push(time);
@@ -42,8 +52,9 @@ impl SyncLyrics {
             }
             let text = rest.trim().to_string();
             for time in times {
+                let shifted = (time.as_millis() as i64 + offset_ms).max(0) as u64;
                 lines.push(LyricLine {
-                    time,
+                    time: Duration::from_millis(shifted),
                     text: text.clone(),
                 });
             }
@@ -71,6 +82,13 @@ fn strip_timestamp(s: &str) -> Option<(Duration, &str)> {
     let (body, tail) = s.split_once(']')?;
     let time = parse_time(body)?;
     Some((time, tail))
+}
+
+/// Extrae la etiqueta global `[offset:±ms]` (milisegundos con signo, estándar
+/// LRC). Solo vale al inicio de la línea y no genera verso.
+fn strip_offset(s: &str) -> Option<i64> {
+    let body = s.strip_prefix("[offset:")?.strip_suffix(']')?;
+    body.trim().parse().ok()
 }
 
 /// Parsea un reloj `mm:ss.xx` (o `hh:mm:ss.xx`) a una duración.
@@ -164,5 +182,37 @@ mod tests {
     fn empty_input_yields_no_lines() {
         assert!(SyncLyrics::parse("").is_empty());
         assert!(SyncLyrics::parse("[ti:x]\nsin tiempo\n").is_empty());
+    }
+
+    #[test]
+    fn offset_tag_shifts_all_lines() {
+        // Desplazamiento global negativo (caso típico: intro instrumental):
+        // todas las marcas se adelantan y la etiqueta no genera verso.
+        let lrc = "[offset:-2000]\n[00:10.00] diez\n[00:20.00] veinte\n";
+        let sync = SyncLyrics::parse(lrc);
+        assert_eq!(sync.lines.len(), 2);
+        assert_eq!(sync.lines[0].time, Duration::from_millis(8_000));
+        assert_eq!(sync.lines[1].time, Duration::from_millis(18_000));
+        assert_eq!(sync.active_index(Duration::from_millis(8_500)), Some(0));
+    }
+
+    #[test]
+    fn positive_offset_delays_and_clamps_at_zero() {
+        let lrc = "[offset:+1500]\n[00:10.00] diez\n";
+        let sync = SyncLyrics::parse(lrc);
+        assert_eq!(sync.lines[0].time, Duration::from_millis(11_500));
+        // Un offset que dejaría tiempos negativos satura en cero, sin pánico.
+        let lrc = "[offset:-99999]\n[00:10.00] diez\n";
+        let sync = SyncLyrics::parse(lrc);
+        assert_eq!(sync.lines[0].time, Duration::ZERO);
+    }
+
+    #[test]
+    fn malformed_offset_is_ignored_like_metadata() {
+        // `[offset:x]` no numérico no desplaza nada ni genera versos.
+        let lrc = "[offset:pronto]\n[00:10.00] diez\n";
+        let sync = SyncLyrics::parse(lrc);
+        assert_eq!(sync.lines.len(), 1);
+        assert_eq!(sync.lines[0].time, Duration::from_millis(10_000));
     }
 }

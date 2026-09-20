@@ -64,6 +64,14 @@ impl RelatedState {
         !self.tracks.is_empty()
     }
 
+    /// `true` si la banda superior muestra el karaoke con líneas activas (y
+    /// por tanto la vista necesita refresco fino): hay letra y el modo no la
+    /// oculta tras el visualizador.
+    pub fn shows_lyrics(&self, mode: super::VisualContent) -> bool {
+        let has = self.synced.as_ref().filter(|s| !s.is_empty()).is_some();
+        has && !matches!(mode, super::VisualContent::Visual)
+    }
+
     /// Actualiza la cola mostrada y su paralelo de orígenes, y marca las filas
     /// recién añadidas (diferencia por identificador estable con la cola
     /// anterior) como "nuevas" para el feedback contextual.
@@ -812,6 +820,22 @@ mod tests {
             points > 0,
             "el osciloscopio sigue vivo tras las letras (puntos atenuados)"
         );
+    }
+
+    #[test]
+    fn shows_lyrics_only_when_band_displays_karaoke() {
+        use super::super::VisualContent;
+        let sync = SyncLyrics::parse("[00:05] hola\n");
+        let with = RelatedState {
+            synced: Some(sync),
+            ..RelatedState::default()
+        };
+        assert!(with.shows_lyrics(VisualContent::Auto));
+        assert!(with.shows_lyrics(VisualContent::Lyrics));
+        assert!(!with.shows_lyrics(VisualContent::Visual));
+        let empty = RelatedState::default();
+        assert!(!empty.shows_lyrics(VisualContent::Auto));
+        assert!(!empty.shows_lyrics(VisualContent::Lyrics));
     }
 
     #[test]

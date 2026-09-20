@@ -214,13 +214,24 @@ impl App {
         // buffering/stream lento, barra de progreso y extrapolación del
         // karaoke. Sin animación la UI se redibuja únicamente al recibir
         // eventos, de modo que una terminal en reposo no quema ciclos.
+        //
+        // Dos cadencias: el karaoke a la vista late a 10 Hz para que la línea
+        // activa cambie como máximo ~100 ms tarde (con 250 ms se percibía
+        // sistemáticamente atrasado en LRCs densos); el resto sigue a 4 Hz.
+        // El render cuesta ~50 µs, así que el coste es despreciable.
         let mut redraw = tokio::time::interval(std::time::Duration::from_millis(250));
-        redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut redraw_fast = tokio::time::interval(std::time::Duration::from_millis(100));
+        redraw_fast.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             let animated = self.animation_active();
+            let karaoke = self.view == View::Related && self.related.shows_lyrics(self.visual_mode);
             tokio::select! {
-                _ = redraw.tick(), if animated => {
+                _ = redraw_fast.tick(), if animated && karaoke => {
+                    self.draw(terminal)?;
+                }
+                _ = redraw.tick(), if animated && !karaoke => {
                     self.draw(terminal)?;
                 }
                 ui = ui_rx.recv() => {

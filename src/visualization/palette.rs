@@ -51,16 +51,33 @@ impl VisualPalette {
     }
 
     /// De los tres colores dominantes de la portada (`None` ⇒ [`Self::fallback`]).
+    ///
+    /// Los dominantes crudos (neones puros, casi-blancos) se `tame`an: mismo
+    /// matiz, pero sin gritar en barras, karaoke y trazo.
     pub fn from_cover(cover: Option<[[u8; 3]; 3]>) -> Self {
         let Some(p) = cover else {
             return Self::fallback();
         };
+        let primary = Self::tame(p[0]);
         Self {
-            primary: p[0],
-            secondary: p[1],
-            accent: p[2],
-            background: Self::shade(p[0], 0.22),
+            primary,
+            secondary: Self::tame(p[1]),
+            accent: Self::tame(p[2]),
+            background: Self::shade(primary, 0.22),
         }
+    }
+
+    /// Recorta la agresividad de un dominante de portada conservando su matiz:
+    /// saturación ≤ [`TAME_MAX_SATURATION`] y luminosidad en
+    /// [`TAME_MIN_LIGHTNESS`]..=[`TAME_MAX_LIGHTNESS`].
+    ///
+    /// Pura y determinista (ida y vuelta RGB↔HSL con redondeo u8). Los grises
+    /// (saturación 0) solo se mueven si son casi negros o casi blancos.
+    fn tame(c: [u8; 3]) -> [u8; 3] {
+        let (h, s, l) = rgb_to_hsl(c);
+        let s = s.min(TAME_MAX_SATURATION);
+        let l = l.clamp(TAME_MIN_LIGHTNESS, TAME_MAX_LIGHTNESS);
+        hsl_to_rgb(h, s, l)
     }
 
     /// Mezcla lineal hacia `other` (t=0 mantiene `self`, t=1 llega a `other`).
@@ -194,6 +211,15 @@ pub const KARAOKE_SUBDUED: f32 = 0.45;
 /// ambiental aplica a una celda (techo de brillo para [`VisualPalette`]).
 pub const KARAOKE_TRACE_CEILING: f32 = 0.27;
 
+/// Saturación máxima que conserva un dominante de portada (0..1): por encima
+/// los neones saturan barras, karaoke y trazo.
+pub const TAME_MAX_SATURATION: f32 = 0.72;
+/// Luminosidad mínima de un dominante (0..1): los casi-negros se elevan lo
+/// justo para seguir visibles sobre la escena oscura.
+pub const TAME_MIN_LIGHTNESS: f32 = 0.28;
+/// Luminosidad máxima de un dominante (0..1): los casi-blancos se apagan lo
+/// justo para no deslumbrar.
+pub const TAME_MAX_LIGHTNESS: f32 = 0.78;
 /// Contraste mínimo (WCAG) de la línea de karaoke en lectura (la resolución
 /// además la marca en negrita).
 pub const KARAOKE_ACTIVE_CONTRAST: f64 = 4.5;
@@ -205,8 +231,10 @@ pub const KARAOKE_DIM_CONTRAST: f64 = 3.0;
 const CHANNEL_LEFT_TINT: f32 = 0.55;
 /// Fracción de tinte frío de R → dominante (secondary→primary).
 const CHANNEL_RIGHT_TINT: f32 = 0.30;
-/// Distancia euclídea mínima aceptable entre L y R (0..442).
-const CHANNEL_DISTANCE_MIN: f32 = 60.0;
+/// Distancia euclídea mínima aceptable entre L y R (0..442): lo bastante
+/// amplia para distinguir ambos trazos a simple vista cuando se cruzan en el
+/// plano compartido.
+const CHANNEL_DISTANCE_MIN: f32 = 100.0;
 /// Pasos máximos de separación incremental L(↑claro) R(↓oscuro).
 const CHANNEL_SEPARATION_STEPS: u8 = 8;
 /// Factor de corrección por paso de separación (0..1).
@@ -226,6 +254,51 @@ fn channel_distance(a: [u8; 3], b: [u8; 3]) -> f32 {
     let (ar, ag, ab) = (a[0] as f32, a[1] as f32, a[2] as f32);
     let (br, bg, bb) = (b[0] as f32, b[1] as f32, b[2] as f32);
     ((ar - br).powi(2) + (ag - bg).powi(2) + (ab - bb).powi(2)).sqrt()
+}
+
+/// RGB (0..255) → HSL (matiz 0..1, saturación 0..1, luminosidad 0..1).
+fn rgb_to_hsl(c: [u8; 3]) -> (f32, f32, f32) {
+    let (r, g, b) = (
+        f32::from(c[0]) / 255.0,
+        f32::from(c[1]) / 255.0,
+        f32::from(c[2]) / 255.0,
+    );
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) * 0.5;
+    if (max - min).abs() < f32::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = d / (1.0 - (2.0 * l - 1.0).abs());
+    let h = if (max - r).abs() < f32::EPSILON {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if (max - g).abs() < f32::EPSILON {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    } / 6.0;
+    (h, s.clamp(0.0, 1.0), l.clamp(0.0, 1.0))
+}
+
+/// HSL → RGB (0..255, con redondeo).
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [u8; 3] {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h * 6.0).rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match (h * 6.0).floor() as i32 % 6 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c * 0.5;
+    [
+        ((r + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
 }
 
 /// Colores resueltos de los tres estados del karaoke (ya leído / en lectura /
@@ -303,12 +376,38 @@ mod tests {
         let p = VisualPalette::from_cover(cover);
         assert_eq!(p.primary, [200, 40, 40]);
         assert_eq!(p.secondary, [40, 200, 60]);
-        assert_eq!(p.accent, [30, 60, 220]);
+        // El accent supera la saturación máxima (S≈0.76): se recorta al mismo
+        // matiz sin cambiar de color ([35, 63, 215] sigue siendo azul).
+        assert_eq!(p.accent, [35, 63, 215]);
         assert_eq!(p.background, [(200.0f32 * 0.22).round() as u8, 9, 9]);
         assert!(
             u32::from(p.background[0]) + u32::from(p.background[1]) + u32::from(p.background[2])
                 < u32::from(p.primary[0]) + u32::from(p.primary[1]) + u32::from(p.primary[2]),
             "el fondo es siempre una versión oscura del dominante"
+        );
+    }
+
+    #[test]
+    fn tame_keeps_hue_but_caps_neon_white_and_black() {
+        // Neones puros: mismo matiz (canal dominante intacto), picos recortados.
+        let neon = VisualPalette::from_cover(Some([[255u8, 0, 0], [0, 255, 0], [0, 0, 255]]));
+        assert_eq!(neon.primary, [219, 36, 36]);
+        assert_eq!(neon.secondary, [36, 219, 36]);
+        assert_eq!(neon.accent, [36, 36, 219]);
+        // Casi-blanco: se apaga sin agrisarse del todo (conserva calidez).
+        let white =
+            VisualPalette::from_cover(Some([[250u8, 245, 235], [250, 245, 235], [250, 245, 235]]));
+        assert_eq!(white.primary, [233, 210, 165]);
+        // Casi-negro: se eleva a gris visible; gris medio: intacto.
+        let black = VisualPalette::from_cover(Some([[5u8, 5, 5], [5, 5, 5], [5, 5, 5]]));
+        assert_eq!(black.primary, [71, 71, 71]);
+        let gray =
+            VisualPalette::from_cover(Some([[128u8, 128, 128], [128, 128, 128], [128, 128, 128]]));
+        assert_eq!(gray.primary, [128, 128, 128]);
+        // Determinista.
+        assert_eq!(
+            VisualPalette::from_cover(Some([[255u8, 0, 0], [0, 255, 0], [0, 0, 255]])),
+            neon
         );
     }
 
@@ -439,7 +538,7 @@ mod tests {
             contrast_ratio(c.current, bg)
         );
         assert!(
-            c.current[0] >= 200 && c.current[1] >= 200,
+            c.current[0] >= 190 && c.current[1] >= 190,
             "se resuelve claro: {:?}",
             c.current
         );
@@ -541,6 +640,7 @@ mod tests {
         for cover in [
             None,
             Some([[200u8, 40, 40], [40, 200, 60], [30, 60, 220]]), // RGB primarios
+            Some([[255u8, 0, 0], [0, 255, 0], [0, 0, 255]]),       // neones puros
             Some([[40u8, 30, 90], [120, 60, 40], [10, 80, 110]]),  // portada oscura
             Some([[240u8, 220, 200], [230, 235, 240], [250, 245, 235]]), // luz
             Some([[120u8, 120, 120], [130, 130, 130], [128, 128, 128]]), // gris
