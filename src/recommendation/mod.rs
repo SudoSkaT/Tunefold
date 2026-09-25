@@ -3,6 +3,7 @@
 //! Pipeline: candidatos → scoring (metadata + acoustic + affinity + recency + popularity - negative) → ranking.
 
 pub mod acoustic_aggregator;
+pub mod greeting;
 pub mod profile;
 pub mod ranker;
 pub mod scoring;

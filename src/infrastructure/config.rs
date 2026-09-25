@@ -27,6 +27,10 @@ pub struct FeatureFlags {
     pub proxy: bool,
     pub audio_analysis: bool,
     pub advanced_visualization: bool,
+    /// Descarga persistente de audio (Fase 5 N1). Apagada por defecto:
+    /// solo tiene efecto con la feature `youtube` compilada y requiere
+    /// consentimiento explícito (`TUNEFOLD_DOWNLOAD_ENABLED=1`).
+    pub download_enabled: bool,
 }
 
 impl Default for FeatureFlags {
@@ -40,6 +44,7 @@ impl Default for FeatureFlags {
             proxy: true,
             audio_analysis: true,
             advanced_visualization: true,
+            download_enabled: false,
         }
     }
 }
@@ -63,6 +68,7 @@ impl FeatureFlags {
             proxy: f("PROXY_ENABLED", true),
             audio_analysis: f("AUDIO_ANALYSIS_ENABLED", true),
             advanced_visualization: f("ADVANCED_VISUALIZATION_ENABLED", true),
+            download_enabled: f("TUNEFOLD_DOWNLOAD_ENABLED", false),
         }
     }
 

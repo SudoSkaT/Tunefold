@@ -1,6 +1,6 @@
 [package]
 name = "tunefold"
-version = "1.7.32"
+version = "1.7.34"
 edition = "2021"
 description = "TUI music player and recommendation engine. The YouTube/YouTube Music provider is an optional, GPL-3.0 component built with `--features youtube`."
 license = "GPL-3.0"
@@ -42,6 +42,9 @@ anyhow = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 unicode-normalization = "0.1"
 sha2 = "0.10"
+# Portapapeles para `Ctrl+V` en Search (MIT OR Apache-2.0, lista verde):
+# solo se usa en la UI, con fallback a pegado nativo del terminal.
+arboard = "3"
 
 [dev-dependencies]
 tempfile = "3"

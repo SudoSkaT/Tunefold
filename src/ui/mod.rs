@@ -8,6 +8,7 @@ pub mod backend;
 pub mod dashboard;
 pub mod event;
 pub mod glyphs;
+pub mod greeting;
 pub mod help;
 pub mod history;
 pub mod layout;

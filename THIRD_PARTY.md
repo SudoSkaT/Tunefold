@@ -27,6 +27,7 @@ completo.
 | `image` 0.25 | decodificación de miniaturas | MIT OR Apache-2.0 |
 | `unicode-normalization` 0.1 | normalización de texto | MIT OR Apache-2.0 |
 | `sha2` 0.10 | resumenes (verificación de streams) | MIT OR Apache-2.0 |
+| `arboard` 3 | portapapeles (`Ctrl+V` en Search, con fallback a pegado del terminal) | MIT OR Apache-2.0 |
 
 ## Copyleft en el binario completo
 

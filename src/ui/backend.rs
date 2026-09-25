@@ -31,6 +31,9 @@ use super::event::BackendEvent;
 #[derive(Debug)]
 pub enum BackendCommand {
     Search(String),
+    /// Resuelve un enlace YouTube a entidad interna (Fase 1: video → Track;
+    /// playlist remota → mensaje honesto de copia local, sin espejo).
+    ResolveLink(String),
     SaveTrack(Box<Track>),
     SaveSettings(Box<ConfigForm>),
     LoadHistory,
@@ -83,12 +86,25 @@ pub enum BackendCommand {
     DeletePlaylist(i64),
     PlaylistTracks(i64),
     AddToPlaylist(i64, i64),
+    /// Persiste `track` (upsert canónico) y lo añade a `playlist_id` (MVP Fase 1:
+    /// la UI envía el destino resuelto; el backend registra `PlaylistAdd`).
+    SaveAndAddToPlaylist {
+        track: Box<Track>,
+        playlist_id: i64,
+    },
     RemoveFromPlaylist(i64, i64),
     MovePlaylistTrack(i64, i64, usize),
     SetArtworkOverride(i64, String),
     // ------------------------------------------------------------- L1K3D
     /// Pide el estado L1K3D completo (tracks "liked") para pintar corazones.
     LoadLiked,
+    // ------------------------------------------------------------ saludo
+    /// Estado del saludo diario (nombre + última fecha con saludo).
+    LoadGreeting,
+    /// Guarda el nombre elegido y marca el saludo de hoy como mostrado.
+    SaveDisplayName(String),
+    /// Cierra el saludo de hoy sin guardar nombre.
+    DismissGreeting,
     /// Conmuta "liked" de un track (añade/quita de L1K3D) y registra la señal
     /// `Like`/`Unlike` correspondiente.
     ToggleLiked(Box<Track>),
@@ -482,6 +498,7 @@ impl Backend {
                     }
                 }
             }
+            BackendCommand::ResolveLink(input) => self.resolve_link(input).await,
             BackendCommand::SaveTrack(track) => {
                 let track = *track;
                 let mut ids = HashMap::new();
@@ -645,6 +662,9 @@ impl Backend {
                     Err(e) => vec![BackendEvent::Error(format!("añadir: {e}"))],
                 }
             }
+            BackendCommand::SaveAndAddToPlaylist { track, playlist_id } => {
+                self.save_and_add_to_playlist(*track, playlist_id).await
+            }
             BackendCommand::RemoveFromPlaylist(pid, tid) => {
                 match self.db.remove_from_playlist(pid, tid).await {
                     Ok(()) => self.refresh_playlists().await,
@@ -722,6 +742,25 @@ impl Backend {
                 ev.extend(self.refresh_playlists().await);
                 ev
             }
+            // ------------------------------------------------------------ saludo
+            BackendCommand::LoadGreeting => self.load_greeting().await,
+            BackendCommand::SaveDisplayName(name) => {
+                if let Err(e) = self.db.set_display_name(&name).await {
+                    return vec![BackendEvent::Error(format!("nombre: {e}"))];
+                }
+                let today = crate::recommendation::greeting::today_local();
+                if let Err(e) = self.db.mark_greeting_shown(&today).await {
+                    return vec![BackendEvent::Error(format!("saludo: {e}"))];
+                }
+                self.load_greeting().await
+            }
+            BackendCommand::DismissGreeting => {
+                let today = crate::recommendation::greeting::today_local();
+                if let Err(e) = self.db.mark_greeting_shown(&today).await {
+                    return vec![BackendEvent::Error(format!("saludo: {e}"))];
+                }
+                self.load_greeting().await
+            }
             BackendCommand::PlayPlaylist(playlist_id) => {
                 match self.db.playlist_tracks(playlist_id).await {
                     Ok(playlist_tracks) if !playlist_tracks.is_empty() => {
@@ -783,6 +822,103 @@ impl Backend {
             Ok(pls) => vec![BackendEvent::Playlists(pls)],
             Err(e) => vec![BackendEvent::Error(format!("playlists: {e}"))],
         }
+    }
+
+    /// Estado del saludo diario (nombre + última fecha). Fallo blando: si la
+    /// tabla `kv` aún no migró se responde vacío para no bloquear el arranque.
+    async fn load_greeting(&self) -> Vec<BackendEvent> {
+        let display_name = self.db.display_name().await.unwrap_or(None);
+        let last_greeting_date = self.db.last_greeting_date().await.unwrap_or(None);
+        vec![BackendEvent::Greeting {
+            display_name,
+            last_greeting_date,
+        }]
+    }
+
+    /// Resuelve un enlace YouTube a entidad interna (Fase 1).
+    ///
+    /// - Video → `get_track(video_id)` del proveedor YouTube → `LinkResolved`.
+    /// - Playlist remota → mensaje honesto: se importa como copia local
+    ///   (decisión Q2), sin espejo; la UI la crea con `CreatePlaylist`.
+    /// - Inválido / sin feature / sin catálogo → `Error`/`Message` sin red.
+    async fn resolve_link(&self, input: String) -> Vec<BackendEvent> {
+        #[cfg(feature = "youtube")]
+        {
+            use crate::providers::youtube::link::{parse_link, LinkKind};
+            match parse_link(&input) {
+                LinkKind::VideoId(id) => {
+                    if self.search.aggregator().is_empty() {
+                        return vec![BackendEvent::Message(
+                            "No hay fuentes de catálogo activas (revisa los feature flags en .env)."
+                                .to_string(),
+                        )];
+                    }
+                    let Some(provider) = self
+                        .search
+                        .aggregator()
+                        .providers()
+                        .get(crate::domain::source::Source::YouTube)
+                    else {
+                        return vec![BackendEvent::Error(
+                            "YouTube no está disponible en este binario.".to_string(),
+                        )];
+                    };
+                    match provider.get_track(&id).await {
+                        Ok(track) => vec![BackendEvent::LinkResolved {
+                            input,
+                            track: Box::new(track),
+                        }],
+                        Err(e) => vec![BackendEvent::Error(format!("enlace: {e}"))],
+                    }
+                }
+                LinkKind::PlaylistId(list) => vec![BackendEvent::Message(format!(
+                    "Playlist remota {list}: créala local (n) e importa sus canciones como copia local; sin espejo sincronizado."
+                ))],
+                LinkKind::Invalid => vec![BackendEvent::Error(
+                    "Enlace no reconocido: pega un watch/watch?v=, youtu.be, shorts o playlist de YouTube.".to_string(),
+                )],
+            }
+        }
+        #[cfg(not(feature = "youtube"))]
+        {
+            let _ = input;
+            vec![BackendEvent::Message(
+                "Resolver enlaces requiere el build con `--features youtube`.".to_string(),
+            )]
+        }
+    }
+
+    /// Upsert canónico + `add_to_playlist` + señal `PlaylistAdd` (Fase 1).
+    /// Devuelve refresco del listado para contadores al día.
+    async fn save_and_add_to_playlist(&self, track: Track, playlist_id: i64) -> Vec<BackendEvent> {
+        let mut ids = HashMap::new();
+        if let Some(ext) = track.external_id.clone() {
+            ids.insert(track.source, ext);
+        }
+        let internal_id = match self.search.save_track(&track, &ids).await {
+            Ok(id) => id,
+            Err(e) => return vec![BackendEvent::Error(format!("guardar: {e}"))],
+        };
+        if let Err(e) = self.db.add_to_playlist(playlist_id, internal_id).await {
+            return vec![BackendEvent::Error(format!("añadir: {e}"))];
+        }
+        let _ = self
+            .db
+            .record_signal(
+                internal_id,
+                SignalKind::PlaylistAdd,
+                PlayContext::Manual,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let mut ev = vec![BackendEvent::Message(format!(
+            "Añadida «{}» a la playlist.",
+            track.title
+        ))];
+        ev.extend(self.refresh_playlists().await);
+        ev
     }
 
     /// Track de la cola en la dirección pedida, relativo al último reproducido
@@ -1299,6 +1435,7 @@ fn is_heavy(cmd: &BackendCommand) -> bool {
     matches!(
         cmd,
         BackendCommand::Search(_)
+            | BackendCommand::ResolveLink(_)
             | BackendCommand::SaveTrack(_)
             | BackendCommand::Play(_)
             | BackendCommand::NextTrack
@@ -1312,10 +1449,14 @@ fn is_heavy(cmd: &BackendCommand) -> bool {
             | BackendCommand::DeletePlaylist(_)
             | BackendCommand::PlaylistTracks(_)
             | BackendCommand::AddToPlaylist(..)
+            | BackendCommand::SaveAndAddToPlaylist { .. }
             | BackendCommand::RemoveFromPlaylist(..)
             | BackendCommand::MovePlaylistTrack(..)
             | BackendCommand::SetArtworkOverride(..)
             | BackendCommand::LoadLiked
+            | BackendCommand::LoadGreeting
+            | BackendCommand::SaveDisplayName(_)
+            | BackendCommand::DismissGreeting
             | BackendCommand::ToggleLiked(_)
             | BackendCommand::PlayPlaylist(_)
     )

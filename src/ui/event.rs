@@ -29,6 +29,12 @@ pub enum BackendEvent {
         query: String,
         outcome: Box<SearchOutcome<Track>>,
     },
+    /// Enlace resuelto a un track (la UI lo pone en resultados para
+    /// `Enter`/`l`/`p` sin modelos paralelos).
+    LinkResolved {
+        input: String,
+        track: Box<Track>,
+    },
     TrackSaved {
         track: Box<Track>,
         internal_id: i64,
@@ -113,6 +119,11 @@ pub enum BackendEvent {
     /// para pintar los corazones de cada vista: cada track trae su id interno y
     /// su id externo, las dos claves por las que la UI resuelve la pertenencia.
     L1K3D(Vec<Track>),
+    /// Estado del saludo diario (nombre + última fecha `YYYY-MM-DD` local).
+    Greeting {
+        display_name: Option<String>,
+        last_greeting_date: Option<String>,
+    },
     /// Una canción entró/salió de L1K3D (toggle inmediato: la UI ya puede
     /// pintar el corazón lleno/vacío sin volver a consultar la playlist).
     L1K3DChanged {

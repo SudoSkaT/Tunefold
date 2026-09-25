@@ -238,6 +238,16 @@ pub const BINDINGS: &[KeyBinding] = &[
         keys: "Esc",
         desc: "volver (guarda)",
     },
+    KeyBinding {
+        context: Context::Search,
+        keys: "Ctrl+V",
+        desc: "pegar",
+    },
+    KeyBinding {
+        context: Context::Search,
+        keys: "l / p",
+        desc: "L1K3D / a playlist",
+    },
     // -------------------------------------------------------- Playlists
     KeyBinding {
         context: Context::Playlists,

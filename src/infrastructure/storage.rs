@@ -975,6 +975,56 @@ impl Db {
         .await?;
         Ok(rows.iter().map(signal_to_playsignal).collect())
     }
+
+    // ------------------------------------------------------------- kv saludo
+    /// Lee una clave del kv genérico (`0010`). `None` si no existe o está vacía.
+    pub async fn kv_get(&self, key: &str) -> Result<Option<String>> {
+        let row: Option<String> = sqlx::query_scalar("SELECT value FROM kv WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(row.filter(|v| !v.is_empty()))
+    }
+
+    /// Escribe una clave del kv genérico (upsert).
+    pub async fn kv_set(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO kv (key, value, updated_at) VALUES (?1, ?2, datetime('now')) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+                updated_at = excluded.updated_at",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Nombre elegido por el usuario para el saludo (`display_name`).
+    pub async fn display_name(&self) -> Result<Option<String>> {
+        self.kv_get("display_name").await
+    }
+
+    /// Guarda el nombre del usuario (recortado a 32 chars, sin control).
+    pub async fn set_display_name(&self, name: &str) -> Result<()> {
+        let clean: String = name
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(32)
+            .collect();
+        self.kv_set("display_name", clean.trim()).await
+    }
+
+    /// Última fecha local con saludo mostrado (`YYYY-MM-DD`).
+    pub async fn last_greeting_date(&self) -> Result<Option<String>> {
+        self.kv_get("last_greeting_date").await
+    }
+
+    /// Marca el saludo de hoy como mostrado.
+    pub async fn mark_greeting_shown(&self, today: &str) -> Result<()> {
+        self.kv_set("last_greeting_date", today).await
+    }
 }
 
 /// Parsea la representación textual "[r1,r2,r3,r4,r5]" del perfil de bandas a

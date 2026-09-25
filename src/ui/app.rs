@@ -155,6 +155,9 @@ pub struct App {
     shuffle: bool,
     /// Modo de repetición actual de la cola (Off/All).
     repeat: crate::playback::queue::RepeatMode,
+    /// Modal de bienvenida diaria (`Some` = visible). Se abre una vez por
+    /// fecha local si el backend lo indica; pregunta el nombre si aún no hay.
+    greeting: Option<super::greeting::GreetingUi>,
 }
 
 impl App {
@@ -198,6 +201,7 @@ impl App {
             clock: crate::playback::PositionClock::new(),
             shuffle: false,
             repeat: Default::default(),
+            greeting: None,
         }
     }
 
@@ -286,6 +290,7 @@ impl App {
         let _ = self.backend_tx.send(BackendCommand::LoadSettings);
         let _ = self.backend_tx.send(BackendCommand::ListPlaylists);
         let _ = self.backend_tx.send(BackendCommand::LoadLiked);
+        let _ = self.backend_tx.send(BackendCommand::LoadGreeting);
         let _ = self
             .backend_tx
             .send(BackendCommand::SetAutoplay(self.autoplay));
@@ -319,6 +324,12 @@ impl App {
         // popup no tiene scroll, no hay teclas reservadas que consultar.
         if self.show_help {
             self.show_help = false;
+            return;
+        }
+        // Modal de bienvenida: consume sus teclas (input de nombre + cierre).
+        // Va antes que la ayuda/at acoustics para no perder la escritura.
+        if self.greeting.is_some() {
+            self.on_greeting_key(key);
             return;
         }
         // Se acepta `h` y `H` con o sin modificador SHIFT: la mayoría de
@@ -370,7 +381,10 @@ impl App {
     /// cursor activo, formulario de ajustes o el diálogo de crear playlist.
     /// Los atajos globales no deben tragarse esas pulsaciones.
     fn is_editing_text(&self) -> bool {
-        self.search.editing || self.view == View::Settings || self.playlist_view.creating
+        self.search.editing
+            || self.view == View::Settings
+            || self.playlist_view.creating
+            || self.greeting.as_ref().is_some_and(|g| g.asking_name)
     }
 
     /// Teclas en vistas de solo lectura (Now Playing, Related, Sources, ...).
@@ -554,6 +568,38 @@ impl App {
             KeyCode::Esc => {
                 self.switch_view(View::NowPlaying);
             }
+            // `l`/`p` SOLO actúan sobre el resultado seleccionado (no editando):
+            // mientras se escribe la consulta deben insertar el carácter
+            // normal (si no, sería imposible escribir "Miranda", "playlist"...).
+            // Con guarda fallida el evento cae al `Char(c)` de abajo e inserta.
+            KeyCode::Char('l') if !self.search.editing && self.search.selected().is_some() => {
+                let Some(track) = self.search.selected().cloned() else {
+                    return;
+                };
+                let _ = self
+                    .backend_tx
+                    .send(BackendCommand::ToggleLiked(Box::new(track)));
+                self.status = Some("Conmutando L1K3D...".to_string());
+            }
+            KeyCode::Char('p') if !self.search.editing && self.search.selected().is_some() => {
+                let Some(track) = self.search.selected().cloned() else {
+                    return;
+                };
+                if let Some(pid) = self.first_user_playlist_id() {
+                    let _ = self.backend_tx.send(BackendCommand::SaveAndAddToPlaylist {
+                        track: Box::new(track),
+                        playlist_id: pid,
+                    });
+                    self.status = Some("Añadiendo a la playlist...".to_string());
+                } else {
+                    let _ = self
+                        .backend_tx
+                        .send(BackendCommand::CreatePlaylist("Enlaces".to_string()));
+                    self.status = Some(
+                        "Creando playlist «Enlaces»: pulsa `p` de nuevo para añadir.".to_string(),
+                    );
+                }
+            }
             KeyCode::Enter => {
                 if self.search.editing || self.search.results.is_empty() {
                     let query = self.search.text().trim().to_string();
@@ -566,14 +612,27 @@ impl App {
                     self.search.results.clear();
                     self.search.related_from = 0;
                     self.search.list_state.select(None);
-                    self.status = Some(format!("Buscando «{query}»..."));
-                    let _ = self.backend_tx.send(BackendCommand::Search(query));
+                    // Enlace YouTube → ResolveLink (Fase 1); texto → Search.
+                    // La detección vive en el provider (regla frontera `api`).
+                    if is_link_query(&query) {
+                        self.status = Some("Resolviendo enlace…".to_string());
+                        let _ = self.backend_tx.send(BackendCommand::ResolveLink(query));
+                    } else {
+                        self.status = Some(format!("Buscando «{query}»..."));
+                        let _ = self.backend_tx.send(BackendCommand::Search(query));
+                    }
                 } else if let Some(track) = self.search.selected().cloned() {
                     self.save_and_play(track);
                 }
             }
             KeyCode::Up => self.search.select_prev(),
             KeyCode::Down => self.search.select_next(),
+            // Pegar portapapeles (`Ctrl+V`): lee el clipboard del sistema y lo
+            // inserta en el cursor. Si no hay clipboard (SSH, TTY sin X/Wayland)
+            // se indica el pegado nativo del terminal (Ctrl+Shift+V).
+            KeyCode::Char('v' | 'V') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.paste_clipboard();
+            }
             KeyCode::Left => self.search.move_cursor_left(),
             KeyCode::Right => self.search.move_cursor_right(),
             KeyCode::Home => self.search.move_cursor_home(),
@@ -583,6 +642,116 @@ impl App {
             KeyCode::Char('\n') => {}
             KeyCode::Char(c) => self.search.insert_char(c),
             _ => {}
+        }
+    }
+
+    /// Teclas del modal de bienvenida: input de nombre + cierre.
+    ///
+    /// - Preguntando nombre: texto/Backspace editan, Enter guarda
+    ///   (`SaveDisplayName`, que también marca el día), Esc sigue sin nombre
+    ///   (`DismissGreeting`, solo marca el día).
+    /// - Ya con nombre: Enter/Esc cierran (`DismissGreeting`).
+    fn on_greeting_key(&mut self, key: KeyEvent) {
+        let asking = self.greeting.as_ref().is_some_and(|g| g.asking_name);
+        match key.code {
+            KeyCode::Esc => {
+                self.greeting = None;
+                let _ = self.backend_tx.send(BackendCommand::DismissGreeting);
+                self.status = Some("Bienvenido a Tunefold.".to_string());
+            }
+            KeyCode::Enter if asking => {
+                let name = self
+                    .greeting
+                    .as_ref()
+                    .map(|g| g.draft_text())
+                    .unwrap_or_default();
+                if name.trim().is_empty() {
+                    self.status =
+                        Some("Escribe tu nombre o pulsa Esc para seguir sin nombre.".to_string());
+                    return;
+                }
+                self.greeting = None;
+                let _ = self.backend_tx.send(BackendCommand::SaveDisplayName(name));
+                self.status = Some("Nombre guardado. ¡Que suene!".to_string());
+            }
+            KeyCode::Enter => {
+                self.greeting = None;
+                let _ = self.backend_tx.send(BackendCommand::DismissGreeting);
+            }
+            KeyCode::Backspace if asking => {
+                if let Some(g) = self.greeting.as_mut() {
+                    g.backspace();
+                }
+            }
+            KeyCode::Char(c) if asking => {
+                if let Some(g) = self.greeting.as_mut() {
+                    g.insert_char(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Abre (o refresca) el modal con el estado del backend. El brief se
+    /// construye con historial+stats YA cargados en la UI; si llegan después,
+    /// `History`/`ListeningStats` lo reconstruyen mientras siga abierto.
+    fn open_greeting(&mut self, display_name: Option<String>, last_greeting_date: Option<String>) {
+        use crate::recommendation::greeting as greet;
+        let today = greet::today_local();
+        if !greet::should_greet(last_greeting_date.as_deref(), &today) {
+            self.greeting = None;
+            return;
+        }
+        let stats: Vec<TrackListeningStats> = self.listening_stats.values().cloned().collect();
+        let brief = greet::build_brief(
+            &self.history,
+            &stats,
+            &std::collections::HashSet::new(),
+            display_name.clone(),
+            greet::hour_local(),
+        );
+        let continue_label = self.history.first().map(|e| match &e.artist_name {
+            Some(a) => format!("{a} - {}", e.title),
+            None => e.title.clone(),
+        });
+        self.greeting = Some(super::greeting::GreetingUi {
+            franja: brief.franja.to_string(),
+            display_name: display_name.clone(),
+            asking_name: display_name.is_none(),
+            name_draft: Vec::new(),
+            reason: brief.reason,
+            top_artists: brief.top_artists,
+            continue_label,
+        });
+    }
+
+    /// Si el modal sigue abierto cuando llegan historial/stats, reconstruye su
+    /// brief con los datos frescos (el `Greeting` del backend pudo llegar
+    /// antes que ellos al arrancar).
+    fn refresh_greeting_brief(&mut self) {
+        let (name, name_draft) = match &self.greeting {
+            Some(g) => (g.display_name.clone(), g.name_draft.clone()),
+            None => return,
+        };
+        use crate::recommendation::greeting as greet;
+        let stats: Vec<TrackListeningStats> = self.listening_stats.values().cloned().collect();
+        let brief = greet::build_brief(
+            &self.history,
+            &stats,
+            &std::collections::HashSet::new(),
+            name.clone(),
+            greet::hour_local(),
+        );
+        let continue_label = self.history.first().map(|e| match &e.artist_name {
+            Some(a) => format!("{a} - {}", e.title),
+            None => e.title.clone(),
+        });
+        if let Some(g) = self.greeting.as_mut() {
+            g.franja = brief.franja.to_string();
+            g.reason = brief.reason;
+            g.top_artists = brief.top_artists;
+            g.continue_label = continue_label;
+            g.name_draft = name_draft;
         }
     }
 
@@ -715,6 +884,57 @@ impl App {
             "Autoplay renovado: {} recomendaciones frescas de la canción en curso.",
             fresh.len()
         ));
+    }
+
+    /// Primera playlist de usuario (MVP Fase 1 para `p` en Search): L1K3D es
+    /// System y no cuenta. Si hay varias, la primera del listado; el picker
+    /// completo con índice queda para la siguiente iteración.
+    fn first_user_playlist_id(&self) -> Option<i64> {
+        self.playlists
+            .iter()
+            .find(|p| p.kind.is_user())
+            .map(|p| p.id)
+    }
+
+    /// Pega el portapapeles del sistema en el cursor de búsqueda.
+    ///
+    /// Sin dependencias de runtime del sistema más allá de lo que `arboard`
+    /// resuelve en puro Rust (X11/Wayland/macOS/Windows); en sesión sin
+    /// clipboard (SSH/TTY) falla con mensaje + alternativa nativa, nunca pánico.
+    fn paste_clipboard(&mut self) {
+        let pasted = arboard::Clipboard::new()
+            .and_then(|mut cb| cb.get_text())
+            .map_err(|e| e.to_string())
+            .and_then(|t| {
+                let clean: String = t
+                    .chars()
+                    .filter(|c| !c.is_control() || *c == '\n')
+                    .collect();
+                let clean = clean.trim().to_string();
+                if clean.is_empty() {
+                    Err("vacío".to_string())
+                } else {
+                    Ok(clean)
+                }
+            });
+        match pasted {
+            Ok(text) => {
+                // Pegado multilínea (links con saltos): se aplana a espacios.
+                let flat = text.replace(['\n', '\r', '\t'], " ");
+                let n = flat.chars().count();
+                for c in flat.chars() {
+                    self.search.insert_char(c);
+                }
+                self.status = Some(format!(
+                    "Pegado ({n} caracteres). Enter para buscar/resolver."
+                ));
+            }
+            Err(kind) => {
+                self.status = Some(format!(
+                    "Portapapeles no disponible ({kind}): pega con Ctrl+Shift+V del terminal."
+                ));
+            }
+        }
     }
 
     /// Actualiza `now_playing` y dispara la carga de recomendaciones si el
@@ -861,9 +1081,28 @@ impl App {
                     track.title
                 ));
             }
-            BackendEvent::History(entries) => self.history = entries,
+            BackendEvent::LinkResolved { track, .. } => {
+                self.search.searching = false;
+                self.search.related_from = 0;
+                self.search.results = vec![*track];
+                self.search.list_state.select(Some(0));
+                self.status = Some(
+                    "Enlace resuelto: Enter reproduce · l L1K3D · p añade a playlist.".to_string(),
+                );
+            }
+            BackendEvent::Greeting {
+                display_name,
+                last_greeting_date,
+            } => {
+                self.open_greeting(display_name, last_greeting_date);
+            }
+            BackendEvent::History(entries) => {
+                self.history = entries;
+                self.refresh_greeting_brief();
+            }
             BackendEvent::ListeningStats(stats) => {
                 self.listening_stats = stats.into_iter().map(|s| (s.key.clone(), s)).collect();
+                self.refresh_greeting_brief();
             }
             BackendEvent::Sources(sources) => self.sources = sources,
             BackendEvent::Settings(form) => {
@@ -1186,6 +1425,9 @@ impl App {
         if self.show_help {
             crate::ui::help::render_help(frame, area, profile, *crate::ui::glyphs::GLYPHS);
         }
+        if let Some(g) = &self.greeting {
+            super::greeting::render(frame, area, g);
+        }
     }
 
     fn render_header(
@@ -1488,6 +1730,21 @@ impl App {
     }
 }
 
+/// ¿La consulta es un enlace YouTube (desviar a `ResolveLink`)? La detección
+/// vive en el provider (frontera `api`): aquí solo se delega con `cfg` para
+/// no duplicar conocimiento YouTube fuera de `providers/youtube/`.
+fn is_link_query(query: &str) -> bool {
+    #[cfg(feature = "youtube")]
+    {
+        crate::providers::youtube::link::looks_like_url(query)
+    }
+    #[cfg(not(feature = "youtube"))]
+    {
+        let _ = query;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1689,6 +1946,75 @@ mod tests {
         app.on_key(key);
         assert_eq!(app.view, View::Search, "el dígito debe quedar en el input");
         assert_eq!(app.search.text(), "4");
+    }
+
+    #[test]
+    fn greeting_asks_name_first_time_and_saves_it() {
+        use crate::recommendation::greeting as greet;
+        let (tx, mut rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        let today = greet::today_local();
+
+        // Primera vez (sin nombre ni fecha): abre preguntando el nombre.
+        app.on_backend(BackendEvent::Greeting {
+            display_name: None,
+            last_greeting_date: None,
+        });
+        assert!(app.greeting.as_ref().is_some_and(|g| g.asking_name));
+
+        // Escribir + Enter guarda el nombre y cierra.
+        for c in "Ska".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.greeting.is_none(), "tras guardar se cierra");
+        let mut saw_save = false;
+        while let Ok(c) = rx.try_recv() {
+            if matches!(c, BackendCommand::SaveDisplayName(_)) {
+                saw_save = true;
+            }
+        }
+        assert!(saw_save, "el nombre se persiste");
+
+        // Mismo día ya mostrado: no reabre.
+        app.on_backend(BackendEvent::Greeting {
+            display_name: Some("Ska".into()),
+            last_greeting_date: Some(today),
+        });
+        assert!(app.greeting.is_none(), "una vez al día");
+    }
+
+    #[test]
+    fn search_l_and_p_type_while_editing_but_act_on_selection() {
+        // Regresión Fase 1: `l`/`p` sin guarda tragaban la escritura
+        // ("Miranda", "playlist"...). Con resultado y sin edición actúan.
+        let (tx, mut rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        app.view = View::Search;
+
+        // Escribiendo: insertan, no envían nada.
+        app.search.editing = true;
+        app.on_search_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        app.on_search_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.search.text(), "lp", "editando deben escribirse");
+        assert!(
+            rx.try_recv().is_err(),
+            "editando no se envía L1K3D ni playlist"
+        );
+
+        // Con resultado seleccionado y sin edición: `l` da L1K3D sin escribir.
+        app.search.editing = false;
+        app.search.results = vec![rec_track("vid-1")];
+        app.search.list_state.select(Some(0));
+        app.on_search_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.search.text(), "lp", "`l` sobre resultado no escribe");
+        let mut saw_like = false;
+        while let Ok(c) = rx.try_recv() {
+            if matches!(c, BackendCommand::ToggleLiked(_)) {
+                saw_like = true;
+            }
+        }
+        assert!(saw_like, "`l` sobre resultado envía ToggleLiked");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 /target
 /data
+/audio
 *.db
 *.db-shm
 *.db-wal
