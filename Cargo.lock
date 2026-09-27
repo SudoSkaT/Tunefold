@@ -3576,7 +3576,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tunefold"
-version = "0.17.43"
+version = "0.17.44"
 dependencies = [
  "anyhow",
  "arboard",
