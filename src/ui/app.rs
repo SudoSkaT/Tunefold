@@ -158,6 +158,11 @@ pub struct App {
     /// Modal de bienvenida diaria (`Some` = visible). Se abre una vez por
     /// fecha local si el backend lo indica; pregunta el nombre si aún no hay.
     greeting: Option<super::greeting::GreetingUi>,
+    /// Popup para incorporar enlaces externos (`None` = oculto).
+    /// El usuario pulsa clic derecho dentro del campo para pegar la URL,
+    /// el sistema la detecta y la resuelve automáticamente, añadiéndola a
+    /// la playlist de enlaces externos.
+    #[allow(dead_code)] external_link_popup: Option<ExternalLinkPopupUi>,
 }
 
 impl App {
@@ -202,6 +207,7 @@ impl App {
             shuffle: false,
             repeat: Default::default(),
             greeting: None,
+            external_link_popup: None,
         }
     }
 
@@ -3526,4 +3532,44 @@ mod tests {
             app.status
         );
     }
+}
+#[allow(dead_code)] struct ExternalLinkPopupUi {
+    /// Texto pegado o escrito en el campo.
+    text: String,
+    /// Modo: esperando pegar, resolviendo, añadido, error.
+    state: ExternalLinkState,
+    /// Mensaje de feedback para el usuario.
+    feedback: String,
+    /// Contador para auto-cerrar o timed feedback.
+    feedback_timer: std::time::Instant,
+}
+
+/// Estado del popup de enlaces externos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
+#[allow(dead_code)] enum ExternalLinkState {
+    /// Esperando que el usuario pegue un enlace (campo vacío o con texto).
+    #[default]
+    Waiting,
+    /// Detectando el tipo de URL y resolviéndolo.
+    Resolving,
+    /// Asegurando que la playlist "Enlaces Externos" existe y añadiendo el track.
+    CreatingPlaylist,
+    /// Añadiendo el track a la playlist.
+    Adding,
+    /// Enlace resuelto y añadido a la playlist exitosamente.
+    Added,
+    /// Error: el enlace no es válido o no se pudo resolver.
+    Error,
+}
+
+impl Default for ExternalLinkPopupUi {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            state: ExternalLinkState::Waiting,
+            feedback: String::new(),
+            feedback_timer: std::time::Instant::now(),
+        }
+        }
 }

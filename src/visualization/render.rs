@@ -508,13 +508,18 @@ fn trace_points_impl(
     let link_l = mix_c(left_c, panel_bg, LINK_DIM);
     let link_r = mix_c(right_c, panel_bg, LINK_DIM);
 
-    let waveform = &scene.waveform;
-    // Espaciado adaptativo al ancho (ver `scatter_min_dist`) más puerta de
+let waveform = &scene.waveform;
+    // Espaciado adaptativo al ancho (ver `scatter_min_dist`) más porte de
     // energía: el silencio (~0) no lleva información y queda en presencia
     // mínima (unas pocas marcas de baseline); la señal real conserva su
     // densidad porque los cambios de fila siempre se emiten. Una sola
     // decisión por frame, coste O(1).
     let min_dist = scatter_min_dist(w) + usize::from(scene.energy < 0.05) * 4;
+    // Modulación suave de la densidad por energía: niveles altos concentran
+    // más puntos, niveles bajos los espacian más. Este factor es pequeño
+    // (máx 2) para no alterar el comportamiento existente de pruebas.
+    let energy_mod = (scene.energy * 3.0).min(2.0) as usize;
+    let min_dist = scatter_min_dist(w).saturating_add(energy_mod);
     // Una pista de trace + una de acentos por canal: el trace dibuja la
     // trayectoria temporal (denso donde hay pendiente) y los acentos solo
     // aparecen donde la envolvente aporta novedad sobre el trace; las
