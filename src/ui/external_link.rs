@@ -269,22 +269,161 @@ pub fn first_link_token(raw: &str) -> Option<String> {
     }
 }
 
-/// Lee el portapapeles del sistema de forma robusta, en cualquier contexto.
+/// Sanitiza texto crudo del portapapeles → primer token, o `None` si vacío.
 ///
-/// - Usa `arboard` (X11/Wayland/macOS/Windows) sin pánicos.
-/// - Filtra caracteres de control (conserva `\n` para tokenizar después).
-/// - Devuelve el primer token (un enlace no lleva espacios ni saltos).
-/// - En sesiones sin clipboard (SSH/TTY) devuelve el motivo para mostrar el
-///   fallback nativo del terminal (`Ctrl+Shift+V` / pegar del terminal).
-pub fn read_clipboard_text() -> Result<String, String> {
-    let raw = arboard::Clipboard::new()
-        .and_then(|mut cb| cb.get_text())
-        .map_err(|e| e.to_string())?;
+/// Filtra caracteres de control (conserva `\n` para tokenizar después),
+/// recorta espacios y devuelve el primer token (un enlace no lleva espacios
+/// ni saltos). Pura y testeable sin tocar el clipboard real.
+pub fn sanitize_clipboard_text(raw: &str) -> Option<String> {
     let clean: String = raw
         .chars()
         .filter(|c| !c.is_control() || *c == '\n')
         .collect();
-    first_link_token(&clean).ok_or_else(|| "vacío".to_string())
+    first_link_token(&clean)
+}
+
+/// Timeout para los CLIs de clipboard: un helper colgado no debe congelar la
+/// TUI nunca.
+const CLIP_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+const WL_ARGS: &[&str] = &["--no-newline"];
+const XCLIP_ARGS: &[&str] = &["-o", "-selection", "clipboard"];
+const XSEL_ARGS: &[&str] = &["--clipboard", "--output"];
+#[cfg(target_os = "macos")]
+const NO_ARGS: &[&str] = &[];
+
+/// CLIs de clipboard por plataforma. Los binarios ausentes se reportan en
+/// tiempo de ejecución y se pasa al siguiente (Omarchy trae `wl-paste` de
+/// serie con Hyprland; en X11 suelen estar `xclip`/`xsel`).
+fn paste_commands() -> Vec<(&'static str, &'static [&'static str])> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![("pbpaste", NO_ARGS)]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut cmds = Vec::new();
+        // En Wayland `wl-paste` habla data-control directamente, sin XWayland.
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            cmds.push(("wl-paste", WL_ARGS));
+        }
+        cmds.push(("xclip", XCLIP_ARGS));
+        cmds.push(("xsel", XSEL_ARGS));
+        // Sesión mixta sin WAYLAND_DISPLAY pero con wl-paste instalado.
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            cmds.push(("wl-paste", WL_ARGS));
+        }
+        cmds
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Ejecuta un CLI de clipboard y devuelve su stdout como texto.
+fn run_paste_cmd(cmd: &str, args: &[&str]) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    let child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{cmd} no disponible ({e})"))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    // `wait_with_output` bloquea: se ejecuta en un hilo y se espera con
+    // timeout. Si cuelga, se devuelve error y el hijo huérfano termina solo
+    // (los helpers de clipboard no esperan contenido, responden al momento).
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(CLIP_CMD_TIMEOUT) {
+        Ok(Ok(out)) if out.status.success() => {
+            String::from_utf8(out.stdout).map_err(|_| format!("{cmd}: salida no UTF-8"))
+        }
+        Ok(Ok(_)) => Err(format!("{cmd}: falló")),
+        Ok(Err(e)) => Err(format!("{cmd}: {e}")),
+        Err(_) => Err(format!("{cmd}: sin respuesta")),
+    }
+}
+
+/// Recorta un error a una línea corta para el pie de estado.
+fn short_err(e: impl std::fmt::Display) -> String {
+    let line = e.to_string();
+    let line = line.lines().next().unwrap_or("").trim();
+    if line.chars().count() > 90 {
+        line.chars().take(87).collect::<String>() + "…"
+    } else {
+        line.to_string()
+    }
+}
+
+/// Lee el portapapeles del sistema de forma robusta, en cualquier contexto.
+///
+/// Cadena de fuentes (el primer token no vacío gana):
+/// 1. `arboard`, selección clipboard (copiado explícito). En Wayland usa el
+///    protocolo data-control (feature `wayland-data-control`); sin ella, en
+///    compositores puros como Hyprland/Omarchy el backend X11 fallaba siempre.
+/// 2. `arboard`, selección primaria (solo Linux: texto seleccionado con el
+///    ratón en el terminal).
+/// 3. CLIs del sistema (`wl-paste`, `xclip`, `xsel`, `pbpaste`) para cuando
+///    arboard no negocia el MIME o no hay conexión de display.
+///
+/// Sin pánicos. Si alguna fuente era legible pero todo venía vacío →
+/// `Err("vacío")`; si ninguna fuente responde → `Err("no disponible (…)")`
+/// para mostrar el fallback nativo del terminal (`Ctrl+Shift+V` / pegar).
+pub fn read_clipboard_text() -> Result<String, String> {
+    let mut problems: Vec<String> = Vec::new();
+    let mut readable = false;
+
+    // 1 — arboard, selección clipboard (copiado explícito Ctrl+C / Ctrl+Shift+C).
+    match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+        Ok(raw) => {
+            readable = true;
+            if let Some(token) = sanitize_clipboard_text(&raw) {
+                return Ok(token);
+            }
+        }
+        Err(e) => problems.push(format!("arboard: {}", short_err(e))),
+    }
+
+    // 2 — arboard, selección primaria (solo Linux: selección con el ratón,
+    // típica al copiar desde el terminal donde el clic derecho pega esto).
+    #[cfg(target_os = "linux")]
+    {
+        use arboard::{GetExtLinux, LinuxClipboardKind};
+        match arboard::Clipboard::new()
+            .and_then(|mut cb| cb.get().clipboard(LinuxClipboardKind::Primary).text())
+        {
+            Ok(raw) => {
+                readable = true;
+                if let Some(token) = sanitize_clipboard_text(&raw) {
+                    return Ok(token);
+                }
+            }
+            Err(e) => problems.push(format!("primaria: {}", short_err(e))),
+        }
+    }
+
+    // 3 — CLIs del sistema (cuando arboard no negocia o no hay display).
+    for (cmd, args) in paste_commands() {
+        match run_paste_cmd(cmd, args) {
+            Ok(raw) => {
+                readable = true;
+                if let Some(token) = sanitize_clipboard_text(&raw) {
+                    return Ok(token);
+                }
+            }
+            Err(e) => problems.push(e),
+        }
+    }
+
+    if readable {
+        Err("vacío".to_string())
+    } else {
+        Err(format!("no disponible ({})", problems.join("; ")))
+    }
 }
 
 /// Área centrada y clampada para el modal (responsive: nunca excede `area`).
@@ -600,6 +739,53 @@ mod tests {
             "hint de pegado visible: {text}"
         );
         assert!(text.contains("Esc cerrar"), "hint de cierre visible");
+    }
+
+    #[test]
+    fn sanitize_filters_controls_and_empty() {
+        // Controles fuera, `\n` dentro para tokenizar después.
+        assert_eq!(
+            sanitize_clipboard_text("https://youtu.be/abc123XYZ-_\x00\x07"),
+            Some("https://youtu.be/abc123XYZ-_".to_string())
+        );
+        // Multilínea (pegar de terminal/Win+V): primer token manda.
+        assert_eq!(
+            sanitize_clipboard_text("https://youtu.be/abc123XYZ-_\nhttps://other.example/x"),
+            Some("https://youtu.be/abc123XYZ-_".to_string())
+        );
+        // Solo ruido → None (el llamador informa "vacío", no pega basura).
+        assert_eq!(sanitize_clipboard_text("   \n\t  \x00"), None);
+        assert_eq!(sanitize_clipboard_text(""), None);
+        // Envoltorios habituales del portapapeles.
+        assert_eq!(
+            sanitize_clipboard_text("\"https://youtu.be/abc123XYZ-_\""),
+            Some("https://youtu.be/abc123XYZ-_".to_string())
+        );
+    }
+
+    #[test]
+    fn paste_cmd_missing_binary_is_an_error_not_a_panic() {
+        let err = run_paste_cmd("tunefold-definitely-missing-binary-xyz", &[]).unwrap_err();
+        assert!(
+            err.contains("tunefold-definitely-missing-binary-xyz"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn paste_cmd_reads_stdout() {
+        // `/bin/echo` existe en cualquier Unix: el runner devuelve su stdout.
+        let out = run_paste_cmd("/bin/echo", &["https://youtu.be/abc123XYZ-_"])
+            .expect("echo disponible en unix");
+        assert!(out.contains("https://youtu.be/abc123XYZ-_"), "{out}");
+    }
+
+    #[test]
+    fn read_clipboard_never_panics_without_display() {
+        // Sin display el resultado depende del entorno (vacío o no
+        // disponible); lo único exigible aquí es que nunca entre en pánico.
+        let _ = read_clipboard_text();
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "tunefold"
-version = "0.17.45"
+version = "0.17.46"
 edition = "2021"
 description = "TUI music player and recommendation engine. The YouTube/YouTube Music provider is an optional, GPL-3.0 component built with `--features youtube`."
 license = "GPL-3.0"
@@ -44,7 +44,10 @@ unicode-normalization = "0.1"
 sha2 = "0.10"
 # Portapapeles para `Ctrl+V` en Search (MIT OR Apache-2.0, lista verde):
 # solo se usa en la UI, con fallback a pegado nativo del terminal.
-arboard = "3"
+# `wayland-data-control` (vía wl-clipboard-rs, MIT): imprescindible en
+# compositores Wayland puros (Hyprland/Omarchy), donde el backend X11 no
+# puede conectar y `get_text()` fallaría siempre.
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 [dev-dependencies]
 tempfile = "3"
