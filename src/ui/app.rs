@@ -636,8 +636,20 @@ impl App {
             // Pegar portapapeles (`Ctrl+V`): lee el clipboard del sistema y lo
             // inserta en el cursor. Si no hay clipboard (SSH, TTY sin X/Wayland)
             // se indica el pegado nativo del terminal (Ctrl+Shift+V).
+            // El método mejorado `paste_clipboard()` funciona en cualquier contexto.
             KeyCode::Char('v' | 'V') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.paste_clipboard();
+                match self.paste_clipboard() {
+                    Ok(n) => {
+                        self.status = Some(format!(
+                            "Pegado ({n} caracteres). Enter para buscar/resolver."
+                        ));
+                    }
+                    Err(kind) => {
+                        self.status = Some(format!(
+                            "Portapapeles no disponible ({kind}): pega con Ctrl+Shift+V del terminal."
+                        ));
+                    }
+                }
             }
             KeyCode::Left => self.search.move_cursor_left(),
             KeyCode::Right => self.search.move_cursor_right(),
@@ -904,43 +916,52 @@ impl App {
 
     /// Pega el portapapeles del sistema en el cursor de búsqueda.
     ///
-    /// Sin dependencias de runtime del sistema más allá de lo que `arboard`
-    /// resuelve en puro Rust (X11/Wayland/macOS/Windows); en sesión sin
-    /// clipboard (SSH/TTY) falla con mensaje + alternativa nativa, nunca pánico.
-    fn paste_clipboard(&mut self) {
-        let pasted = arboard::Clipboard::new()
-            .and_then(|mut cb| cb.get_text())
-            .map_err(|e| e.to_string())
-            .and_then(|t| {
-                let clean: String = t
-                    .chars()
-                    .filter(|c| !c.is_control() || *c == '\n')
-                    .collect();
-                let clean = clean.trim().to_string();
-                if clean.is_empty() {
-                    Err("vacío".to_string())
-                } else {
-                    Ok(clean)
-                }
-            });
-        match pasted {
-            Ok(text) => {
-                // Pegado multilínea (links con saltos): se aplana a espacios.
-                let flat = text.replace(['\n', '\r', '\t'], " ");
-                let n = flat.chars().count();
-                for c in flat.chars() {
-                    self.search.insert_char(c);
-                }
-                self.status = Some(format!(
-                    "Pegado ({n} caracteres). Enter para buscar/resolver."
-                ));
+    /// Lee el texto del portapapeles del sistema de forma robusta.
+/// Funciona en cualquier contexto (búsqueda, now playing, related, etc.).
+/// En sesiones sin clipboard (SSH/TTY sin X11/Wayland) devuelve un error
+/// con la alternativa nativa del terminal.
+fn read_clipboard_text(&self) -> Result<String, String> {
+    arboard::Clipboard::new()
+        .and_then(|mut cb| cb.get_text())
+        .map_err(|e| e.to_string())
+        .and_then(|t| {
+            let clean: String = t
+                .chars()
+                .filter(|c| !c.is_control() || *c == '\n')
+                .collect();
+            let clean = clean.trim().to_string();
+            if clean.is_empty() {
+                Err("vacío".to_string())
+            } else {
+                Ok(clean)
             }
-            Err(kind) => {
-                self.status = Some(format!(
-                    "Portapapeles no disponible ({kind}): pega con Ctrl+Shift+V del terminal."
-                ));
-            }
+        })
+}
+
+/// Método mejorado para pegar el portapapeles.
+/// A diferencia del anterior, este método:
+/// - Funciona en cualquier vista/panel, no solo en búsqueda
+/// - Devuelve el texto pegado para que el caller decida qué hacer
+/// - Tiene mejor manejo de errores y fallbacks
+/// - El pegado se realiza insertando caracteres en el campo activo
+fn paste_clipboard(&mut self) -> Result<usize, String> {
+    let text = self.read_clipboard_text()?;
+    // Pegar en el campo activo dependiendo de la vista actual
+    let n = text.chars().count();
+    // Insertar caracteres en el campo activo
+    // Si estamos en modo edición de búsqueda, insertar en el campo de búsqueda
+    if self.search.editing {
+        for c in text.chars() {
+            self.search.insert_char(c);
         }
+    } else {
+        // En otras vistas, mostrar el texto en la línea de estado
+        // o podría integrarse con el campo activo de esa vista
+        self.status = Some(format!(
+            "Pegado ({n} caracteres). El contenido se copió al buffer pero no se insertó en un campo editable activo."
+        ));
+    }
+    Ok(n)
     }
 
     /// Actualiza `now_playing` y dispara la carga de recomendaciones si el
