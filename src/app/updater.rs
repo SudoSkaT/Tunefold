@@ -55,16 +55,10 @@ pub async fn run(dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == expected_asset_name())
-        .with_context(|| {
-            format!(
-                "No hay asset «{}» en esta release (solo se distribuye para la plataforma en la que compilaste)",
-                expected_asset_name()
-            )
-        })?;
+    // Endurecido contra releases con assets duplicados (p. ej. uno manual y
+    // otro de CI con el mismo nombre): elegir a ciegas con `find` instalaría
+    // un binario arbitrario. Con 0 o con 2+ candidatos se falla ruidoso.
+    let asset = select_asset(&release.assets, &expected_asset_name(), &release.tag_name)?;
 
     if dry_run {
         println!("Disponible: {} ({})", asset.name, asset.size);
@@ -197,6 +191,25 @@ fn purge_caches() -> Result<()> {
         println!("Caché purgada: {}", cache.display());
     }
     Ok(())
+}
+
+/// Elige el asset de la plataforma actual dentro de una release.
+///
+/// Exactamente 1 candidato con el nombre esperado: se devuelve. Con 0 se
+/// informa (quizá la release solo cubre otras plataformas); con 2+ (p. ej.
+/// resto manual + asset de CI) se falla ruidoso en vez de instalar al azar.
+fn select_asset<'a>(assets: &'a [Asset], expected: &str, tag: &str) -> Result<&'a Asset> {
+    let mut hits = assets.iter().filter(|a| a.name == expected);
+    let first = hits.next();
+    match (first, hits.next()) {
+        (Some(one), None) => Ok(one),
+        (None, _) => anyhow::bail!(
+            "No hay asset «{expected}» en esta release (solo se distribuye para la plataforma en la que compilaste)"
+        ),
+        (Some(_), Some(_)) => anyhow::bail!(
+            "Hay varios assets llamados «{expected}» en la release {tag}: imposible elegir sin ambigüedad. Avisa al mantenedor."
+        ),
+    }
 }
 
 /// Nombre del asset para la plataforma actual (el que produce el workflow de
@@ -336,6 +349,31 @@ mod tests {
         assert!(versions_equal("0.17.42", "0.17.42"));
         assert!(versions_equal("0.17.42", "v0.17.42"));
         assert!(!versions_equal("0.17.41", "0.17.42"));
+    }
+
+    #[test]
+    fn asset_selection_needs_exactly_one_candidate() {
+        let mk = |name: &str| Asset {
+            name: name.to_string(),
+            size: 1,
+            download_url: String::new(),
+        };
+        let expected = "tunefold-x86_64-unknown-linux-gnu";
+        // 1 candidato: se elige.
+        let one = vec![mk("otro"), mk(expected)];
+        assert_eq!(select_asset(&one, expected, "0.17.44").unwrap().size, 1);
+        // 0 candidatos: error que menciona el nombre esperado.
+        let none: Vec<Asset> = vec![mk("otro")];
+        assert!(select_asset(&none, expected, "0.17.44")
+            .unwrap_err()
+            .to_string()
+            .contains(expected));
+        // 2+ candidatos (manual + CI): error de ambigüedad, nunca al azar.
+        let two = vec![mk(expected), mk(expected)];
+        assert!(select_asset(&two, expected, "0.17.44")
+            .unwrap_err()
+            .to_string()
+            .contains("varios"));
     }
 
     #[test]

@@ -33,6 +33,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # rodio/playback enlaza ALSA en Linux: sin las cabeceras, alsa-sys
+      # aborta su build script y todo lo que compile el crate falla en CI.
+      - name: Install ALSA dev libs
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
 
   test:
@@ -46,6 +50,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Ver `clippy`: ALSA es requisito de compilación en Linux.
+      - name: Install ALSA dev libs
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - run: cargo test --lib ${{ matrix.features }}
 
   licenses:
