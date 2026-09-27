@@ -112,9 +112,12 @@ pub struct App {
     // Estado del ratón: posición (columna, fila) del último evento y si ha
     // habido un click izquierdo pendiente. El render de una vista con lista
     // (Search, Related, Now Playing) lo consume para seleccionar la fila bajo
-    // el cursor.
+    // el cursor. `mouse_right_click` es EXCLUSIVO del campo del popup de
+    // enlaces externos (pegar): en ningún otro sitio el clic derecho hace
+    // nada.
     mouse_pos: Option<(u16, u16)>,
     mouse_click: bool,
+    mouse_right_click: bool,
     status: Option<String>,
     /// Pie de diagnóstico discreto: errores de stream en caliente (overrun,
     /// cortes, decodificación) mostrados abajo a la derecha con caducidad, sin
@@ -158,11 +161,13 @@ pub struct App {
     /// Modal de bienvenida diaria (`Some` = visible). Se abre una vez por
     /// fecha local si el backend lo indica; pregunta el nombre si aún no hay.
     greeting: Option<super::greeting::GreetingUi>,
-    /// Popup para incorporar enlaces externos (`None` = oculto).
-    /// El usuario pulsa clic derecho dentro del campo para pegar la URL,
-    /// el sistema la detecta y la resuelve automáticamente, añadiéndola a
-    /// la playlist de enlaces externos.
-    #[allow(dead_code)] external_link_popup: Option<ExternalLinkPopupUi>,
+    /// Popup dedicado de incorporación de enlaces externos (`None` = oculto).
+    /// Se abre con clic izquierdo en la lupa de la vista de consulta; solo
+    /// dentro de su campo el clic derecho pega el portapapeles.
+    external_link_popup: Option<super::external_link::ExternalLinkPopup>,
+    /// Contador de generaciones de `ResolveLink` del popup (distinto de 0).
+    /// La búsqueda clásica usa generación 0.
+    link_generation: u64,
 }
 
 impl App {
@@ -191,6 +196,7 @@ impl App {
             liked: super::liked::Liked::default(),
             mouse_pos: None,
             mouse_click: false,
+            mouse_right_click: false,
             status: None,
             notices: Notices::default(),
             autoplay: true,
@@ -208,6 +214,7 @@ impl App {
             repeat: Default::default(),
             greeting: None,
             external_link_popup: None,
+            link_generation: 0,
         }
     }
 
@@ -309,6 +316,12 @@ impl App {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.mouse_click = true;
         }
+        // El clic derecho SOLO tiene significado dentro del campo del popup
+        // de enlaces (se consume en el render con hit-test). Aquí solo se
+        // registra; en cualquier otro contexto se ignora al consumir.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+            self.mouse_right_click = true;
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -336,6 +349,12 @@ impl App {
         // Va antes que la ayuda/at acoustics para no perder la escritura.
         if self.greeting.is_some() {
             self.on_greeting_key(key);
+            return;
+        }
+        // Popup de enlaces externos: consume sus teclas mientras está abierto
+        // (edición del campo + cierre). Va antes de la navegación global.
+        if self.external_link_popup.is_some() {
+            self.on_external_link_key(key);
             return;
         }
         // Se acepta `h` y `H` con o sin modificador SHIFT: la mayoría de
@@ -391,6 +410,7 @@ impl App {
             || self.view == View::Settings
             || self.playlist_view.creating
             || self.greeting.as_ref().is_some_and(|g| g.asking_name)
+            || self.external_link_popup.is_some()
     }
 
     /// Teclas en vistas de solo lectura (Now Playing, Related, Sources, ...).
@@ -620,9 +640,11 @@ impl App {
                     self.search.list_state.select(None);
                     // Enlace YouTube → ResolveLink (Fase 1); texto → Search.
                     // La detección vive en el provider (regla frontera `api`).
+                    // Generación 0 = flujo clásico de búsqueda (el popup usa
+                    // generaciones distintas de 0).
                     if is_link_query(&query) {
                         self.status = Some("Resolviendo enlace…".to_string());
-                        let _ = self.backend_tx.send(BackendCommand::ResolveLink(query));
+                        let _ = self.backend_tx.send(BackendCommand::ResolveLink(query, 0));
                     } else {
                         self.status = Some(format!("Buscando «{query}»..."));
                         let _ = self.backend_tx.send(BackendCommand::Search(query));
@@ -633,11 +655,14 @@ impl App {
             }
             KeyCode::Up => self.search.select_prev(),
             KeyCode::Down => self.search.select_next(),
-            // Pegar portapapeles (`Ctrl+V`): lee el clipboard del sistema y lo
-            // inserta en el cursor. Si no hay clipboard (SSH, TTY sin X/Wayland)
-            // se indica el pegado nativo del terminal (Ctrl+Shift+V).
-            // El método mejorado `paste_clipboard()` funciona en cualquier contexto.
-            KeyCode::Char('v' | 'V') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Pegar portapapeles (`Ctrl+V`, y `Win+V` donde el terminal lo
+            // reporte como SUPER): lee el clipboard del sistema y lo inserta
+            // en el cursor. Si no hay clipboard (SSH, TTY sin X/Wayland) se
+            // indica el pegado nativo del terminal (Ctrl+Shift+V).
+            KeyCode::Char('v' | 'V')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
                 match self.paste_clipboard() {
                     Ok(n) => {
                         self.status = Some(format!(
@@ -916,52 +941,203 @@ impl App {
 
     /// Pega el portapapeles del sistema en el cursor de búsqueda.
     ///
-    /// Lee el texto del portapapeles del sistema de forma robusta.
-/// Funciona en cualquier contexto (búsqueda, now playing, related, etc.).
-/// En sesiones sin clipboard (SSH/TTY sin X11/Wayland) devuelve un error
-/// con la alternativa nativa del terminal.
-fn read_clipboard_text(&self) -> Result<String, String> {
-    arboard::Clipboard::new()
-        .and_then(|mut cb| cb.get_text())
-        .map_err(|e| e.to_string())
-        .and_then(|t| {
-            let clean: String = t
-                .chars()
-                .filter(|c| !c.is_control() || *c == '\n')
-                .collect();
-            let clean = clean.trim().to_string();
-            if clean.is_empty() {
-                Err("vacío".to_string())
-            } else {
-                Ok(clean)
-            }
-        })
-}
-
-/// Método mejorado para pegar el portapapeles.
-/// A diferencia del anterior, este método:
-/// - Funciona en cualquier vista/panel, no solo en búsqueda
-/// - Devuelve el texto pegado para que el caller decida qué hacer
-/// - Tiene mejor manejo de errores y fallbacks
-/// - El pegado se realiza insertando caracteres en el campo activo
-fn paste_clipboard(&mut self) -> Result<usize, String> {
-    let text = self.read_clipboard_text()?;
-    // Pegar en el campo activo dependiendo de la vista actual
-    let n = text.chars().count();
-    // Insertar caracteres en el campo activo
-    // Si estamos en modo edición de búsqueda, insertar en el campo de búsqueda
-    if self.search.editing {
-        for c in text.chars() {
+    /// Sin dependencias de runtime del sistema más allá de lo que `arboard`
+    /// resuelve en puro Rust (X11/Wayland/macOS/Windows); en sesión sin
+    /// clipboard (SSH/TTY) falla con mensaje + alternativa nativa, nunca pánico.
+    /// La lectura cruda vive en `external_link::read_clipboard_text` (una sola
+    /// implementación para búsqueda y popup).
+    fn paste_clipboard(&mut self) -> Result<usize, String> {
+        let text = super::external_link::read_clipboard_text()?;
+        // Pegado multilínea (links con saltos): se aplana a espacios.
+        let flat = text.replace(['\n', '\r', '\t'], " ");
+        let n = flat.chars().count();
+        for c in flat.chars() {
             self.search.insert_char(c);
         }
-    } else {
-        // En otras vistas, mostrar el texto en la línea de estado
-        // o podría integrarse con el campo activo de esa vista
-        self.status = Some(format!(
-            "Pegado ({n} caracteres). El contenido se copió al buffer pero no se insertó en un campo editable activo."
-        ));
+        Ok(n)
     }
-    Ok(n)
+
+    /// Abre el popup dedicado de enlaces externos (lupa, clic izquierdo).
+    fn open_external_popup(&mut self) {
+        self.external_link_popup = Some(super::external_link::ExternalLinkPopup::new());
+        self.status = Some(
+            "Enlace externo: pega con clic derecho dentro del campo · Enter resolver · Esc cerrar."
+                .to_string(),
+        );
+    }
+
+    /// Teclas del popup de enlaces externos: edición + cierre + resolver.
+    ///
+    /// - `Esc` cierra sin resolver. `Enter` valida y resuelve el contenido.
+    /// - Texto/Backspace/Delete/flechas editan solo en estados editables; en
+    ///   vuelo (`Resolving`/`Adding`) se ignoran para no corromper la
+    ///   operación en curso.
+    /// - `Ctrl+V` (y `SUPER+V` para teclados/terminales que reportan la tecla
+    ///   Win) pega el portapapeles dentro del campo, igual que el clic derecho.
+    fn on_external_link_key(&mut self, key: KeyEvent) {
+        let paste_modifiers = key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER);
+        match key.code {
+            KeyCode::Esc => {
+                self.external_link_popup = None;
+                self.mouse_right_click = false;
+                self.status = Some("Enlace externo cancelado.".to_string());
+            }
+            KeyCode::Enter => self.submit_external_link(),
+            KeyCode::Char('v' | 'V') if paste_modifiers => self.paste_into_external_popup(),
+            KeyCode::Backspace => {
+                if let Some(p) = self.external_link_popup.as_mut() {
+                    p.backspace();
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(p) = self.external_link_popup.as_mut() {
+                    p.delete();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(p) = self.external_link_popup.as_mut() {
+                    p.move_left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(p) = self.external_link_popup.as_mut() {
+                    p.move_right();
+                }
+            }
+            KeyCode::Home => {
+                if let Some(p) = self.external_link_popup.as_mut() {
+                    p.move_home();
+                }
+            }
+            KeyCode::End => {
+                if let Some(p) = self.external_link_popup.as_mut() {
+                    p.move_end();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(p) = self.external_link_popup.as_mut() {
+                    p.insert_char(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pega el portapapeles DENTRO del campo del popup (clic derecho o
+    /// `Ctrl+V`/`Win+V` con el popup abierto) y dispara la resolución
+    /// automática si lo pegado parece un enlace.
+    fn paste_into_external_popup(&mut self) {
+        let Some(popup) = self.external_link_popup.as_mut() else {
+            return;
+        };
+        if popup.flow().in_flight() {
+            return;
+        }
+        self.status = Some("Pegando enlace…".to_string());
+        match super::external_link::read_clipboard_text() {
+            Ok(text) => {
+                popup.replace_with_paste(&text);
+                self.status = Some("Detectando enlace…".to_string());
+                self.submit_external_link();
+            }
+            Err(kind) => {
+                popup.set_flow_with(
+                    super::external_link::LinkFlow::Editing,
+                    "Portapapeles vacío o no disponible.",
+                );
+                self.status = Some(format!(
+                    "Portapapeles no disponible ({kind}): pega con Ctrl+Shift+V del terminal o Win+V."
+                ));
+            }
+        }
+        self.mouse_right_click = false;
+    }
+
+    /// Valida el contenido del campo y lo envía a resolver (Enter o pegado).
+    fn submit_external_link(&mut self) {
+        let text = self
+            .external_link_popup
+            .as_ref()
+            .map(|p| p.text())
+            .unwrap_or_default();
+        let Some(popup) = self.external_link_popup.as_mut() else {
+            return;
+        };
+        if popup.flow().in_flight() {
+            return;
+        }
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            popup.set_flow_with(
+                super::external_link::LinkFlow::Editing,
+                "El campo está vacío: pega un enlace primero.",
+            );
+            self.status = Some("El campo está vacío: pega un enlace primero.".to_string());
+            return;
+        }
+        let Some(token) = super::external_link::first_link_token(&trimmed) else {
+            popup.set_flow_with(
+                super::external_link::LinkFlow::Rejected,
+                "Enlace inválido: no se encontró una URL.",
+            );
+            self.status = Some("Enlace inválido: no se encontró una URL.".to_string());
+            return;
+        };
+        if !super::external_link::looks_like_external_link(&token) {
+            popup.set_flow_with(
+                super::external_link::LinkFlow::Rejected,
+                "Enlace inválido: pega un watch, youtu.be, shorts o playlist de YouTube.",
+            );
+            self.status = Some(
+                "Enlace inválido: pega un watch, youtu.be, shorts o playlist de YouTube."
+                    .to_string(),
+            );
+            return;
+        }
+        // Resolución automática con generación anti-carreras.
+        self.link_generation = self.link_generation.wrapping_add(1).max(1);
+        let generation = self.link_generation;
+        popup.set_flow(super::external_link::LinkFlow::Resolving);
+        popup.generation = generation;
+        popup.submitted = token.clone();
+        popup.pending = None;
+        self.status = Some("Resolviendo…".to_string());
+        let _ = self
+            .backend_tx
+            .send(BackendCommand::ResolveLink(token, generation));
+    }
+
+    /// Id de la playlist destino de enlaces externos, si ya existe.
+    fn external_links_playlist_id(&self) -> Option<i64> {
+        self.playlists
+            .iter()
+            .find(|p| p.name == super::external_link::EXTERNAL_LINKS_PLAYLIST_NAME)
+            .map(|p| p.id)
+    }
+
+    /// Asegura la playlist destino y envía el track a añadir.
+    fn ensure_external_playlist_and_add(&mut self, track: Track) {
+        if let Some(pid) = self.external_links_playlist_id() {
+            if let Some(popup) = self.external_link_popup.as_mut() {
+                popup.pending = Some(track.clone());
+                popup.set_flow(super::external_link::LinkFlow::Adding);
+            }
+            self.status = Some("Agregando a playlist…".to_string());
+            let _ = self.backend_tx.send(BackendCommand::SaveAndAddToPlaylist {
+                track: Box::new(track),
+                playlist_id: pid,
+            });
+        } else {
+            if let Some(popup) = self.external_link_popup.as_mut() {
+                popup.pending = Some(track);
+                popup.set_flow(super::external_link::LinkFlow::Adding);
+            }
+            self.status = Some("Creando playlist «Enlaces externos»…".to_string());
+            let _ = self.backend_tx.send(BackendCommand::CreatePlaylist(
+                super::external_link::EXTERNAL_LINKS_PLAYLIST_NAME.to_string(),
+            ));
+        }
     }
 
     /// Actualiza `now_playing` y dispara la carga de recomendaciones si el
@@ -1108,7 +1284,31 @@ fn paste_clipboard(&mut self) -> Result<usize, String> {
                     track.title
                 ));
             }
-            BackendEvent::LinkResolved { track, .. } => {
+            BackendEvent::LinkResolved {
+                input,
+                track,
+                generation,
+            } => {
+                // Flujo popup (generación distinta de 0): solo aplica si sigue
+                // siendo la operación en vuelo del popup (input + generación).
+                // Una resolución tardía de una operación anterior se ignora.
+                if generation != 0 {
+                    let fresh = self.external_link_popup.as_ref().is_some_and(|p| {
+                        p.generation == generation
+                            && p.submitted == input
+                            && p.flow() == super::external_link::LinkFlow::Resolving
+                    });
+                    if !fresh {
+                        return;
+                    }
+                    if let Some(popup) = self.external_link_popup.as_mut() {
+                        popup.set_flow(super::external_link::LinkFlow::Resolved);
+                    }
+                    self.status = Some("Recurso encontrado… Agregando a playlist…".to_string());
+                    self.ensure_external_playlist_and_add(*track);
+                    return;
+                }
+                // Flujo clásico de búsqueda (generación 0): sin cambios.
                 self.search.searching = false;
                 self.search.related_from = 0;
                 self.search.results = vec![*track];
@@ -1116,6 +1316,28 @@ fn paste_clipboard(&mut self) -> Result<usize, String> {
                 self.status = Some(
                     "Enlace resuelto: Enter reproduce · l L1K3D · p añade a playlist.".to_string(),
                 );
+            }
+            BackendEvent::ExternalLinkAdded { track, .. } => {
+                if let Some(popup) = self.external_link_popup.as_mut() {
+                    if popup.flow() == super::external_link::LinkFlow::Adding {
+                        popup.pending = None;
+                        popup.set_flow(super::external_link::LinkFlow::Added);
+                        self.status = Some("Agregado correctamente.".to_string());
+                        return;
+                    }
+                }
+                self.status = Some(format!("Añadida «{}» a la playlist.", track.title));
+            }
+            BackendEvent::ExternalLinkDuplicate { track, .. } => {
+                if let Some(popup) = self.external_link_popup.as_mut() {
+                    if popup.flow() == super::external_link::LinkFlow::Adding {
+                        popup.pending = None;
+                        popup.set_flow(super::external_link::LinkFlow::Duplicate);
+                        self.status = Some("Ya existe en la playlist.".to_string());
+                        return;
+                    }
+                }
+                self.status = Some(format!("Ya existe en la playlist «{}».", track.title));
             }
             BackendEvent::Greeting {
                 display_name,
@@ -1372,6 +1594,16 @@ fn paste_clipboard(&mut self) -> Result<usize, String> {
                 if let Some(sel) = self.playlist_view.listing.selected() {
                     self.playlist_view.listing.select(Some(sel.min(max)));
                 }
+                // Flujo popup: si hay un track resuelto pendiente y la playlist
+                // destino ya existe tras el refresco, se envía a añadir.
+                let pending = self.external_link_popup.as_ref().and_then(|p| {
+                    (p.flow() == super::external_link::LinkFlow::Resolved)
+                        .then(|| p.pending.clone())
+                        .flatten()
+                });
+                if let Some(track) = pending {
+                    self.ensure_external_playlist_and_add(track);
+                }
             }
             BackendEvent::PlaylistTracks {
                 playlist_id,
@@ -1419,8 +1651,41 @@ fn paste_clipboard(&mut self) -> Result<usize, String> {
                     format!("Quitada de L1K3D: «{}».", track.title)
                 });
             }
-            BackendEvent::Message(msg) => self.status = Some(msg),
+            BackendEvent::Message(msg) => {
+                // Flujo popup: la playlist remota llega como mensaje honesto
+                // (copia local, sin espejo). Solo se mapea si el popup está
+                // resolviendo; en otro caso es un mensaje normal.
+                if self.external_link_popup.as_ref().is_some_and(|p| {
+                    p.flow() == super::external_link::LinkFlow::Resolving
+                        && (msg.starts_with("Playlist remota")
+                            || msg.contains("sin proveedores")
+                            || msg.contains("Resolver enlaces requiere"))
+                }) {
+                    if let Some(popup) = self.external_link_popup.as_mut() {
+                        popup.set_flow_with(super::external_link::LinkFlow::Rejected, &msg);
+                    }
+                }
+                self.status = Some(msg);
+            }
             BackendEvent::Error(err) => {
+                // Flujo popup: los errores de enlace (`enlace: …`, `Enlace no
+                // reconocido`) mapean a fallo explícito solo si el popup está
+                // resolviendo. Otros errores siguen su camino normal.
+                if self.external_link_popup.as_ref().is_some_and(|p| {
+                    p.flow() == super::external_link::LinkFlow::Resolving
+                        && (err.starts_with("enlace:")
+                            || err.contains("Enlace no reconocido")
+                            || err.contains("no está disponible"))
+                }) {
+                    if let Some(popup) = self.external_link_popup.as_mut() {
+                        popup.set_flow_with(
+                            super::external_link::LinkFlow::Failed,
+                            "No se pudo resolver.",
+                        );
+                    }
+                    self.status = Some(format!("No se pudo resolver: {err}"));
+                    return;
+                }
                 self.search.searching = false;
                 // El error puede haber dejado una petición de recomendaciones
                 // colgada: se aborta para no esperar una respuesta que nunca
@@ -1454,6 +1719,32 @@ fn paste_clipboard(&mut self) -> Result<usize, String> {
         }
         if let Some(g) = &self.greeting {
             super::greeting::render(frame, area, g);
+        }
+        // Popup de enlaces externos: por encima de todo. El clic DERECHO solo
+        // pega si cae dentro del campo del popup; en cualquier otro sitio se
+        // consume sin efecto (no cambia el comportamiento global del ratón).
+        if self.external_link_popup.is_some() {
+            let popup_rect = super::external_link::popup_rect(area);
+            let field = super::external_link::field_rect(popup_rect);
+            if self.mouse_right_click {
+                let inside = self
+                    .mouse_pos
+                    .is_some_and(|(x, y)| super::external_link::contains(field, x, y));
+                if inside {
+                    self.paste_into_external_popup();
+                } else {
+                    self.mouse_right_click = false;
+                }
+            }
+            // El clic izquierdo no cierra ni interfiere: se consume para que
+            // el fondo no lo herede en el siguiente frame.
+            self.mouse_click = false;
+            if let Some(p) = &self.external_link_popup {
+                super::external_link::render(frame, area, p, *crate::ui::glyphs::GLYPHS);
+            }
+        } else {
+            // Sin popup no hay pegado por ratón en ningún sitio.
+            self.mouse_right_click = false;
         }
     }
 
@@ -1619,15 +1910,53 @@ fn paste_clipboard(&mut self) -> Result<usize, String> {
                     &self.liked,
                 );
             }
-            View::Search => search::render(
-                frame,
-                area,
-                &mut self.search,
-                &self.mouse_pos,
-                &mut self.mouse_click,
-                &self.listening_stats,
-                &self.liked,
-            ),
+            View::Search => {
+                // Con el popup abierto el fondo no consume clics (modal).
+                if self.external_link_popup.is_some() {
+                    let mut sink = false;
+                    search::render(
+                        frame,
+                        area,
+                        &mut self.search,
+                        &self.mouse_pos,
+                        &mut sink,
+                        &self.listening_stats,
+                        &self.liked,
+                    );
+                } else {
+                    search::render(
+                        frame,
+                        area,
+                        &mut self.search,
+                        &self.mouse_pos,
+                        &mut self.mouse_click,
+                        &self.listening_stats,
+                        &self.liked,
+                    );
+                    // Lupa "Enlace externo": overlay clicable con click
+                    // IZQUIERDO en la esquina superior derecha del bloque de
+                    // consulta. Abre el popup dedicado.
+                    let input = search::input_area(area);
+                    let lupa = super::external_link::lupa_rect(input);
+                    let hovered = self
+                        .mouse_pos
+                        .is_some_and(|(x, y)| super::external_link::contains(lupa, x, y));
+                    super::external_link::render_lupa(
+                        frame,
+                        input,
+                        hovered,
+                        *crate::ui::glyphs::GLYPHS,
+                    );
+                    if self.mouse_click {
+                        if let Some((x, y)) = self.mouse_pos {
+                            if super::external_link::contains(lupa, x, y) {
+                                self.mouse_click = false;
+                                self.open_external_popup();
+                            }
+                        }
+                    }
+                }
+            }
             View::Sources => sources::render(frame, area, &self.sources),
             View::Metadata => metadata::render(frame, area, self.now_playing.as_ref(), &self.liked),
             View::History => history::render(frame, area, &self.history, &self.liked),
@@ -3553,44 +3882,4 @@ mod tests {
             app.status
         );
     }
-}
-#[allow(dead_code)] struct ExternalLinkPopupUi {
-    /// Texto pegado o escrito en el campo.
-    text: String,
-    /// Modo: esperando pegar, resolviendo, añadido, error.
-    state: ExternalLinkState,
-    /// Mensaje de feedback para el usuario.
-    feedback: String,
-    /// Contador para auto-cerrar o timed feedback.
-    feedback_timer: std::time::Instant,
-}
-
-/// Estado del popup de enlaces externos.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
-#[allow(dead_code)] enum ExternalLinkState {
-    /// Esperando que el usuario pegue un enlace (campo vacío o con texto).
-    #[default]
-    Waiting,
-    /// Detectando el tipo de URL y resolviéndolo.
-    Resolving,
-    /// Asegurando que la playlist "Enlaces Externos" existe y añadiendo el track.
-    CreatingPlaylist,
-    /// Añadiendo el track a la playlist.
-    Adding,
-    /// Enlace resuelto y añadido a la playlist exitosamente.
-    Added,
-    /// Error: el enlace no es válido o no se pudo resolver.
-    Error,
-}
-
-impl Default for ExternalLinkPopupUi {
-    fn default() -> Self {
-        Self {
-            text: String::new(),
-            state: ExternalLinkState::Waiting,
-            feedback: String::new(),
-            feedback_timer: std::time::Instant::now(),
-        }
-        }
 }

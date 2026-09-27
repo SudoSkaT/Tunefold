@@ -31,8 +31,22 @@ pub enum BackendEvent {
     },
     /// Enlace resuelto a un track (la UI lo pone en resultados para
     /// `Enter`/`l`/`p` sin modelos paralelos).
+    /// `generation` empareja la respuesta con la operación en vuelo: la UI
+    /// solo aplica la respuesta si sigue siendo la carga en vuelo (0 = flujo
+    /// clásico de búsqueda; distinto de 0 = popup de enlaces externos).
     LinkResolved {
         input: String,
+        track: Box<Track>,
+        generation: u64,
+    },
+    /// Track de enlace externo incorporado a su playlist (flujo popup).
+    ExternalLinkAdded {
+        playlist_id: i64,
+        track: Box<Track>,
+    },
+    /// El track ya estaba en la playlist (sin duplicar).
+    ExternalLinkDuplicate {
+        playlist_id: i64,
         track: Box<Track>,
     },
     TrackSaved {

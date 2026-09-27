@@ -33,7 +33,9 @@ pub enum BackendCommand {
     Search(String),
     /// Resuelve un enlace YouTube a entidad interna (Fase 1: video → Track;
     /// playlist remota → mensaje honesto de copia local, sin espejo).
-    ResolveLink(String),
+    /// `u64` = generación de la operación en vuelo (0 = búsqueda clásica;
+    /// distinto de 0 = popup de enlaces externos). La respuesta la repite.
+    ResolveLink(String, u64),
     SaveTrack(Box<Track>),
     SaveSettings(Box<ConfigForm>),
     LoadHistory,
@@ -498,7 +500,9 @@ impl Backend {
                     }
                 }
             }
-            BackendCommand::ResolveLink(input) => self.resolve_link(input).await,
+            BackendCommand::ResolveLink(input, generation) => {
+                self.resolve_link(input, generation).await
+            }
             BackendCommand::SaveTrack(track) => {
                 let track = *track;
                 let mut ids = HashMap::new();
@@ -841,7 +845,7 @@ impl Backend {
     /// - Playlist remota → mensaje honesto: se importa como copia local
     ///   (decisión Q2), sin espejo; la UI la crea con `CreatePlaylist`.
     /// - Inválido / sin feature / sin catálogo → `Error`/`Message` sin red.
-    async fn resolve_link(&self, input: String) -> Vec<BackendEvent> {
+    async fn resolve_link(&self, input: String, generation: u64) -> Vec<BackendEvent> {
         #[cfg(feature = "youtube")]
         {
             use crate::providers::youtube::link::{parse_link, LinkKind};
@@ -867,6 +871,7 @@ impl Backend {
                         Ok(track) => vec![BackendEvent::LinkResolved {
                             input,
                             track: Box::new(track),
+                            generation,
                         }],
                         Err(e) => vec![BackendEvent::Error(format!("enlace: {e}"))],
                     }
@@ -882,6 +887,7 @@ impl Backend {
         #[cfg(not(feature = "youtube"))]
         {
             let _ = input;
+            let _ = generation;
             vec![BackendEvent::Message(
                 "Resolver enlaces requiere el build con `--features youtube`.".to_string(),
             )]
@@ -890,6 +896,9 @@ impl Backend {
 
     /// Upsert canónico + `add_to_playlist` + señal `PlaylistAdd` (Fase 1).
     /// Devuelve refresco del listado para contadores al día.
+    /// Detecta duplicados ANTES de insertar (`playlist_contains`): si el track
+    /// ya está, no duplica (la inserción además es `INSERT OR IGNORE`) y emite
+    /// el evento explícito `ExternalLinkDuplicate` junto al mensaje honesto.
     async fn save_and_add_to_playlist(&self, track: Track, playlist_id: i64) -> Vec<BackendEvent> {
         let mut ids = HashMap::new();
         if let Some(ext) = track.external_id.clone() {
@@ -899,6 +908,11 @@ impl Backend {
             Ok(id) => id,
             Err(e) => return vec![BackendEvent::Error(format!("guardar: {e}"))],
         };
+        let already = self
+            .db
+            .playlist_contains(playlist_id, internal_id)
+            .await
+            .unwrap_or(false);
         if let Err(e) = self.db.add_to_playlist(playlist_id, internal_id).await {
             return vec![BackendEvent::Error(format!("añadir: {e}"))];
         }
@@ -913,10 +927,23 @@ impl Backend {
                 None,
             )
             .await;
-        let mut ev = vec![BackendEvent::Message(format!(
-            "Añadida «{}» a la playlist.",
-            track.title
-        ))];
+        let mut ev = if already {
+            vec![
+                BackendEvent::ExternalLinkDuplicate {
+                    playlist_id,
+                    track: Box::new(track.clone()),
+                },
+                BackendEvent::Message(format!("Ya existe en la playlist «{}».", track.title)),
+            ]
+        } else {
+            vec![
+                BackendEvent::ExternalLinkAdded {
+                    playlist_id,
+                    track: Box::new(track.clone()),
+                },
+                BackendEvent::Message(format!("Añadida «{}» a la playlist.", track.title)),
+            ]
+        };
         ev.extend(self.refresh_playlists().await);
         ev
     }
@@ -1435,7 +1462,7 @@ fn is_heavy(cmd: &BackendCommand) -> bool {
     matches!(
         cmd,
         BackendCommand::Search(_)
-            | BackendCommand::ResolveLink(_)
+            | BackendCommand::ResolveLink(..)
             | BackendCommand::SaveTrack(_)
             | BackendCommand::Play(_)
             | BackendCommand::NextTrack

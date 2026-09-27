@@ -107,6 +107,17 @@ impl super::navigation::ListSelection for SearchState {
     }
 }
 
+/// Área del bloque de entrada de la consulta (3 filas superiores).
+///
+/// Fuente única del layout del input: `render` y el botón de lupa usan este
+/// mismo rectángulo, así el hit-test del clic nunca se desfasa del dibujo.
+pub fn input_area(area: Rect) -> Rect {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area)[0]
+}
+
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -116,9 +127,10 @@ pub fn render(
     stats: &std::collections::HashMap<String, TrackListeningStats>,
     liked: &Liked,
 ) {
+    let input = input_area(area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([Constraint::Length(input.height), Constraint::Min(0)])
         .split(area);
 
     // Entrada de consulta

@@ -218,6 +218,12 @@ impl UiGlyphs {
         self.pick("›", ">")
     }
 
+    /// Lupa del botón "Enlace externo" en la vista de consulta.
+    /// Unicode `○` (U+25CB, ancho 1 en fuentes mono) / ASCII `o`.
+    pub fn link_lupa(self) -> &'static str {
+        self.pick("○", "o")
+    }
+
     // ------------------------------------------ osciloscopio estéreo (§8)
     //
     // Punto mínimo discreto (estética Scatter de scope-tui, `Marker::Dot`):

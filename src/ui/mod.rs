@@ -7,6 +7,7 @@ pub mod app;
 pub mod backend;
 pub mod dashboard;
 pub mod event;
+pub mod external_link;
 pub mod glyphs;
 pub mod greeting;
 pub mod help;
