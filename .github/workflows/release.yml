@@ -1,9 +1,17 @@
 name: release
 
+# Único publicador oficial: un tag numérico SIN prefijo `v` (p. ej. `0.17.42`)
+# construye aquí los binarios y los sube como assets de la GitHub Release.
+# Las subidas manuales quedan prohibidas por procedimiento (ver checklist en
+# docs/policies.md): solo lo que sale de este workflow tiene la versión
+# horneada verificada contra el tag, que es lo que `tunefold --update` exige.
 on:
+  # Cualquier tag dispara el job, pero el paso `version-guard` (el primero)
+  # solo deja pasar tags numéricos SIN `v` que coincidan con Cargo.toml/lock.
+  # Así un tag erróneo falla rápido y ruidoso en vez de publicar mal.
   push:
     tags:
-      - "v*"
+      - "*"
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,6 +40,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fuente única de verdad: el tag debe ser numérico SIN `v` y coincidir
+      # con Cargo.toml y con Cargo.lock (paquete tunefold). Sin esto se
+      # publican assets cuya `--version` horneada no coincide con el tag (el
+      # síntoma "actualiza pero --version dice otra cosa"). Va primero para
+      # fallar rápido sin compilar nada.
+      - name: version-guard (tag == Cargo.toml == Cargo.lock, sin v)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in
+            v*) echo "tags canónicos SIN prefijo 'v' (recibido: $TAG)"; exit 1;;
+          esac
+          case "$TAG" in
+            *[!0-9.]*) echo "tag no numérico: $TAG (se espera X.Y.Z)"; exit 1;;
+          esac
+          TOML="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          LOCK="$(grep -A1 'name = "tunefold"' Cargo.lock | grep -m1 '^version' | cut -d'"' -f2)"
+          test "$TOML" = "$TAG" || { echo "Cargo.toml ($TOML) != tag ($TAG): sube primero el bump de versión"; exit 1; }
+          test "$LOCK" = "$TAG" || { echo "Cargo.lock ($LOCK) != tag ($TAG): regenera el lock"; exit 1; }
+          echo "versión OK: $TAG"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -43,38 +73,55 @@ jobs:
       - name: Build official binary (no youtube)
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # El build con youtube SOBREESCRIBE la misma ruta de salida; se aparta
+      # el oficial primero para no empaquetar youtube como "oficial" (TdS).
+      - name: Stage official binary aside
+        shell: bash
+        run: |
+          mkdir -p dist stage-official
+          cp target/${{ matrix.target }}/release/tunefold stage-official/ 2>/dev/null || cp target/${{ matrix.target }}/release/tunefold.exe stage-official/ 2>/dev/null || true
+
       - name: Build full binary (with youtube)
         run: cargo build --release --locked --features youtube --target ${{ matrix.target }}
 
+      # El binario oficial se publica CRUDO con el nombre exacto que
+      # `tunefold --update` busca (`tunefold-<TARGET>` [+`.exe`]); el completo
+      # lleva sufijo `-yt` y el updater lo ignora por diseño.
       - name: Package binary (linux/mac)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/tunefold dist/ 2>/dev/null || true
-          # El binario oficial es el sin-youtube; el completo lleva sufijo -yt.
+          cp stage-official/tunefold "dist/tunefold-${{ matrix.target }}"
           cp target/${{ matrix.target }}/release/tunefold "dist/tunefold-${{ matrix.target }}-yt"
-          chmod +x dist/* || true
+          chmod +x dist/tunefold-${{ matrix.target }}* || true
 
       - name: Package binary (windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/tunefold.exe dist/tunefold-${{ matrix.target }}.exe
-          cp target/${{ matrix.target }}/release/tunefold.exe dist/tunefold-${{ matrix.target }}-yt.exe
+          cp stage-official/tunefold.exe "dist/tunefold-${{ matrix.target }}.exe"
+          cp target/${{ matrix.target }}/release/tunefold.exe "dist/tunefold-${{ matrix.target }}-yt.exe"
 
-      - name: Archive binary
+      # Verificación post-build: el asset oficial debe reportar el tag.
+      # Espejo de la verificación post-descarga del updater.
+      - name: Verify packaged version matches tag
         shell: bash
         run: |
-          cd dist
-          tar -czf tunefold-${{ matrix.target }}.tar.gz tunefold 2>/dev/null || tar -czf tunefold-${{ matrix.target }}.tar.gz tunefold-${{ matrix.target }}*
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            REPORTED="$(dist/tunefold-${{ matrix.target }}.exe --version)"
+          else
+            REPORTED="$(./dist/tunefold-${{ matrix.target }} --version)"
+          fi
+          echo "$REPORTED"
+          echo "$REPORTED" | grep -q "tunefold ${GITHUB_REF_NAME}$" || { echo "el binario no reporta el tag ${GITHUB_REF_NAME}"; exit 1; }
 
       - uses: softprops/action-gh-release@v1
         with:
           files: |
-            dist/*.tar.gz
-            dist/*.exe
+            dist/tunefold-*
             LICENSE
             THIRD_PARTY.md
             NOTICE

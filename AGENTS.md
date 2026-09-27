@@ -53,6 +53,8 @@ cargo check --offline --features youtube
 - `Cargo.lock` se regenera al renombrar crates; verifica que no queden nombres
   viejos.
 - La versión canónica se mantiene en `Cargo.toml` (y `--version`); las releases
-  usan tags `vX.Y.Z`.
+  usan tags numéricos SIN `v` (`X.Y.Z`) que deben coincidir con `Cargo.toml` y
+  `Cargo.lock` (ver checklist en `docs/policies.md`); solo el workflow
+  `release` publica assets.
 - Las políticas (privacidad, licencias, semver) están en `docs/policies.md` y
   `PRIVACY.md`; se aplican en CI.

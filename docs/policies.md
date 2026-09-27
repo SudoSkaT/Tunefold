@@ -13,7 +13,22 @@ respetar. Cambiarlas exige revisión explícita en el PR.
 - **PATCH**: correcciones, sin contratos rotos.
 
 El flag `--version` y el `CARGO_PKG_VERSION` son la única fuente de verdad; los
-tags de release usan el prefijo `v` (`v1.5.4`).
+tags de release son numéricos SIN prefijo `v` (`0.17.42`) y deben coincidir
+exactamente con `Cargo.toml` y `Cargo.lock` (lo verifica el paso
+`version-guard` del workflow `release`).
+
+Checklist de release (obligatorio, en este orden):
+
+1. Subir `version` en `Cargo.toml` y regenerar `Cargo.lock`.
+2. Commit del bump en `main` con el árbol limpio.
+3. Crear el tag numérico (`git tag 0.17.x && git push origin 0.17.x`).
+4. Solo el workflow `release` publica: construye `--release --locked`,
+   verifica que el binario reporta el tag y sube el asset crudo
+   `tunefold-<target>` (el que `tunefold --update` descarga). Las subidas
+   manuales están prohibidas: un asset con la versión horneada distinta del
+   tag produce el síntoma "actualiza pero `--version` dice otra cosa".
+5. Nota de migración: la línea `1.7.x` migró a `0.17.x`; el updater acepta ese
+   salto una vez (one-time) con aviso explícito.
 
 ## Licencias
 

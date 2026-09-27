@@ -12,6 +12,12 @@ vendor/**/target/
 
 *.snap.new
 
+# Binarios de release: los publica CI como assets de la GitHub Release, nunca
+# se commitean (cada versión pesaba ~26 MB en el historial).
+tunefold-x86_64-unknown-linux-gnu
+tunefold-*
+/dist
+
 .idea/
 .vscode/
 *.swp
