@@ -2,7 +2,7 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use std::error::Error;
 use tunefold::analysis::WaveformEnvelope;
-use tunefold::visualization::engine::{SceneState, VisualState, WaveformView};
+use tunefold::visualization::engine::{SceneState, VisualState, WaveformHistory, WaveformView};
 use tunefold::visualization::palette::VisualTheme;
 use tunefold::visualization::render::render;
 use tunefold::visualization::VISUAL_BARS;
@@ -49,6 +49,7 @@ fn state(theme: VisualTheme) -> VisualState {
         active: true,
         scene: SceneState {
             waveform: punchy_view(),
+            history: WaveformHistory::default(),
             energy: 0.7,
             brightness: 0.4,
             theme,

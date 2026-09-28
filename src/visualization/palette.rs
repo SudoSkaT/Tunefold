@@ -373,6 +373,83 @@ impl VisualTheme {
     pub fn channel_colors(&self) -> ChannelColors {
         let mut left = Self::blend(self.accent, self.primary, CHANNEL_LEFT_TINT);
         let mut right = Self::blend(self.secondary, self.primary, CHANNEL_RIGHT_TINT);
+        // Garantía doble y acotada (máx `CHANNEL_SEPARATION_STEPS` rondas):
+        // (1) L y R perceptualmente separados entre sí; (2) cada uno con
+        // contraste suficiente contra el fondo para que los puntos se lean
+        // como señal y no como ruido (Fase 8). Ambos ajustes son monótonos
+        // por canal (mezclas hacia extremos), así que conservan el matiz
+        // relativo derivado de la portada. Determinista, sin aleatoriedad.
+        let bg = self.background;
+        for _ in 0..CHANNEL_SEPARATION_STEPS {
+            let mut changed = false;
+            if channel_distance(left, right) < CHANNEL_DISTANCE_MIN {
+                left = Self::blend(left, [255, 255, 255], CHANNEL_SEPARATION_DELTA);
+                right = Self::blend(right, [0, 0, 0], CHANNEL_SEPARATION_DELTA);
+                changed = true;
+            }
+            let fixed_l = ensure_contrast(left, bg, TRACE_MIN_CONTRAST);
+            let fixed_r = ensure_contrast(right, bg, TRACE_MIN_CONTRAST);
+            if fixed_l != left || fixed_r != right {
+                left = fixed_l;
+                right = fixed_r;
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+        ChannelColors { left, right }
+    }
+
+    /// Dúo cromático del osciloscopio: L brillante + R complementario, ambos
+    /// derivados de la portada para la composición del trazo estéreo.
+    ///
+    /// - L = el tameado con mayor brillo cromático (luminancia × saturación),
+    ///   garantizado contra el fondo.
+    /// - R = su complementario cromático (matiz +180° en HSL, misma S/L),
+    ///   garantizado contra el fondo.
+    /// - Separación mutua mínima con el mismo patrón acotado de
+    ///   `channel_colors`, más re-garantía final de contraste.
+    ///
+    /// Los protagonistas son cromáticos y brillantes (nunca gris/blanco/negro
+    /// como primera opción): solo una portada acromática produce un dúo
+    /// acromático, y aun así legible. Pura y determinista, sin aleatoriedad.
+    /// Acento del trazo para el dúo: el rol (primary/secondary/accent) más
+    /// distante de ambos colores del dúo, garantizado contra el fondo.
+    ///
+    /// Los picos/transitorios nunca deben confundirse por color con el trace
+    /// de ningún canal (en el fallback, el accent crudo coincide con el L del
+    /// dúo). Pura y determinista.
+    pub fn duet_accent(&self, duet: ChannelColors) -> [u8; 3] {
+        let cands = [self.primary, self.secondary, self.accent];
+        let mut best = cands[0];
+        let mut best_d = f32::MIN;
+        for c in cands {
+            let d = channel_distance(c, duet.left).min(channel_distance(c, duet.right));
+            if d > best_d {
+                best_d = d;
+                best = c;
+            }
+        }
+        ensure_contrast(best, self.background, TRACE_MIN_CONTRAST)
+    }
+
+    pub fn duet_colors(&self) -> ChannelColors {
+        let bg = self.background;
+        let cands = [self.primary, self.secondary, self.accent];
+        let mut li = 0usize;
+        let mut best = f32::MIN;
+        for (i, c) in cands.iter().enumerate() {
+            let (_, s, _) = rgb_to_hsl(*c);
+            let score = relative_luminance(*c) as f32 * (0.25 + s);
+            if score > best {
+                best = score;
+                li = i;
+            }
+        }
+        let mut left = ensure_contrast(cands[li], bg, TRACE_MIN_CONTRAST);
+        let (h, s, l) = rgb_to_hsl(left);
+        let mut right = ensure_contrast(hsl_to_rgb((h + 0.5) % 1.0, s, l), bg, TRACE_MIN_CONTRAST);
         let mut steps = 0u8;
         while channel_distance(left, right) < CHANNEL_DISTANCE_MIN
             && steps < CHANNEL_SEPARATION_STEPS
@@ -381,7 +458,29 @@ impl VisualTheme {
             right = Self::blend(right, [0, 0, 0], CHANNEL_SEPARATION_DELTA);
             steps += 1;
         }
+        left = ensure_contrast(left, bg, TRACE_MIN_CONTRAST);
+        right = ensure_contrast(right, bg, TRACE_MIN_CONTRAST);
         ChannelColors { left, right }
+    }
+
+    /// Color único del traza mono del osciloscopio.
+    ///
+    /// Promedio del dúo de la portada (L + R mezclados 50/50), garantizado
+    /// contra el fondo. Solo el color cambia con el tema de la portada;
+    /// el resto de la composición es idéntico.
+    pub fn duet_color(&self) -> [u8; 3] {
+        let bg = self.background;
+        let candidates = [self.primary, self.secondary, self.accent, self.glow];
+        let mut best = candidates[0];
+        let mut best_ratio = 0.0f64;
+        for c in candidates {
+            let ratio = contrast_ratio(c, bg);
+            if ratio > best_ratio {
+                best_ratio = ratio;
+                best = c;
+            }
+        }
+        ensure_contrast(best, bg, TRACE_MIN_CONTRAST)
     }
 
     /// Colores de los tres estados del karaoke con contraste garantizado.
@@ -446,6 +545,9 @@ const CHANNEL_RIGHT_TINT: f32 = 0.30;
 const CHANNEL_DISTANCE_MIN: f32 = 100.0;
 /// Pasos máximos de separación incremental L(↑claro) R(↓oscuro).
 const CHANNEL_SEPARATION_STEPS: u8 = 8;
+/// Contraste mínimo (WCAG) de cada trazo contra el fondo de escena: por
+/// debajo los puntos se perciben como ruido (Fase 8).
+pub const TRACE_MIN_CONTRAST: f64 = 3.0;
 /// Factor de corrección por paso de separación (0..1).
 const CHANNEL_SEPARATION_DELTA: f32 = 0.06;
 
@@ -1067,6 +1169,65 @@ mod tests {
                 c1.left,
                 c1.right,
                 channel_distance(c1.left, c1.right)
+            );
+        }
+    }
+
+    #[test]
+    fn duet_colors_are_complementary_chromatic_and_legible() {
+        // Portadas cromáticas: L brillante + R complementario (≈180° de
+        // matiz), ambos con contraste ≥3 contra el fondo y separados entre
+        // sí; nunca gris/blanco/negro como protagonistas.
+        for cover in [
+            Some([[200u8, 40, 40], [40, 200, 60], [30, 60, 220]]),
+            Some([[255u8, 0, 0], [0, 255, 0], [0, 0, 255]]),
+            Some([[40u8, 30, 90], [120, 60, 40], [10, 80, 110]]),
+            Some([[240u8, 220, 200], [230, 235, 240], [250, 245, 235]]),
+            None,
+        ] {
+            let p = VisualTheme::from_cover(cover);
+            let d1 = p.duet_colors();
+            let d2 = p.duet_colors();
+            assert_eq!(d1, d2, "determinista en {cover:?}");
+            assert!(
+                channel_distance(d1.left, d1.right) >= CHANNEL_DISTANCE_MIN,
+                "L/R separados en {cover:?}"
+            );
+            for (name, c) in [("L", d1.left), ("R", d1.right)] {
+                assert!(
+                    contrast_ratio(c, p.background) >= TRACE_MIN_CONTRAST,
+                    "{name} χ<3 en {cover:?}"
+                );
+                let (_, s, _) = rgb_to_hsl(c);
+                assert!(s > 0.08, "{name} cromático en {cover:?} (s={s})");
+                assert_ne!(c, [255, 255, 255], "{name} no es blanco en {cover:?}");
+                assert_ne!(c, [0, 0, 0], "{name} no es negro en {cover:?}");
+            }
+            // Complementariedad: matices opuestos (±180° con tolerancia).
+            let (hl, _, _) = rgb_to_hsl(d1.left);
+            let (hr, _, _) = rgb_to_hsl(d1.right);
+            let mut dh = (hr - hl).abs();
+            if dh > 0.5 {
+                dh = 1.0 - dh;
+            }
+            assert!(
+                (dh - 0.5).abs() < 0.12,
+                "matices opuestos en {cover:?} (Δh={dh:.2})"
+            );
+        }
+    }
+
+    #[test]
+    fn duet_colors_on_gray_cover_stay_legible() {
+        // Excepción documentada: sin croma en la portada no hay de dónde
+        // derivar color; el dúo sale acromático pero legible y separado.
+        let p =
+            VisualTheme::from_cover(Some([[120u8, 120, 120], [130, 130, 130], [128, 128, 128]]));
+        let d = p.duet_colors();
+        for c in [d.left, d.right] {
+            assert!(
+                contrast_ratio(c, p.background) >= TRACE_MIN_CONTRAST,
+                "legible aun en gris: {c:?}"
             );
         }
     }

@@ -209,10 +209,12 @@ pub fn render(
     // para no estirar el waveform indefinidamente en terminales muy anchos.
     let profile = super::layout::TerminalProfile::from_rect(area);
     let comp = super::layout::related_composition(area.height, profile);
-    let band_area = super::layout::centered_width(
-        Rect::new(area.x, area.y, area.width, comp.band),
-        super::layout::RELATED_MAX_WIDTH,
-    );
+    // Ancho proporcional al viewport (ver `related_content_width`): en
+    // terminales grandes el contenido crece en vez de quedar encajonado a 100
+    // columnas con medio viewport vacío.
+    let content_w = crate::ui::layout::related_content_width(area.width);
+    let band_area =
+        super::layout::centered_width(Rect::new(area.x, area.y, area.width, comp.band), content_w);
     let list_area = super::layout::centered_width(
         Rect::new(
             area.x,
@@ -220,17 +222,19 @@ pub fn render(
             area.width,
             area.height.saturating_sub(comp.band + comp.gap),
         ),
-        super::layout::RELATED_MAX_WIDTH,
+        content_w,
     );
 
     {
         let top_area = band_area;
         // El osciloscopio vive tras el texto: fondo plano + trazo atenuado de
         // puntos (nunca bloques), y encima el contenido (letras o mensaje).
-        let trace_inner = top_area.inner(Margin {
+        // El trazo tras las letras comparte el mismo tope de fidelidad que
+        // el modo visual (el panel conserva todo el ancho proporcional).
+        let trace_inner = visualizer::clamp_trace_width(top_area.inner(Margin {
             horizontal: 1,
             vertical: 1,
-        });
+        }));
         let paint_ambient = |frame: &mut Frame| {
             visualizer::render_backdrop(frame, top_area, visual, true);
             if trace_inner.width > 0 && trace_inner.height > 0 {
@@ -784,6 +788,7 @@ mod tests {
                     right: env,
                     gain: 1.0,
                 },
+                history: crate::visualization::engine::WaveformHistory::default(),
                 energy: 0.8,
                 brightness: 0.5,
                 theme,
@@ -900,5 +905,75 @@ mod tests {
             BandContent::resolve(VisualContent::Visual, true, false),
             BandContent::Visual
         ));
+    }
+
+    #[test]
+    fn related_uses_viewport_width_on_required_sizes() {
+        // Fase 4: CONTENT_WIDTH = f(viewport). La banda se centra con el ancho
+        // proporcional (esquinas del marco en la x esperada) y el contenido
+        // ocupa razonablemente el viewport en los seis tamaños, sin solapes
+        // (banda arriba, lista debajo) y sin pánicos.
+        for (w, h) in [
+            (60u16, 15u16),
+            (80, 24),
+            (100, 30),
+            (120, 40),
+            (160, 50),
+            (200, 60),
+        ] {
+            let mut state = RelatedState::default();
+            let backend = TestBackend::new(w, h);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    render(
+                        f,
+                        f.area(),
+                        &mut state,
+                        Some(Duration::from_secs(12)),
+                        false,
+                        VisualContent::Visual,
+                        None,
+                        &visual_with_palette(None),
+                        &None,
+                        &mut false,
+                        &std::collections::HashMap::new(),
+                        &Liked::default(),
+                    )
+                })
+                .unwrap_or_else(|_| panic!("related visual a {w}x{h}"));
+            let buf = terminal.backend().buffer().clone();
+            let content_w = crate::ui::layout::related_content_width(w);
+            let expect_x = (w - content_w) / 2;
+            // Esquina superior izquierda del marco de la banda.
+            let row0: String = (0..w).map(|x| buf.cell((x, 0)).unwrap().symbol()).collect();
+            let corner = row0
+                .find('┌')
+                .unwrap_or_else(|| panic!("sin marco a {w}x{h}"));
+            assert_eq!(
+                corner as u16, expect_x,
+                "banda centrada con ancho proporcional a {w}x{h}"
+            );
+            assert_eq!(
+                row0.chars().nth((expect_x + content_w - 1) as usize),
+                Some('┐'),
+                "esquina derecha coherente a {w}x{h}"
+            );
+            // Ocupación: la banda contiene celdas no vacías en gran parte de
+            // su ancho (nada de panel fantasma ni medio viewport en blanco).
+            let profile = crate::ui::layout::TerminalProfile::from_rect(Rect::new(0, 0, w, h));
+            let comp = crate::ui::layout::related_composition(h, profile);
+            assert!(comp.band >= 2, "banda presente a {w}x{h}");
+            let mut used = 0usize;
+            for x in expect_x..expect_x + content_w {
+                if (0..comp.band).any(|y| !buf.cell((x, y)).unwrap().symbol().trim().is_empty()) {
+                    used += 1;
+                }
+            }
+            assert!(
+                used * 100 / content_w as usize >= 60,
+                "la banda ocupa su ancho a {w}x{h} ({used}/{content_w})"
+            );
+        }
     }
 }

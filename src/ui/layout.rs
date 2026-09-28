@@ -152,10 +152,10 @@ pub fn dashboard_layout(body: Rect, profile: TerminalProfile) -> DashboardLayout
     // al final visual/progreso — hasta llenar el cuerpo exactamente sin
     // huecos residuales.
     let (recs_cap, controls_cap, visual_cap, progress_cap) = match profile {
-        TerminalProfile::Large => (10, 8, 8, 6),
-        TerminalProfile::Medium => (9, 6, 6, 5),
-        TerminalProfile::Small => (8, 4, 4, 4),
-        TerminalProfile::Tiny => (6, 3, 3, 3),
+        TerminalProfile::Large => (10, 8, 12, 6),
+        TerminalProfile::Medium => (9, 6, 8, 5),
+        TerminalProfile::Small => (8, 4, 6, 4),
+        TerminalProfile::Tiny => (6, 3, 4, 3),
     };
     loop {
         let total = card + visual + progress + recs + controls;
@@ -186,14 +186,38 @@ pub fn dashboard_layout(body: Rect, profile: TerminalProfile) -> DashboardLayout
     }
 }
 
-/// Ancho máximo del contenido centrado de Related (banda visual +
-/// recomendaciones).
+/// Ancho máximo histórico del contenido de Related.
 ///
-/// En terminales muy anchos el waveform no debe estirarse indefinidamente: más
-/// allá de ~100 columnas cada columna cubre <1 bucket y el trazo gana puntos
-/// redundantes en vez de detalle. El espacio sobrante queda como breathing
-/// room lateral y la composición se percibe centrada.
+/// Sustituido por [`related_content_width`]: un tope fijo deja 40–50% de la
+/// pantalla sin usar en terminales grandes. Se conserva por compatibilidad de
+/// tests; el render usa la función proporcional.
 pub const RELATED_MAX_WIDTH: u16 = 100;
+
+/// Ancho del contenido de Related en función del viewport (nunca constante).
+///
+/// - Pequeño/mediano (≤100): todo el ancho disponible (información primero).
+/// - Grande (100–140): margen lateral de 4+4.
+/// - Ultra-wide (141–200): el contenido absorbe la mitad del excedente.
+/// - Extremo (>200): crece despacio (1 de cada 4) para no dispersar la lectura.
+///
+/// Márgenes resultantes: 120→4+4, 160→9+9, 200→19+19. El waveform NO se estira
+/// sin límite con ello: el trazo se topa por fidelidad en
+/// [`crate::visualization::render::WAVEFORM_TRACE_MAX_WIDTH`] (128 buckets ⇒
+/// más columnas solo añaden puntos redundantes), mientras banda y lista sí
+/// aprovechan el ancho.
+pub fn related_content_width(viewport_w: u16) -> u16 {
+    if viewport_w <= 100 {
+        viewport_w
+    } else if viewport_w <= 140 {
+        // Suelo en 100 para no encoger al cruzar el umbral (100→101 seguiría
+        // en 100); continua y monótona en 140 (132).
+        viewport_w.saturating_sub(8).max(100)
+    } else if viewport_w <= 200 {
+        132 + (viewport_w - 140) / 2
+    } else {
+        162 + (viewport_w - 200) / 4
+    }
+}
 
 /// Composición vertical de la vista Related: banda visual + gap + lista.
 ///
@@ -219,10 +243,10 @@ pub struct RelatedComposition {
 /// - La lista se queda con el resto (mínimo 1 fila: scroll interno).
 pub fn related_composition(body_h: u16, profile: TerminalProfile) -> RelatedComposition {
     let (min, max) = match profile {
-        TerminalProfile::Large => (6, 16),
-        TerminalProfile::Medium => (5, 13),
-        TerminalProfile::Small => (4, 10),
-        TerminalProfile::Tiny => (3, 8),
+        TerminalProfile::Large => (8, 30),
+        TerminalProfile::Medium => (7, 24),
+        TerminalProfile::Small => (5, 16),
+        TerminalProfile::Tiny => (4, 10),
     };
     if body_h == 0 {
         return RelatedComposition {
@@ -231,7 +255,7 @@ pub fn related_composition(body_h: u16, profile: TerminalProfile) -> RelatedComp
             list: 0,
         };
     }
-    let target = ((body_h as u32 * 60) / 100) as u16;
+    let target = ((body_h as u32 * 70) / 100) as u16;
     let gap: u16 = if body_h >= 20 { 1 } else { 0 };
     // Reserva mínima de la lista (2 filas: borde + 1 item) más el gap.
     let reserve = 2 + gap;
@@ -370,10 +394,10 @@ mod tests {
                 "la composición llena el cuerpo sin huecos ni solapes"
             );
             // Banda ≈40-60% del cuerpo (proporción, no rigidez matemática);
-            // en cuerpos enormes manda el tope para no crear un waveform
+            // en cuerpos enormes manda el tope (24) para no crear un waveform
             // gigante y el resto es lista con scroll + breathing.
-            if *body_h > 30 {
-                assert_eq!(c.band, 16, "banda topada en cuerpo {body_h}: {c:?}");
+            if *body_h > 44 {
+                assert_eq!(c.band, 24, "banda topada en cuerpo {body_h}: {c:?}");
             } else {
                 let frac = c.band as f32 / *body_h as f32;
                 assert!(
@@ -390,11 +414,52 @@ mod tests {
     }
 
     #[test]
+    fn related_content_width_grows_with_viewport() {
+        // CONTENT_WIDTH = f(viewport), nunca constante: pequeño/medio a todo
+        // ancho, grande con márgenes razonables, ultra-wide absorbiendo el
+        // excedente sin dejar medio viewport vacío.
+        let cases: &[(u16, u16)] = &[
+            (60, 60),
+            (80, 80),
+            (100, 100),
+            (120, 112),
+            (140, 132),
+            (160, 142),
+            (200, 162),
+        ];
+        for (viewport, want) in cases {
+            assert_eq!(
+                related_content_width(*viewport),
+                *want,
+                "ancho para viewport {viewport}"
+            );
+        }
+        // Monótono y con márgenes acotados en ultra-wide.
+        let mut prev = 0u16;
+        for w in (60..=200).step_by(5) {
+            let c = related_content_width(w);
+            assert!(c >= prev, "monótono en {w}");
+            assert!(c <= w, "nunca excede el viewport en {w}");
+            prev = c;
+        }
+        let unused_200 = 200 - related_content_width(200);
+        assert!(
+            unused_200 <= 40,
+            "en 200 cols no se desperdicia medio viewport: {unused_200} libres"
+        );
+        let unused_120 = 120 - related_content_width(120);
+        assert!(
+            unused_120 <= 10,
+            "en 120 cols el contenido casi llena: {unused_120} libres"
+        );
+    }
+
+    #[test]
     fn related_composition_caps_band_and_keeps_list() {
-        // En terminales grandes la banda NO crece indefinidamente (tope 14) y
+        // En terminales grandes la banda NO crece indefinidamente (tope 24) y
         // la lista conserva filas suficientes para varias recomendaciones.
         let c = related_composition(46, TerminalProfile::Large);
-        assert!(c.band <= 16, "banda topada: {c:?}");
+        assert!(c.band <= 24, "banda topada: {c:?}");
         assert!(c.list >= 10, "lista amplia: {c:?}");
         assert_eq!(c.gap, 1, "breathing entre secciones: {c:?}");
         // En terminales bajos no hay gap y los mínimos mandan.

@@ -44,6 +44,84 @@ impl WaveformView {
     }
 }
 
+impl Default for WaveformView {
+    fn default() -> Self {
+        Self::baseline()
+    }
+}
+
+/// Nº de snapshots del historial visual (8 × ~66 ms ≈ medio segundo de frase
+/// musical en el eje X del osciloscopio).
+pub const VIS_HISTORY: usize = 8;
+
+/// Historial visual de forma de onda: últimos snapshots (anillo sin allocs).
+///
+/// Separa la VENTANA DE VISUALIZACIÓN de la ventana de análisis FFT (Fase 6):
+/// el análisis sigue con su ventana de 2048 muestras (~46 ms); esto es solo
+/// memoria de PRESENTACIÓN en el motor visual (lado UI, nunca en el hilo de
+/// audio). El renderer mapea sus columnas sobre la tira virtual
+/// `len × 128` buckets (izquierda = pasado, derecha = presente), así el trazo
+/// conserva trayectoria temporal incluso en terminales anchos donde una sola
+/// ventana colapsaría a puntos horizontales aislados.
+///
+/// `Copy` (arreglos fijos, ~24 KiB): se publica por valor en cada frame sin
+/// allocations; el anillo reutiliza sus slots.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaveformHistory {
+    slots: [WaveformView; VIS_HISTORY],
+    /// Nº de slots válidos (0 = sin historial: el renderer usa la vista única,
+    /// comportamiento idéntico al anterior).
+    pub len: usize,
+    /// Índice del slot MÁS RECIENTE.
+    head: usize,
+}
+
+impl WaveformHistory {
+    /// Historial vacío (sin señal / escena dormida).
+    pub fn empty() -> Self {
+        Self {
+            slots: [WaveformView::baseline(); VIS_HISTORY],
+            len: 0,
+            head: 0,
+        }
+    }
+
+    /// Nº total de buckets virtuales (`len × 128`, 0 si vacío).
+    pub fn total_buckets(&self) -> usize {
+        self.len * crate::analysis::WAVEFORM_BUCKETS
+    }
+
+    /// Añade el snapshot más reciente (anillo: sobrescribe el más antiguo).
+    pub fn push(&mut self, view: WaveformView) {
+        self.head = (self.head + 1) % VIS_HISTORY;
+        self.slots[self.head] = view;
+        self.len = (self.len + 1).min(VIS_HISTORY);
+    }
+
+    /// Snapshot `seq`-ésimo en orden temporal (0 = más antiguo). `None` si
+    /// fuera de rango.
+    pub fn get(&self, seq: usize) -> Option<WaveformView> {
+        if seq >= self.len {
+            return None;
+        }
+        // El más antiguo está `len-1` posiciones detrás del head.
+        let idx = (self.head + VIS_HISTORY - (self.len - 1 - seq)) % VIS_HISTORY;
+        Some(self.slots[idx])
+    }
+
+    /// Vacía el historial (pausa, seek, cambio de track).
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.head = 0;
+    }
+}
+
+impl Default for WaveformHistory {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 /// Escena ambiental (osciloscopio estéreo de forma de onda) lista para el renderer.
 ///
 /// El App NO conoce envelopes ni buckets: consume `VisualState` y recibe la
@@ -52,6 +130,9 @@ impl WaveformView {
 pub struct SceneState {
     /// Trace + envolvente decimados listos para el trazo (+ auto-gain).
     pub waveform: WaveformView,
+    /// Historial visual para el eje X extendido (0 = vista única, idéntico al
+    /// comportamiento anterior). El renderer lo consume sin más análisis.
+    pub history: WaveformHistory,
     /// Energía continua 0..1 (suavizada, RMS).
     pub energy: f32,
     /// Brillo 0..1 (agudos, con aporte del pulso de beat).
@@ -92,6 +173,7 @@ impl VisualState {
             active: false,
             scene: SceneState {
                 waveform: WaveformView::baseline(),
+                history: WaveformHistory::empty(),
                 energy: 0.0,
                 brightness: 0.0,
                 theme: VisualTheme::fallback(),
@@ -112,6 +194,9 @@ pub struct VisualEngine {
     /// Vista de forma de onda actual: se mantiene hasta que llegue una envolvente
     /// nueva, así el trazo "respira" sin parpadear entre frames.
     waveform_view: WaveformView,
+    /// Historial visual (anillo): cada envolvente NUEVA se archiva para que el
+    /// eje X abarque ~0.5 s en vez de una sola ventana de 46 ms.
+    history: WaveformHistory,
     /// Última envolvente estéreo procesada (dedupe por identidad del `Arc`).
     last_envelope: Option<Arc<StereoWaveform>>,
     /// Envolventes suavizadas de la escena (para que no "tiemblen").
@@ -128,10 +213,10 @@ const PALETTE_RATE: f32 = 0.35;
 /// Suavizado temporal de los niveles de escena por frame.
 const SCENE_SMOOTH: f32 = 0.45;
 /// Ajuste por frame del auto-gain (≈ cmd a ~0.3 s a otro nivel).
-const WAVEFORM_GAIN_SMOOTH: f32 = 0.30;
+const WAVEFORM_GAIN_SMOOTH: f32 = 0.15;
 /// Límites del auto-gain (1/peak): ni disparar a ruido de fondo ni aplastar.
 const WAVEFORM_GAIN_MIN: f32 = 0.5;
-const WAVEFORM_GAIN_MAX: f32 = 8.0;
+const WAVEFORM_GAIN_MAX: f32 = 4.0;
 
 impl VisualEngine {
     pub fn new(mapper: ParameterMapper) -> Self {
@@ -142,6 +227,7 @@ impl VisualEngine {
             last_position: None,
             theme: VisualTheme::fallback(),
             waveform_view: WaveformView::baseline(),
+            history: WaveformHistory::empty(),
             last_envelope: None,
             smooth_energy: 0.0,
             smooth_brightness: 0.0,
@@ -172,6 +258,7 @@ impl VisualEngine {
             self.smooth_brightness = 0.0;
             self.last_position = None;
             self.waveform_view = WaveformView::baseline();
+            self.history.clear();
             self.last_envelope = None;
             return VisualState {
                 bars: [0.0; VISUAL_BARS],
@@ -182,6 +269,7 @@ impl VisualEngine {
                 active: false,
                 scene: SceneState {
                     waveform: WaveformView::baseline(),
+                    history: WaveformHistory::empty(),
                     energy: 0.0,
                     brightness: 0.0,
                     theme: self.theme,
@@ -199,6 +287,8 @@ impl VisualEngine {
             if jumped {
                 self.prev_bars = params.bars;
                 self.prev_pulse = params.pulse_kick;
+                // Trayectoria nueva: el historial viejo mentiría sobre el X.
+                self.history.clear();
             }
         }
         self.last_position = Some(position);
@@ -240,6 +330,9 @@ impl VisualEngine {
                     (target - self.waveform_view.gain) * WAVEFORM_GAIN_SMOOTH;
                 self.waveform_view.left = env.left;
                 self.waveform_view.right = env.right;
+                // Archiva el snapshot NUEVO (con su gain ya suavizado): el eje
+                // X del renderer recorre el historial de viejo a nuevo.
+                self.history.push(self.waveform_view);
                 self.last_envelope = Some(Arc::clone(env));
             }
         }
@@ -257,6 +350,7 @@ impl VisualEngine {
             active: true,
             scene: SceneState {
                 waveform: self.waveform_view,
+                history: self.history,
                 energy: self.smooth_energy.clamp(0.0, 1.0),
                 brightness: (self.smooth_brightness + pulse * 0.3).clamp(0.0, 1.0),
                 theme: self.theme,
@@ -562,4 +656,69 @@ mod tests {
     // BandRatios referenciado para mantener import vivo si evoluciona.
     #[allow(dead_code)]
     fn _touch(_: BandRatios) {}
+
+    #[test]
+    fn history_archives_new_envelopes_oldest_first_capped() {
+        // Cada envolvente NUEVA (Arc distinto) se archiva; el mismo Arc
+        // repetido no duplica (dedupe por identidad).
+        let mut h = WaveformHistory::empty();
+        assert_eq!(h.len, 0);
+        assert_eq!(h.total_buckets(), 0);
+        assert!(h.get(0).is_none());
+        for i in 0..(VIS_HISTORY + 3) {
+            let amp = 0.1 + i as f32 * 0.05;
+            h.push(WaveformView {
+                left: WaveformEnvelope::from_window(&[amp; 64]),
+                right: WaveformEnvelope::silent(),
+                gain: 1.0,
+            });
+        }
+        assert_eq!(h.len, VIS_HISTORY, "tope del anillo");
+        // Orden temporal: el más antiguo primero (amplitud menor).
+        let first = h.get(0).unwrap().left.peak();
+        let last = h.get(VIS_HISTORY - 1).unwrap().left.peak();
+        assert!(first < last, "viejo {first} → nuevo {last}");
+        assert!(h.get(VIS_HISTORY).is_none(), "fuera de rango");
+    }
+
+    #[test]
+    fn engine_exposes_growing_history_and_clears_it() {
+        let mut e = engine();
+        let f = Arc::new(features(0.6, 0.2, 0.0, false, 0.0));
+        // Sin envolvente no hay historial (vista única).
+        let s0 = e.update(Some(&f), None, Duration::ZERO, &FALLBACK);
+        assert_eq!(s0.scene.history.len, 0);
+        // Tres envolventes DISTINTAS ⇒ tres slots en orden de llegada.
+        for i in 0..3 {
+            let env = envelope(0.2 + i as f32 * 0.1);
+            let s = e.update(
+                Some(&f),
+                Some(&env),
+                Duration::from_millis(66 * (i as u64 + 1)),
+                &FALLBACK,
+            );
+            assert_eq!(s.scene.history.len, (i + 1) as usize);
+        }
+        // El MISMO Arc repetido no archiva de nuevo.
+        let again = envelope(0.9);
+        let a = e.update(
+            Some(&f),
+            Some(&again),
+            Duration::from_millis(300),
+            &FALLBACK,
+        );
+        let b = e.update(
+            Some(&f),
+            Some(&again),
+            Duration::from_millis(366),
+            &FALLBACK,
+        );
+        assert_eq!(a.scene.history.len, b.scene.history.len);
+        // Seek ⇒ trayectoria nueva, historial limpio.
+        let s = e.update(Some(&f), None, Duration::from_secs(10), &FALLBACK);
+        assert_eq!(s.scene.history.len, 0, "seek limpia el historial");
+        // Inactivo ⇒ limpio.
+        let off = e.update(None, None, Duration::ZERO, &FALLBACK);
+        assert_eq!(off.scene.history.len, 0);
+    }
 }

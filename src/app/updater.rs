@@ -13,9 +13,22 @@ const RELEASES_API: &str = "https://api.github.com/repos/SudoSkaT/Tunefold/relea
 const REPOS_API: &str = "https://api.github.com/repos/SudoSkaT/Tunefold";
 
 /// Ejecuta `tunefold update`. `dry_run` solo informa de la versión disponible.
+///
+/// Cadena verificable de la operación (cada paso se imprime):
+///
+/// ```text
+/// VERSIÓN EN EJECUCIÓN → RUTA REAL → RELEASE/TAG → ASSET → SHA256 →
+/// --version DEL ASSET → REEMPLAZO → VERIFICACIÓN POST-INSTALACIÓN
+/// ```
 pub async fn run(dry_run: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let client = reqwest::Client::new();
+    let identity = resolve_identity();
+    println!("Tunefold update");
+    println!("  en ejecución: tunefold {current}");
+    println!("  ruta real: {}", identity.current_exe_display());
+    println!("  argv[0]: {}", identity.argv0_display());
+    println!("  target: {}", env!("TUNEFOLD_TARGET"));
 
     let release = match fetch_latest(&client).await? {
         Some(release) => release,
@@ -33,22 +46,22 @@ pub async fn run(dry_run: bool) -> Result<()> {
         }
     };
     let tag = release.tag_name.trim_start_matches('v').to_string();
-
-    println!("Versión actual: {current}");
-    println!("Última release: {tag}");
-    println!(
-        "Ejecutable: {}",
-        std::env::current_exe()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "<desconocido>".to_string())
-    );
+    println!("  última release: {} (tag {})", tag, release.tag_name);
+    match &identity.path_verdict {
+        PathVerdict::Same => println!("  PATH resuelve a: mismo ejecutable ✓"),
+        PathVerdict::Different(other) => println!(
+            "  PATH resuelve a: {} (¡OTRA COPIA! `tunefold` en tu shell NO es este binario)",
+            other.display()
+        ),
+        PathVerdict::NotFound => println!("  PATH resuelve a: no encontrado en PATH"),
+    }
 
     // Migración one-time del esquema 1.7.x → 0.17.x: numéricamente 0 < 1, así
     // que sin esta regla ninguna instalación 1.x vería jamás una 0.x como
     // nueva (quedaría clavada diciendo "ya estás en la última versión").
     let migrating = is_epoch_migration(current, &tag);
     if migrating {
-        println!("Migración de esquema de versión: 1.7.x → 0.17.x (one-time).");
+        println!("  migración de esquema: 1.7.x → 0.17.x (one-time).");
     }
     if !migrating && !newer(&tag, current) {
         println!("Ya estás en la última versión.");
@@ -59,9 +72,16 @@ pub async fn run(dry_run: bool) -> Result<()> {
     // otro de CI con el mismo nombre): elegir a ciegas con `find` instalaría
     // un binario arbitrario. Con 0 o con 2+ candidatos se falla ruidoso.
     let asset = select_asset(&release.assets, &expected_asset_name(), &release.tag_name)?;
+    println!("  asset: {} ({} bytes)", asset.name, asset.size);
+    if let Some(digest) = asset.digest.as_deref() {
+        println!("  sha256 publicado: {digest}");
+    } else {
+        println!("  sha256 publicado: (la release no lo declara; se verificará --version)");
+    }
 
     if dry_run {
         println!("Disponible: {} ({})", asset.name, asset.size);
+        println!("(dry-run: no se descarga ni se reemplaza nada)");
         return Ok(());
     }
 
@@ -75,12 +95,45 @@ pub async fn run(dry_run: bool) -> Result<()> {
     if bytes.is_empty() {
         anyhow::bail!("Descarga vacía: el asset de GitHub puede estar pendiente de subir.");
     }
+    let downloaded_digest = sha256_hex(&bytes);
+    println!("  sha256 descargado: {downloaded_digest}");
+    if let Some(expected) = asset.digest.as_deref() {
+        if !digest_matches(&downloaded_digest, expected) {
+            anyhow::bail!(
+                "El SHA256 descargado no coincide con el publicado ({expected}): \
+                 descarga corrupta o asset manipulado. No se reemplaza nada."
+            );
+        }
+        println!("  sha256: coincide ✓");
+    }
 
-    replace_current_executable(&bytes, &tag)?;
+    let replaced = replace_current_executable(&bytes, &tag)?;
+    println!("  reemplazo: OK → {}", replaced.display());
+    // Verificación POST-INSTALACIÓN: el binario ya instalado debe reportar el
+    // tag. Sin esto, "descargué el asset" no prueba nada (el síntoma reportado
+    // era exactamente ese: update OK pero --version viejo).
+    match run_version_query(&replaced) {
+        Some(v) if versions_equal(&v, &tag) => {
+            println!("  verificación post-instalación (--version): {v} ✓");
+        }
+        other => {
+            anyhow::bail!(
+                "El ejecutable instalado reporta «{}» en vez de «{tag}»: \
+                 el reemplazo ocurrió pero algo no cuadra (¿otra copia en PATH? ¿caché del shell? `hash -r`).",
+                other.as_deref().unwrap_or("<ilegible>")
+            );
+        }
+    }
     purge_caches()?;
 
     println!("Actualizado a {tag}. Reinicia Tunefold.");
-    println!("Verifica con: tunefold --version");
+    if !matches!(identity.path_verdict, PathVerdict::Same) {
+        println!(
+            "OJO: se actualizó {} pero tu shell puede estar ejecutando otra copia. \
+             Comprueba con `which -a tunefold` y, si tu shell cachea rutas, ejecuta `hash -r`.",
+            replaced.display()
+        );
+    }
     Ok(())
 }
 
@@ -148,7 +201,7 @@ fn gh_error_message(status: reqwest::StatusCode) -> String {
 /// `<tmp> --version` y se exige que coincida con el tag de la release. Si el
 /// asset trae otra versión horneada (build del commit equivocado o árbol
 /// sucio), se aborta SIN reemplazar nada.
-fn replace_current_executable(bytes: &[u8], expected_tag: &str) -> Result<()> {
+fn replace_current_executable(bytes: &[u8], expected_tag: &str) -> Result<std::path::PathBuf> {
     let mut exe = std::env::current_exe().context("no se pudo localizar el ejecutable")?;
     let tmp = exe.with_extension("update.tmp");
     std::fs::write(&tmp, bytes)?;
@@ -178,7 +231,112 @@ fn replace_current_executable(bytes: &[u8], expected_tag: &str) -> Result<()> {
             \nGuarda la caché de {tmp:?} y reemplázalo manualmente."
         );
     }
-    Ok(())
+    Ok(exe)
+}
+
+/// SHA256 en hex de unos bytes (cadena de integridad descarga → instalado).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(bytes);
+    format!("{digest:x}")
+}
+
+/// Igualdad de digests insensible a mayúsculas y espacios.
+fn digest_matches(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// Nombre del binario tal como aparece en PATH.
+fn exe_file_name() -> &'static str {
+    if cfg!(windows) {
+        "tunefold.exe"
+    } else {
+        "tunefold"
+    }
+}
+
+/// Cómo resuelve tu PATH el comando `tunefold` (primera coincidencia).
+fn find_in_path() -> Option<std::path::PathBuf> {
+    let name = exe_file_name();
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Veredicto de identidad entre el ejecutable en ejecución y el que tu shell
+/// encontraría con `tunefold`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathVerdict {
+    /// Misma ruta (canónica): actualizar este binario actualiza tu `tunefold`.
+    Same,
+    /// Otra copia: actualizar este binario NO cambia lo que ejecuta tu shell.
+    Different(std::path::PathBuf),
+    /// `tunefold` no aparece en PATH (invocado por ruta directa).
+    NotFound,
+}
+
+/// Identidad del binario en ejecución para el diagnóstico del updater.
+#[derive(Debug, Clone)]
+pub struct ExeIdentity {
+    /// `current_exe()` (canonizado: resuelve symlinks).
+    pub current_exe: Option<std::path::PathBuf>,
+    /// `argv[0]` tal cual lo invocaste (puede ser relativo o un symlink).
+    pub argv0: Option<String>,
+    /// Comparación entre ambos.
+    pub path_verdict: PathVerdict,
+}
+
+impl ExeIdentity {
+    pub fn current_exe_display(&self) -> String {
+        self.current_exe
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<desconocido>".to_string())
+    }
+
+    pub fn argv0_display(&self) -> String {
+        self.argv0
+            .clone()
+            .unwrap_or_else(|| "<desconocido>".to_string())
+    }
+}
+
+/// Resuelve la identidad del ejecutable en ejecución.
+fn resolve_identity() -> ExeIdentity {
+    let current_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok());
+    let argv0 = std::env::args_os()
+        .next()
+        .map(|s| s.to_string_lossy().into_owned());
+    let path_verdict = check_identity(current_exe.as_deref(), find_in_path());
+    ExeIdentity {
+        current_exe,
+        argv0,
+        path_verdict,
+    }
+}
+
+/// Compara el ejecutable en ejecución (canónico) con lo que PATH resuelve.
+///
+/// Puro y testeable: distingue "actualicé el ejecutable que está ejecutándose"
+/// de "el usuario posteriormente está ejecutando otro tunefold diferente".
+/// Canoniza si el fichero existe (resuelve symlinks); si no, devuelve la
+/// ruta tal cual para que la comparación siga siendo total.
+fn canon(p: &std::path::Path) -> std::path::PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+fn check_identity(
+    current_exe: Option<&std::path::Path>,
+    path_hit: Option<std::path::PathBuf>,
+) -> PathVerdict {
+    let hit = path_hit.map(|p| canon(&p));
+    match (current_exe.map(canon), hit) {
+        (Some(cur), Some(hit)) if cur == hit => PathVerdict::Same,
+        (_, Some(hit)) => PathVerdict::Different(hit),
+        (_, None) => PathVerdict::NotFound,
+    }
 }
 
 /// Purga `~/.cache/tunefold` (miniaturas + repertorios de la feature YouTube).
@@ -307,6 +465,10 @@ struct Asset {
     size: u64,
     #[serde(rename = "browser_download_url")]
     download_url: String,
+    /// Digest publicado por GitHub (`sha256:...`). Ausente en releases
+    /// antiguas/manuals: entonces solo se verifica `--version`.
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 #[cfg(test)]
@@ -352,11 +514,74 @@ mod tests {
     }
 
     #[test]
+    fn sha256_is_stable_hex_and_case_insensitive() {
+        // SHA256("") canónico: evita depender de fixtures externos.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(sha256_hex(b"abc").len(), 64);
+        assert!(digest_matches("ABCDEF", "abcdef"));
+        assert!(digest_matches("  abc ", "ABC"));
+        assert!(!digest_matches("abc", "abd"));
+    }
+
+    #[test]
+    fn path_identity_distinguishes_same_from_other_copy() {
+        use std::path::PathBuf;
+        // Misma ruta canonizada ⇒ actualizar aquí actualiza tu shell.
+        assert_eq!(
+            check_identity(
+                Some(std::path::Path::new("/home/u/.cargo/bin/tunefold")),
+                Some(PathBuf::from("/home/u/.cargo/bin/tunefold")),
+            ),
+            PathVerdict::Same
+        );
+        // Otra copia (p. ej. /usr/local/bin vs ~/.cargo/bin) ⇒ el update no
+        // cambia lo que ejecuta tu shell: el falso positivo del síntoma.
+        assert_eq!(
+            check_identity(
+                Some(std::path::Path::new("/tmp/tunefold")),
+                Some(PathBuf::from("/usr/local/bin/tunefold")),
+            ),
+            PathVerdict::Different(PathBuf::from("/usr/local/bin/tunefold"))
+        );
+        // Invocado por ruta directa fuera de PATH.
+        assert_eq!(check_identity(None, None), PathVerdict::NotFound);
+    }
+
+    #[test]
+    fn find_in_path_resolves_first_match() {
+        // Directorio temporal con un `tunefold` falso al frente del PATH.
+        let dir = std::env::temp_dir().join(format!("tunefold-pathtest-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let fake = dir.join(exe_file_name());
+        std::fs::write(&fake, b"x").unwrap();
+        let old = std::env::var_os("PATH");
+        let mut paths = vec![dir.clone()];
+        if let Some(p) = &old {
+            paths.extend(std::env::split_paths(p));
+        }
+        let joined = std::env::join_paths(paths).unwrap();
+        std::env::set_var("PATH", &joined);
+        let hit = find_in_path();
+        if let Some(o) = old {
+            std::env::set_var("PATH", o);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_dir(&dir);
+        assert_eq!(hit, Some(fake));
+    }
+
+    #[test]
     fn asset_selection_needs_exactly_one_candidate() {
         let mk = |name: &str| Asset {
             name: name.to_string(),
             size: 1,
             download_url: String::new(),
+            digest: None,
         };
         let expected = "tunefold-x86_64-unknown-linux-gnu";
         // 1 candidato: se elige.
