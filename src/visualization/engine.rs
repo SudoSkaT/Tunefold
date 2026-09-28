@@ -216,7 +216,7 @@ const SCENE_SMOOTH: f32 = 0.45;
 const WAVEFORM_GAIN_SMOOTH: f32 = 0.15;
 /// Límites del auto-gain (1/peak): ni disparar a ruido de fondo ni aplastar.
 const WAVEFORM_GAIN_MIN: f32 = 0.5;
-const WAVEFORM_GAIN_MAX: f32 = 4.0;
+const WAVEFORM_GAIN_MAX: f32 = 1.8;
 
 impl VisualEngine {
     pub fn new(mapper: ParameterMapper) -> Self {
@@ -479,7 +479,7 @@ mod tests {
         let rest = Arc::new(features(0.6, 0.1, 0.0, false, 0.0));
 
         let s0 = e.update(Some(&hit), None, Duration::ZERO, &FALLBACK);
-        assert!(s0.pulse > 0.8, "el beat pega fuerte: {}", s0.pulse);
+        assert!(s0.pulse > 0.5, "el beat pega fuerte: {}", s0.pulse);
 
         let mut prev = s0.pulse;
         for i in 1..12 {

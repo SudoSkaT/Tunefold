@@ -31,12 +31,12 @@ pub struct MapperConfig {
 impl Default for MapperConfig {
     fn default() -> Self {
         Self {
-            sensitivity: 1.0,
+            sensitivity: 0.40,
             noise_floor: 0.02,
             gamma: 1.35,
             bass_boost: 0.8,
-            turbulence_gain: 0.9,
-            beat_gain: 1.0,
+            turbulence_gain: 0.7,
+            beat_gain: 0.8,
             fallback_phase_rate: 0.5,
         }
     }

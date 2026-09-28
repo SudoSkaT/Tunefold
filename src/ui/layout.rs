@@ -243,10 +243,10 @@ pub struct RelatedComposition {
 /// - La lista se queda con el resto (mínimo 1 fila: scroll interno).
 pub fn related_composition(body_h: u16, profile: TerminalProfile) -> RelatedComposition {
     let (min, max) = match profile {
-        TerminalProfile::Large => (8, 30),
-        TerminalProfile::Medium => (7, 24),
-        TerminalProfile::Small => (5, 16),
-        TerminalProfile::Tiny => (4, 10),
+        TerminalProfile::Large => (10, 36),
+        TerminalProfile::Medium => (8, 28),
+        TerminalProfile::Small => (6, 20),
+        TerminalProfile::Tiny => (4, 12),
     };
     if body_h == 0 {
         return RelatedComposition {
@@ -255,7 +255,7 @@ pub fn related_composition(body_h: u16, profile: TerminalProfile) -> RelatedComp
             list: 0,
         };
     }
-    let target = ((body_h as u32 * 70) / 100) as u16;
+    let target = ((body_h as u32 * 75) / 100) as u16;
     let gap: u16 = if body_h >= 20 { 1 } else { 0 };
     // Reserva mínima de la lista (2 filas: borde + 1 item) más el gap.
     let reserve = 2 + gap;
@@ -393,21 +393,21 @@ mod tests {
                 *body_h,
                 "la composición llena el cuerpo sin huecos ni solapes"
             );
-            // Banda ≈40-60% del cuerpo (proporción, no rigidez matemática);
-            // en cuerpos enormes manda el tope (24) para no crear un waveform
+            // Banda ≈60-80% del cuerpo (proporción, no rigidez matemática);
+            // en cuerpos enormes manda el tope (36) para no crear un waveform
             // gigante y el resto es lista con scroll + breathing.
             if *body_h > 44 {
-                assert_eq!(c.band, 24, "banda topada en cuerpo {body_h}: {c:?}");
+                assert!(c.band <= 36, "banda topada en cuerpo {body_h}: {c:?}");
             } else {
                 let frac = c.band as f32 / *body_h as f32;
                 assert!(
-                    (0.35..=0.65).contains(&frac),
-                    "banda ~55% del cuerpo {body_h}: {c:?}"
+                    (0.50..=0.85).contains(&frac),
+                    "banda ~70% del cuerpo {body_h}: {c:?}"
                 );
             }
-            // Lista ≈30%+ del cuerpo (mínimo funcional con scroll).
+            // Lista ≈20%+ del cuerpo (mínimo funcional con scroll).
             assert!(
-                c.list as f32 / *body_h as f32 >= 0.25 || c.list >= 5,
+                c.list as f32 / *body_h as f32 >= 0.15 || c.list >= 4,
                 "recomendaciones visibles en cuerpo {body_h}: {c:?}"
             );
         }
@@ -456,10 +456,10 @@ mod tests {
 
     #[test]
     fn related_composition_caps_band_and_keeps_list() {
-        // En terminales grandes la banda NO crece indefinidamente (tope 24) y
+        // En terminales grandes la banda NO crece indefinidamente (tope 36) y
         // la lista conserva filas suficientes para varias recomendaciones.
         let c = related_composition(46, TerminalProfile::Large);
-        assert!(c.band <= 24, "banda topada: {c:?}");
+        assert!(c.band <= 36, "banda topada: {c:?}");
         assert!(c.list >= 10, "lista amplia: {c:?}");
         assert_eq!(c.gap, 1, "breathing entre secciones: {c:?}");
         // En terminales bajos no hay gap y los mínimos mandan.

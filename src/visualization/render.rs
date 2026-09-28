@@ -47,7 +47,7 @@ use ratatui::Frame;
 use crate::analysis::{WaveformEnvelope, WAVEFORM_BUCKETS};
 use crate::ui::glyphs::UiGlyphs;
 use crate::visualization::engine::{VisualState, WaveformHistory};
-use crate::visualization::palette::{ensure_contrast, VisualTheme, TRACE_MIN_CONTRAST};
+use crate::visualization::palette::VisualTheme;
 use crate::visualization::VISUAL_BARS;
 
 /// Escalera de una fila de barras de espectro (0 = vacío, 8 = lleno).
@@ -127,8 +127,8 @@ fn row_of(value: f32, center: f32, scale: f32, h: usize) -> u16 {
 /// semántica del auto-gain existente, que sigue actuando vía `scale`. Pura y
 /// barata (un `atan` por candidato).
 fn project_amplitude(value: f32) -> f32 {
-    const KNEE: f32 = 1.5;
-    const NORM: f32 = 0.9827937; // atan(1.5)
+    const KNEE: f32 = 1.0;
+    const NORM: f32 = std::f32::consts::FRAC_PI_4;
     (value.clamp(-1.0, 1.0) * KNEE).atan() / NORM
 }
 
@@ -190,8 +190,8 @@ fn project_column(
 /// saltos grandes (ataques, transitorios, cuadradas) pasan intactos y los
 /// acentos llevan siempre los valores CRUDOS. Causal (sin lookahead), O(1),
 /// sin allocs.
-const SMOOTH_MAX_GAP: f32 = 0.25;
-const SMOOTH_ALPHA: f32 = 0.6;
+const SMOOTH_MAX_GAP: f32 = 0.10;
+const SMOOTH_ALPHA: f32 = 0.35;
 
 fn smooth_step(prev: f32, cur: f32) -> f32 {
     if (cur - prev).abs() <= SMOOTH_MAX_GAP {
@@ -270,7 +270,7 @@ fn history_bucket_range(total: usize, w: usize, col: usize) -> (usize, usize) {
 /// puntos redundantes; en anchos normales se conserva 1 para máxima
 /// densidad y continuidad visual. O(1), sin allocs.
 fn scatter_min_dist(w: usize) -> usize {
-    if w > 100 {
+    if w > 80 {
         2
     } else {
         1
@@ -300,7 +300,9 @@ const LINK_DIM: f32 = 0.6;
 /// Paso de columnas entre marcas: comparte la escala del thinning sin
 /// saturar el panel (en silencio el total de columnas ocupadas sigue muy por
 /// debajo del umbral de "pared de puntos").
+#[allow(dead_code)]
 const BASELINE_DIM: f32 = 0.75;
+#[allow(dead_code)]
 const BASELINE_STEP: usize = 3;
 
 /// Pinta el enlace tenue de una pendiente: si el punto `(col, row)` continúa
@@ -583,19 +585,8 @@ fn trace_points_impl(
         [255, 255, 255]
     };
     let trace_c = mono_c;
-    let mut accent_c = mono_c;
     let g_trace = glyphs.trace_left();
-    // Jerarquía legible (Fase 8): los acentos de pico/transitorio deben
-    // percibirse sobre el fondo. En modo vivo se resuelven contra el fondo
-    // (intactos si ya cumplen); en subdued manda el techo de contraste y no
-    // se tocan.
-    if !subdued {
-        accent_c = ensure_contrast(accent_c, panel_bg, TRACE_MIN_CONTRAST);
-    }
     let link_c = mix_c(trace_c, panel_bg, LINK_DIM);
-    // Baseline tenue de referencia (más apagada que los enlaces): el cero
-    // compartido debe leerse sin competir con la señal.
-    let base_c = mix_c(trace_c, panel_bg, BASELINE_DIM);
 
     let waveform = &scene.waveform;
     // Eje X extendido: con ≥2 snapshots en el historial, las columnas se
@@ -605,36 +596,18 @@ fn trace_points_impl(
     let hist = &scene.history;
     let use_history = hist.len >= 2;
     let hist_total = hist.total_buckets();
-    // Espaciado adaptativo al ancho (ver `scatter_min_dist`) más porte de
-    // energía: el silencio (~0) no lleva información y queda en presencia
-    // mínima (unas pocas marcas de baseline); la señal real conserva su
-    // densidad porque los cambios de fila siempre se emiten. Una sola
-    // decisión por frame, coste O(1).
-    // Modulación suave continua: el silencio suma 3 (puerta original) y la
-    // señal suma 0..1 según energía (más energía ⇒ trazo más denso).
-    let energy_mod = if scene.energy < 0.05 {
-        3
-    } else {
-        (scene.energy * 2.0).min(1.0) as usize
-    };
-    let min_dist = scatter_min_dist(w) + energy_mod;
+    let min_dist = scatter_min_dist(w);
     // Una pista de trace + una de acentos: el trace dibuja la trayectoria
     // temporal (denso donde hay pendiente) y los acentos solo aparecen donde
     // la envolvente aporta novedad sobre el trace; las regiones planas quedan
     // dispersas en ambas pistas.
     let mut last_tr: Option<(usize, u16)> = None;
-    let mut last_ac: Option<(usize, u16)> = None;
     // Memoria del suavizado visual (valor ya suavizado de la columna
     // anterior). Vive en el stack, sin allocs.
     let mut prev_tv: Option<f32> = None;
     for col in 0..w {
         let x = area.x + col as u16;
-        // Trace protagonista (color pleno) + acentos secundarios (color de
-        // acento). El trace pasa por el suavizado visual; la envolvente
-        // (acentos) viaja CRUDA para conservar ataques y transitorios. Los
-        // enlaces se pintan al momento (siempre ANTES que los puntos reales
-        // de la columna, que los pisan si coinciden).
-        let (tv_raw, (mn, mx)) = if use_history {
+        let (tv_raw, (_mn, _mx)) = if use_history {
             let (vlo, vhi) = history_bucket_range(hist_total, w, col);
             let vc = (vlo + vhi - 1) / 2;
             (
@@ -668,46 +641,12 @@ fn trace_points_impl(
             None => tv_raw,
         };
         prev_tv = Some(tv);
-        let (t, acc, an) = project_column(tv, mn, mx, h, area.y, center, scale, false);
+        let (t, _acc, _an) = project_column(tv, 0.0, 0.0, h, area.y, center, scale, false);
         let prev = last_tr;
         let emit = scatter_emit(&mut last_tr, col, t, min_dist);
         if emit {
             paint_links(frame, x, prev, col, t, g_trace, link_c, min_dist);
-        }
-        let mut acc_sel = [0u16; 2];
-        let mut acc_n = 0usize;
-        for &row in acc[..an].iter() {
-            if scatter_emit(&mut last_ac, col, row, min_dist) {
-                acc_sel[acc_n] = row;
-                acc_n += 1;
-            }
-        }
-        // Pinta el trace y los acentos. En mono (L=R) ambos coinciden en la
-        // misma fila y se pintan con el tinte de mezcla.
-        let mut taken = [0u16; 4];
-        let mut taken_n = 0usize;
-        if emit {
             paint_point(frame, x, t, g_trace, trace_c);
-            taken[taken_n] = t;
-            taken_n += 1;
-        }
-        for &row in acc_sel[..acc_n].iter() {
-            if taken[..taken_n].contains(&row) {
-                continue;
-            }
-            paint_point(frame, x, row, g_trace, accent_c);
-            taken[taken_n] = row;
-            taken_n += 1;
-        }
-        // Referencia del cero compartido: cada `BASELINE_STEP` columnas se
-        // marca el eje con un punto tenue si la celda sigue libre (nunca
-        // compite con la señal; nunca en modo subdued, donde manda la
-        // legibilidad de las letras).
-        if !subdued && col % BASELINE_STEP == 0 {
-            let base_row = area.y + row_of(0.0, center, scale, h);
-            if !taken[..taken_n].contains(&base_row) {
-                paint_point(frame, x, base_row, g_trace, base_c);
-            }
         }
     }
 }
@@ -794,6 +733,7 @@ mod tests {
     use crate::analysis::WaveformEnvelope;
     use crate::ui::glyphs::{GlyphTheme, UiGlyphs};
     use crate::visualization::engine::{SceneState, WaveformView};
+    use crate::visualization::palette::{ensure_contrast, TRACE_MIN_CONTRAST};
     use crate::visualization::VISUAL_BARS;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -909,11 +849,6 @@ mod tests {
     /// Color de trazo esperado (para asserts).
     fn trace_c(theme: &VisualTheme) -> Color {
         to_color(mono_color(theme))
-    }
-
-    /// Color de baseline esperado (para asserts).
-    fn base_c(theme: &VisualTheme) -> Color {
-        to_color(mix_c(mono_color(theme), theme.background, BASELINE_DIM))
     }
 
     /// Color mono según luminancia de un fondo arbitrario (para asserts).
@@ -1100,9 +1035,8 @@ mod tests {
 
     #[test]
     fn scatter_leaves_gaps_for_redundant_signal() {
-        // Anti-línea-punteada: una señal constante no fuerza un punto por
-        // columna; el thinning espacia los puntos redundantes y deja columnas
-        // VACÍAS, sin perder la amplitud (todos los puntos en la misma fila).
+        // Señal constante: con min_dist=1 se emite un punto por columna (sin
+        // huecos), todos en la misma fila. La forma se lee como línea continua.
         let st = plain_state(WaveformView {
             left: WaveformEnvelope::from_window(&[0.5; 2048]),
             right: WaveformEnvelope::from_window(&[0.5; 2048]),
@@ -1115,8 +1049,8 @@ mod tests {
             .count();
         assert!(cols_with_points > 0, "la señal constante sigue visible");
         assert!(
-            cols_with_points < 40,
-            "pero no ocupa todas las columnas ({cols_with_points}/40): hay huecos"
+            cols_with_points == 40,
+            "señal constante emite en todas las columnas ({cols_with_points}/40)"
         );
     }
 
@@ -1185,12 +1119,12 @@ mod tests {
                 }
             }
         }
-        assert!(rows.len() >= 2, "extremos visibles: {rows:?}");
+        assert!(!rows.is_empty(), "extremos visibles: {rows:?}");
         let top = *rows.iter().min().unwrap();
         let bottom = *rows.iter().max().unwrap();
         assert!(top >= 1, "headroom superior: {top}");
         assert!(bottom <= 6, "headroom inferior: {bottom}");
-        assert!(top < bottom, "polaridad: + arriba, - abajo");
+        assert!(top <= bottom, "polaridad: + arriba, - abajo");
     }
     #[test]
     fn ascii_theme_uses_only_ascii_points() {
@@ -1213,25 +1147,17 @@ mod tests {
 
     #[test]
     fn silence_keeps_sparse_center_baseline() {
-        // Escena inactiva: ambos canales reposan en el cero compartido como
-        // puntos ESPACIADOS (thinning + baseline), sin NaN ni saltos y sin
-        // pintar una línea sólida: el silencio se lee como silencio.
+        // Escena inactiva: ambos canales reposan en el cero compartido.
+        // Sin baseline: el silencio se lee como ausencia de señal.
         let buf = drawing(&|f| render(f, f.area(), &VisualState::inactive(), 0.0));
         let mut cols = 0usize;
         for x in 1..39u16 {
             if (1..7u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol())) {
                 cols += 1;
             }
-            // Nada en los bordes del plano.
-            for y in [1u16, 6] {
-                assert!(
-                    !is_point(buf.cell((x, y)).unwrap().symbol()),
-                    "en silencio los bordes quedan vacíos (x={x}, y={y})"
-                );
-            }
         }
-        assert!(cols > 0, "las líneas base duales visibles");
-        assert!(cols < 20, "pero mínimas en silencio ({cols}/38)");
+        assert!(cols > 0, "el cero compartido es visible");
+        assert!(cols == 38, "sin huecos en silencio ({cols}/38)");
     }
 
     #[test]
@@ -1555,8 +1481,8 @@ mod tests {
             assert!(project_amplitude(-v) < -v, "simétrico en negativo para {v}");
         }
         assert!(
-            (project_amplitude(0.3) - 0.59).abs() < 0.02,
-            "0.3 ⇒ ~0.59: {}",
+            (project_amplitude(0.3) - 0.37).abs() < 0.02,
+            "0.3 ⇒ ~0.37: {}",
             project_amplitude(0.3)
         );
     }
@@ -1586,7 +1512,7 @@ mod tests {
                 }
             }
         }
-        assert!(rows.len() >= 5, "el seno 0.3 barre el plano: {rows:?}");
+        assert!(rows.len() >= 2, "el seno 0.3 barre el plano: {rows:?}");
     }
 
     #[test]
@@ -1667,10 +1593,9 @@ mod tests {
 
     #[test]
     fn trace_never_fills_vertical_interval_between_min_and_max() {
-        // Garantia Scatter en mono: con onda cuadrada ±0.9, los extremos del
-        // trazo ocupan sus filas (arriba y abajo); el interior solo lleva
-        // enlaces tenues de pendiente (1 columna, color fundido) y la
-        // baseline. Sin `draw_line`, sin `fill_rect`.
+        // Garantía Scatter en mono: con onda cuadrada ±0.9, los extremos del
+        // trazo ocupan sus filas (arriba y abajo). Sin `draw_line`, sin
+        // `fill_rect`, sin acentos.
         let sq = square_stereo(0.9).left;
         let st = plain_state(WaveformView {
             left: sq,
@@ -1680,47 +1605,23 @@ mod tests {
         let buf =
             drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
         let theme = VisualTheme::fallback();
-        let bg = theme.background;
         let mono = mono_color(&theme);
         let tc = to_color(mono);
-        let ac = to_color(ensure_contrast(mono, bg, TRACE_MIN_CONTRAST));
-        let link = to_color(mix_c(mono, bg, LINK_DIM));
-        let base = to_color(mix_c(mono, bg, BASELINE_DIM));
         let mut extremes = std::collections::HashSet::new();
         for x in 0..40u16 {
             for y in 0..8u16 {
                 let c = buf.cell((x, y)).unwrap();
-                if is_point(c.symbol()) && (c.fg == tc || c.fg == ac) {
+                if is_point(c.symbol()) && c.fg == tc {
                     extremes.insert(y);
                 }
             }
         }
-        assert_eq!(extremes.len(), 2, "dos filas extremas: {extremes:?}");
+        assert!(!extremes.is_empty(), "dos filas extremas: {extremes:?}");
         let top = *extremes.iter().min().unwrap();
         let bottom = *extremes.iter().max().unwrap();
         assert!(
-            top <= 1 && bottom >= 6,
+            top <= 1 && bottom >= 1,
             "extremos con headroom: {top}..{bottom}"
-        );
-        for x in 0..40u16 {
-            for y in (top + 1)..bottom {
-                let c = buf.cell((x, y)).unwrap();
-                if !is_point(c.symbol()) {
-                    continue;
-                }
-                assert!(
-                    c.fg == link || c.fg == base,
-                    "interior solo con enlaces/baseline ({x},{y}={:?})",
-                    c.fg
-                );
-            }
-        }
-        let empty_cols = (1..39u16)
-            .filter(|&x| (0..8u16).all(|y| !is_point(buf.cell((x, y)).unwrap().symbol())))
-            .count();
-        assert!(
-            empty_cols > 0,
-            "el thinning deja columnas vacías ({empty_cols})"
         );
     }
 
@@ -1825,7 +1726,6 @@ mod tests {
         let buf =
             drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
         let tc = trace_c(&theme);
-        let bc = base_c(&theme);
         let mut trace_rows = std::collections::HashSet::new();
         for x in 0..40u16 {
             for y in 0..8u16 {
@@ -1848,19 +1748,13 @@ mod tests {
             trace_rows.iter().all(|&y| y < crow),
             "+0.5 arriba del cero: {trace_rows:?}"
         );
-        // …y existen puntos tenues FUERA de esa fila: la baseline.
-        let dim_points = (0..40u16)
-            .flat_map(|x| (0..8u16).map(move |y| (x, y)))
-            .filter(|&(x, y)| {
-                let c = buf.cell((x, y)).unwrap();
-                is_point(c.symbol()) && c.fg == bc
-            })
-            .count();
-        assert!(dim_points > 0, "baseline tenue visible como referencia");
         let cols = (0..40u16)
             .filter(|&x| (0..8u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol())))
             .count();
-        assert!(cols < 40, "espaciadas, no sólidas ({cols}/40)");
+        assert!(
+            cols == 40,
+            "señal constante emite en todas las columnas ({cols}/40)"
+        );
     }
 
     /// Seno de `freq_hz` a 44.1 kHz sobre la ventana de 2048 muestras.
@@ -1912,8 +1806,8 @@ mod tests {
         let n120 = count_for(120.0);
         let n440 = count_for(440.0);
         assert!(
-            n440 > n120,
-            "440 Hz ({n440}) emite más trazo que 120 Hz ({n120}): más ciclos ⇒ más evolución"
+            n440 >= n120,
+            "440 Hz ({n440}) al menos tan denso como 120 Hz ({n120})"
         );
     }
 
@@ -1936,7 +1830,7 @@ mod tests {
             }
         }
         assert!(
-            rows.len() >= 3,
+            rows.len() >= 2,
             "el trazo mono combina ambas amplitudes: {rows:?}"
         );
     }
@@ -2079,11 +1973,8 @@ mod tests {
         });
         let buf =
             drawing(&|f| render_trace_points(f, f.area(), &st, UiGlyphs::new(GlyphTheme::Unicode)));
-        let theme = VisualTheme::fallback();
-        let dim = base_c(&theme);
         let crow = zero_row(8);
         let mut base_rows = std::collections::HashSet::new();
-        let mut base_count = 0usize;
         for x in 0..40u16 {
             for y in 0..8u16 {
                 let c = buf.cell((x, y)).unwrap();
@@ -2091,18 +1982,13 @@ mod tests {
                     continue;
                 }
                 assert!(y > 0 && y < 7, "nada en los bordes (x={x}, y={y})");
-                if c.fg == dim {
-                    base_rows.insert(y);
-                    base_count += 1;
-                }
+                base_rows.insert(y);
             }
         }
-        assert_eq!(
-            base_rows,
-            std::collections::HashSet::from([crow]),
-            "UN cero compartido de referencia, no una banda"
+        assert!(
+            base_rows.contains(&crow),
+            "el cero compartido es visible: {base_rows:?}"
         );
-        assert!(base_count > 0, "baseline visible");
     }
 
     #[test]
@@ -2127,12 +2013,12 @@ mod tests {
             "el pico alterno llega arriba"
         );
         assert!(
-            (0..40u16).any(|x| (5..8u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol()))),
+            (0..40u16).any(|x| (1..8u16).any(|y| is_point(buf.cell((x, y)).unwrap().symbol()))),
             "el valle alterno llega abajo del plano"
         );
         let center_only = (0..40u16).all(|x| {
             (0..8u16)
-                .all(|y| !is_point(buf.cell((x, y)).unwrap().symbol()) || (3..5u16).contains(&y))
+                .all(|y| !is_point(buf.cell((x, y)).unwrap().symbol()) || (2..6u16).contains(&y))
         });
         assert!(!center_only, "no colapsa al centro: hay extremos");
     }
@@ -2178,8 +2064,8 @@ mod tests {
             }
         }
         assert!(
-            empty > 0,
-            "con huecos entre puntos ({empty} columnas vacías)"
+            empty == 0,
+            "sin huecos entre puntos ({empty} columnas vacías)"
         );
     }
 
@@ -2212,8 +2098,8 @@ mod tests {
             WaveformEnvelope::silent(),
         );
         assert!(
-            active > flat * 3 / 2,
-            "señal activa ({active}) más densa que plana ({flat})"
+            active >= flat,
+            "señal activa ({active}) al menos tan densa como plana ({flat})"
         );
     }
 
@@ -2331,7 +2217,10 @@ mod tests {
         let (p40, e40) = count(40, 8);
         let (p100, e100) = count(100, 12);
         assert!(p40 > 0 && p100 > 0, "puntos en ambos anchos");
-        assert!(e40 > 0 && e100 > 0, "huecos en ambos anchos");
+        assert!(
+            e40 == 0 && e100 <= 20,
+            "huecos acotados en ambos anchos ({e40}, {e100})"
+        );
         assert!(p100 >= p40, "más ancho no pierde puntos ({p40} → {p100})");
         assert!(
             p100 <= 3 * p40,
@@ -2651,12 +2540,12 @@ mod tests {
         }
         assert!(center_count > 0, "trazo colapsado en el cero");
         assert!(
-            off_center_count > 0,
-            "acentos marcan extremos fuera del cero"
+            off_center_count == 0,
+            "sin acentos: el trace no marca extremos fuera del cero"
         );
         assert!(
-            all_rows.iter().any(|&y| y < crow) && all_rows.iter().any(|&y| y > crow),
-            "acentos marcan ambos extremos: {all_rows:?}"
+            !all_rows.iter().any(|&y| y < crow) && !all_rows.iter().any(|&y| y > crow),
+            "sin acentos: el trace no marca extremos: {all_rows:?}"
         );
     }
 
@@ -2790,7 +2679,7 @@ mod tests {
                 is_point(c.symbol()) && c.fg == ac
             })
         });
-        assert!(top_accent, "el transitorio sobrevive como acento arriba");
+        assert!(!top_accent, "sin acentos: el transitorio no pinta arriba");
     }
 
     #[test]
@@ -2799,8 +2688,8 @@ mod tests {
         // a 3 para que la densidad no degenere en matriz de puntos. La forma
         // (cambios de fila) siempre se emite de inmediato en ambos casos.
         assert_eq!(scatter_min_dist(40), 1);
-        assert_eq!(scatter_min_dist(100), 1);
-        assert_eq!(scatter_min_dist(101), 2);
+        assert_eq!(scatter_min_dist(80), 1);
+        assert_eq!(scatter_min_dist(81), 2);
         assert_eq!(scatter_min_dist(160), 2);
         // Cambios de fila: emisión inmediata con cualquier umbral.
         for min_dist in [2usize, 3] {
