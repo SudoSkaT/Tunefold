@@ -39,5 +39,6 @@ pub use engine::{AnalysisConfig, AnalysisRuntime, PcmTap, StreamMeta};
 pub use features::{AudioFeatures, FeatureBus};
 pub use ring::SpScRing;
 pub use smoother::FeatureSmoother;
+#[cfg(feature = "rodio")]
 pub use tap::TapSource;
 pub use waveform::{StereoWaveform, WaveformBus, WaveformEnvelope, WAVEFORM_BUCKETS};

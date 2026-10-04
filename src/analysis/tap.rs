@@ -1,25 +1,28 @@
-//! Tap de PCM para rodio: envuelve la fuente decodificada y copia cada muestra
-//! al anillo del análisis.
+//! Tap de PCM para el motor de análisis.
+//!
+//! En desktop (feature `rodio`), envuelve la fuente decodificada de rodio y
+//! copia cada muestra al anillo del análisis. En Android, el adaptador Oboe
+//! llama directamente a `PcmTap::feed()` desde el callback de audio.
 //!
 //! Coste en el hilo de audio: un `fetch_add`+store por muestra (44-48k/s) más
-//! la copia — despreciable frente a la decodificación symphonia. NUNCA
-//! bloquea: si el anillo está lleno, el análisis pierde muestras (drop-newest)
-//! pero el audio sigue intacto.
-
-use rodio::source::Source;
+//! la copia — despreciable frente a la decodificación. NUNCA bloquea: si el
+//! anillo está lleno, el análisis pierde muestras (drop-newest) pero el audio
+//! sigue intacto.
 
 use super::engine::PcmTap;
 use super::engine::StreamMeta;
 
 /// Fuente que reenvía las muestras de `S` y las alimenta al [`PcmTap`].
+#[cfg(feature = "rodio")]
 pub struct TapSource<S> {
     inner: S,
     tap: PcmTap,
 }
 
+#[cfg(feature = "rodio")]
 impl<S> TapSource<S>
 where
-    S: Source<Item = f32>,
+    S: rodio::source::Source<Item = f32>,
 {
     /// Envuelve `inner` anunciando su formato al motor de análisis.
     pub fn new(inner: S, tap: PcmTap) -> Self {
@@ -37,9 +40,10 @@ where
     }
 }
 
+#[cfg(feature = "rodio")]
 impl<S> Iterator for TapSource<S>
 where
-    S: Source<Item = f32>,
+    S: rodio::source::Source<Item = f32>,
 {
     type Item = f32;
 
@@ -50,9 +54,10 @@ where
     }
 }
 
-impl<S> Source for TapSource<S>
+#[cfg(feature = "rodio")]
+impl<S> rodio::source::Source for TapSource<S>
 where
-    S: Source<Item = f32>,
+    S: rodio::source::Source<Item = f32>,
 {
     fn current_span_len(&self) -> Option<usize> {
         self.inner.current_span_len()
@@ -67,17 +72,17 @@ where
     }
 
     fn total_duration(&self) -> Option<std::time::Duration> {
-        None // dinámica (streaming): la duración la aporta el contenedor
+        None
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rodio"))]
 mod tests {
     use super::*;
     use crate::analysis::engine::AnalysisRuntime;
     use crate::analysis::test_support::sine;
+    use rodio::source::Source;
 
-    /// Fuente sintética mínima para probar el reenvío sin rodio real.
     struct VecSource {
         samples: std::vec::IntoIter<f32>,
         rate: std::num::NonZeroU32,

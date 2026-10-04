@@ -1,13 +1,15 @@
 //! Backends de reproducción de audio (Infraestructura).
 //!
-//! - [`output`]: salida de audio local compartida (rodio/cpal).
+//! - [`output`]: salida de audio local compartida (rodio/cpal). Desktop only.
 //! - [`rodio_backend`]: streaming HTTP decodificado con symphonia y emitido por
-//!   el dispositivo de audio local.
+//!   el dispositivo de audio local. Desktop only.
 //!
 //! Ninguno de estos tipos se exporta fuera de esta capa; el enrutador de la
 //! capa de Aplicación solo conoce el trait.
 
+#[cfg(feature = "rodio")]
 mod output;
+#[cfg(feature = "rodio")]
 mod rodio_backend;
 
 use std::sync::Arc;
@@ -17,7 +19,9 @@ use crate::app::playback::RouterConfig;
 use crate::domain::source::Source;
 use crate::infrastructure::config::Config;
 
+#[cfg(feature = "rodio")]
 pub use output::SharedOutput;
+#[cfg(feature = "rodio")]
 pub use rodio_backend::RodioBackend;
 
 /// Construye los motores a partir de la configuración. `http` es el cliente
@@ -44,19 +48,19 @@ pub fn build_engines(
     let features = analysis.as_ref().map(|rt| rt.bus());
     let waveform = analysis.as_ref().map(|rt| rt.waveform_bus());
 
-    // Salida local para rodio. Si no hay dispositivo de audio, el backend
-    // notificará el error en play(). Sus errores en caliente (underrun,
-    // desconexión) van al bus agrupado, no a stderr.
-    let output =
-        Arc::new(SharedOutput::try_new(bus.clone()).expect("dispositivo de audio disponible"));
+    #[cfg(feature = "rodio")]
+    {
+        let output =
+            Arc::new(SharedOutput::try_new(bus.clone()).expect("dispositivo de audio disponible"));
 
-    engines.push(Arc::new(RodioBackend::new(
-        http.clone(),
-        output.clone(),
-        bus.clone(),
-        !config.flags.proxy,
-        analysis,
-    )));
+        engines.push(Arc::new(RodioBackend::new(
+            http.clone(),
+            output.clone(),
+            bus.clone(),
+            !config.flags.proxy,
+            analysis,
+        )));
+    }
 
     let policy = config.playback_policy.clone();
     (RouterConfig { engines, policy }, features, waveform)

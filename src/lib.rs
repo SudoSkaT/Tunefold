@@ -22,6 +22,7 @@ pub mod catalog;
 pub mod domain;
 pub mod infrastructure;
 pub mod media;
+pub mod platform;
 pub mod playback;
 pub mod providers;
 pub mod recommendation;

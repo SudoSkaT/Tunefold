@@ -38,7 +38,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use rodio::{source::Source as RodioSource, Decoder, Player};
 
-use crate::analysis::{AnalysisRuntime, TapSource};
+use crate::analysis::AnalysisRuntime;
+#[cfg(feature = "rodio")]
+use crate::analysis::TapSource;
 use crate::app::audio::{
     EventBus, PlaybackEngine, PlaybackError, PlaybackEvent, PlaybackState, PlaybackStatus,
 };
@@ -561,10 +563,13 @@ impl PlaybackEngine for RodioBackend {
 
         // Análisis opcional: envuelve la fuente decodificada para copiar PCM
         // al anillo SPSC (coste por muestra trivial, jamás bloquea el audio).
+        #[cfg(feature = "rodio")]
         let source: Box<dyn rodio::Source<Item = f32> + Send> = match self.analysis.as_ref() {
             Some(rt) => Box::new(TapSource::new(source, rt.tap())),
             None => Box::new(source),
         };
+        #[cfg(not(feature = "rodio"))]
+        let source: Box<dyn rodio::Source<Item = f32> + Send> = Box::new(source);
 
         // Duration del contenedor si está disponible; si no, la de metadatos.
         let total = decoded_duration.or(track.duration);

@@ -378,19 +378,22 @@ pub fn read_clipboard_text() -> Result<String, String> {
     let mut readable = false;
 
     // 1 — arboard, selección clipboard (copiado explícito Ctrl+C / Ctrl+Shift+C).
-    match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
-        Ok(raw) => {
-            readable = true;
-            if let Some(token) = sanitize_clipboard_text(&raw) {
-                return Ok(token);
+    #[cfg(feature = "clipboard")]
+    {
+        match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+            Ok(raw) => {
+                readable = true;
+                if let Some(token) = sanitize_clipboard_text(&raw) {
+                    return Ok(token);
+                }
             }
+            Err(e) => problems.push(format!("arboard: {}", short_err(e))),
         }
-        Err(e) => problems.push(format!("arboard: {}", short_err(e))),
     }
 
     // 2 — arboard, selección primaria (solo Linux: selección con el ratón,
     // típica al copiar desde el terminal donde el clic derecho pega esto).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "clipboard", target_os = "linux"))]
     {
         use arboard::{GetExtLinux, LinuxClipboardKind};
         match arboard::Clipboard::new()
@@ -407,6 +410,7 @@ pub fn read_clipboard_text() -> Result<String, String> {
     }
 
     // 3 — CLIs del sistema (cuando arboard no negocia o no hay display).
+    #[cfg(feature = "clipboard")]
     for (cmd, args) in paste_commands() {
         match run_paste_cmd(cmd, args) {
             Ok(raw) => {
