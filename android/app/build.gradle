@@ -1,0 +1,72 @@
+plugins {
+    id 'com.android.application'
+}
+
+def repositoryRoot = rootProject.projectDir.parentFile
+def androidSdkRoot = System.getenv('ANDROID_SDK_ROOT') ?: System.getenv('ANDROID_HOME')
+if (!androidSdkRoot) {
+    throw new GradleException('Set ANDROID_HOME or ANDROID_SDK_ROOT to an installed Android SDK')
+}
+def ndkRoot = "${androidSdkRoot}/ndk/28.2.13676358"
+def ndkHost = 'linux-x86_64'
+def toolchainBin = "${ndkRoot}/toolchains/llvm/prebuilt/${ndkHost}/bin"
+def generatedJni = layout.buildDirectory.dir('generated/rustJniLibs')
+def generatedJniPath = generatedJni.get().asFile
+def rustTargets = [
+    [suffix: 'Arm64', abi: 'arm64-v8a', target: 'aarch64-linux-android', env: 'AARCH64_LINUX_ANDROID', cc: 'aarch64_linux_android'],
+    [suffix: 'X86_64', abi: 'x86_64', target: 'x86_64-linux-android', env: 'X86_64_LINUX_ANDROID', cc: 'x86_64_linux_android']
+]
+
+android {
+    namespace 'com.tunefold.app'
+    compileSdk 37
+    ndkVersion '28.2.13676358'
+
+    defaultConfig {
+        applicationId 'com.tunefold.app'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0-runtime'
+        ndk { abiFilters 'arm64-v8a', 'x86_64' }
+    }
+
+    sourceSets {
+        main.jniLibs.srcDir(generatedJniPath)
+    }
+}
+
+def rustBuildTasks = rustTargets.collect { rustTarget ->
+    tasks.register("buildRust${rustTarget.suffix}", Exec) {
+        def rustLinker = "${toolchainBin}/${rustTarget.target}26-clang"
+        def rustLibrary = new File(repositoryRoot,
+                "target/${rustTarget.target}/release/libtunefold.so")
+        workingDir repositoryRoot
+        commandLine 'cargo', 'build', '--lib', '--release', '--target', rustTarget.target,
+            '--no-default-features', '--features', 'android'
+        environment "CARGO_TARGET_${rustTarget.env}_LINKER", rustLinker
+        environment "CC_${rustTarget.cc}", rustLinker
+        environment "AR_${rustTarget.cc}", "${toolchainBin}/llvm-ar"
+        inputs.files fileTree(repositoryRoot) {
+            include 'Cargo.toml', 'Cargo.lock', 'build.rs', 'src/**'
+        }
+        outputs.file rustLibrary
+        doLast {
+            if (!rustLibrary.isFile()) {
+                throw new GradleException("Rust Android library was not produced: ${rustLibrary}")
+            }
+            copy {
+                from rustLibrary
+                into generatedJni.get().dir(rustTarget.abi).asFile
+            }
+        }
+    }
+}
+
+tasks.register('buildRustAndroid') {
+    dependsOn rustBuildTasks
+}
+
+tasks.named('preBuild').configure {
+    dependsOn tasks.named('buildRustAndroid')
+}

@@ -75,10 +75,17 @@ impl SpScRing {
     /// Escribe `data`; devuelve cuántas entraron. Si no cabe entero, se
     /// escribe lo que quepa y el resto se cuenta como descartado (drop-newest).
     pub fn push(&self, data: &[f32]) -> usize {
+        self.push_aligned(data, 1)
+    }
+
+    /// Escribe datos manteniendo grupos completos, por ejemplo pares de
+    /// muestras L/R para PCM estéreo.
+    pub fn push_aligned(&self, data: &[f32], alignment: usize) -> usize {
+        debug_assert!(alignment > 0);
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
         let free = self.capacity() - head.wrapping_sub(tail);
-        let n = data.len().min(free);
+        let n = (data.len().min(free) / alignment) * alignment;
         if n < data.len() {
             self.dropped.fetch_add(data.len() - n, Ordering::Relaxed);
         }
@@ -183,6 +190,17 @@ mod tests {
         }
         assert_eq!(consumed, value, "todo lo producido se consumió");
         assert_eq!(ring.dropped(), 0);
+    }
+
+    #[test]
+    fn aligned_push_never_splits_interleaved_frames() {
+        let ring = SpScRing::new(1024);
+        let data = vec![0.25; 1024];
+        assert_eq!(ring.push_aligned(&data, 2), 1022);
+        let mut out = vec![0.0; 1024];
+        assert_eq!(ring.pop(&mut out), 1022);
+        assert!(out[..1022].iter().all(|sample| *sample == 0.25));
+        assert_eq!(ring.push_aligned(&[0.5; 4], 2), 4);
     }
 
     #[test]

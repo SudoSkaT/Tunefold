@@ -71,8 +71,14 @@ impl PcmTap {
     }
 
     /// Empuja muestras interleaveadas (nunca bloquea).
-    pub fn feed(&self, samples: &[f32]) {
-        self.ring.push(samples);
+    pub fn feed(&self, samples: &[f32]) -> usize {
+        self.ring.push(samples)
+    }
+
+    /// Feeds interleaved stereo without allowing the ring to split an L/R
+    /// frame when only an odd number of sample slots remain.
+    pub fn feed_stereo(&self, samples: &[f32]) -> usize {
+        self.ring.push_aligned(samples, 2)
     }
 }
 

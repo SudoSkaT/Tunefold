@@ -22,7 +22,7 @@ default = ["clipboard", "rodio"]
 # esas restricciones. Ver README §Licencias.
 youtube = ["dep:rustypipe"]
 # Android platform (JNI bridge + Oboe audio backend). Requires NDK + cargo-ndk.
-android = ["dep:jni", "dep:symphonia"]
+android = ["dep:jni", "dep:symphonia", "symphonia/ogg"]
 # Desktop clipboard support (arboard). Disabled on Android.
 clipboard = ["dep:arboard"]
 # Desktop audio backend (rodio/cpal). Disabled on Android.
