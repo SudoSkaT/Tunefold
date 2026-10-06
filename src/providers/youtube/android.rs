@@ -125,6 +125,47 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_searchYoutube(
     }
 }
 
+/// Tracks related to a video, for Home and autoplay.
+///
+/// Uses the provider's own `related` list; the Android layer applies its own
+/// deduplication (current track, queue, liked and recently played).
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_relatedYoutube(
+    mut env: JNIEnv,
+    _class: JClass,
+    video_id: JString,
+    limit: jint,
+) -> jstring {
+    let video_id = match read_string(&mut env, &video_id) {
+        Ok(id) if !id.trim().is_empty() => id,
+        _ => return return_json(&mut env, failure("invalid_request", "video id is empty")),
+    };
+    let result = (|| {
+        let media = MEDIA.get().ok_or_else(|| {
+            (
+                "provider_unavailable",
+                "provider is not initialized".to_string(),
+            )
+        })?;
+        let provider = media.catalog.get(Source::YouTube).ok_or_else(|| {
+            (
+                "provider_unavailable",
+                "YouTube catalog is disabled".to_string(),
+            )
+        })?;
+        runtime().block_on(async {
+            provider
+                .related(&video_id)
+                .await
+                .map_err(|error| (catalog_error_category(&error), error.to_string()))
+        })
+    })();
+    match result {
+        Ok(tracks) => return_json(&mut env, encode_tracks(tracks)),
+        Err((category, message)) => return_json(&mut env, failure(category, message)),
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_resolveYoutubeUrl(
     mut env: JNIEnv,

@@ -10,8 +10,11 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.List;
 
 /** Bounded, atomic local media store; callers opt in by supplying the bytes. */
 final class FileLocalMediaStore implements LocalMediaStore {
@@ -50,6 +53,47 @@ final class FileLocalMediaStore implements LocalMediaStore {
             remove(provider, id);
             return null;
         }
+    }
+
+    /**
+     * Enumerates every valid stored entry.
+     *
+     * <p>This is what makes `Descargadas` a derived view rather than a second
+     * copy of the library: the playlist is exactly the set of entries the store
+     * still considers valid, so removing a file removes the track from it and a
+     * download never has to be "added" to it.
+     *
+     * <p>Validation is identical to {@link #get}, including pruning of corrupt or
+     * inconsistent entries, so a half-written or orphaned file can never be
+     * reported as downloaded.
+     */
+    @Override public synchronized List<Entry> entries() {
+        File[] sidecars = directory.listFiles(file -> file.isFile() && file.getName().endsWith(".json"));
+        if (sidecars == null) return Collections.emptyList();
+        List<Entry> found = new ArrayList<>(sidecars.length);
+        for (File sidecar : sidecars) {
+            try {
+                JSONObject entry = new JSONObject(readText(sidecar));
+                String provider = entry.optString("provider", "");
+                String id = entry.optString("id", "");
+                TrackKey key = TrackKey.of(provider, id);
+                if (key == null) { sidecar.delete(); continue; }
+                File audio = audioFile(provider, id);
+                if (audio == null || !audio.isFile()) { remove(provider, id); continue; }
+                long declared = entry.optLong("size", -1);
+                long actual = audio.length();
+                if (declared != actual || actual <= 0 || actual > MAX_ITEM_BYTES) {
+                    remove(provider, id);
+                    continue;
+                }
+                found.add(new Entry(key, actual, audio));
+            } catch (Exception corrupt) {
+                sidecar.delete();
+            }
+        }
+        // Deterministic order so the UI and its tests are reproducible.
+        found.sort(Comparator.comparing(entry -> entry.key));
+        return found;
     }
 
     @Override public synchronized boolean store(String provider, String id, InputStream audio) {

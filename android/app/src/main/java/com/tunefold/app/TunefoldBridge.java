@@ -20,6 +20,11 @@ final class TunefoldBridge {
     static native int getAvailableFrames(long handle);
     static native long getPositionMs(long handle);
     static native boolean isDecoderFinished(long handle);
+    /**
+     * True once when the last track reached its end of media; false for a
+     * user-initiated stop. Take-once so one EOF cannot fire autoplay twice.
+     */
+    static native boolean takeTrackFinished(long handle);
     static native int readPcm(long handle, ByteBuffer destination, int maxFrames);
     static native void setOutputState(long handle, int state);
     static native String getLastError(long handle);
@@ -42,4 +47,6 @@ final class TunefoldBridge {
     static native String searchYoutube(String query, int limit);
     static native String resolveYoutubeUrl(String url);
     static native String resolveYoutubeSource(String trackJson);
+    /** Provider "related to this video" list, for Home and autoplay. */
+    static native String relatedYoutube(String videoId, int limit);
 }

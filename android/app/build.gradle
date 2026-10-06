@@ -35,6 +35,16 @@ android {
 
     buildFeatures { buildConfig true }
 
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+
+    dependencies {
+        // Pure-JVM unit tests for the state machines (identity, queue,
+        // playlists, autoplay, error policy). No Android framework needed.
+        testImplementation 'junit:junit:4.13.2'
+    }
+
     sourceSets {
         main.jniLibs.srcDir(generatedJniPath)
     }

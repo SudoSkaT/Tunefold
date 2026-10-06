@@ -11,6 +11,10 @@ final class PlaybackController implements AudioTrackOutput.Listener {
 
     interface Observer { void onPlaybackChanged(); }
     interface TrackCallback { void onTrack(MediaTrack track, String error); }
+    /** Notified once when the current track reaches its end of media. */
+    interface TrackFinishedListener { void onTrackFinished(); }
+    /** Notified once the engine accepted the source and is starting output. */
+    interface SourceStartedListener { void onSourceStarted(); }
 
     private final ExecutorService commands = Executors.newSingleThreadExecutor(r ->
             new Thread(r, "tunefold-playback-commands"));
@@ -22,6 +26,12 @@ final class PlaybackController implements AudioTrackOutput.Listener {
     private volatile String error = "";
     private volatile String diagnostics = "";
     private volatile boolean released;
+    private volatile TrackFinishedListener trackFinishedListener;
+    private volatile SourceStartedListener sourceStartedListener;
+
+    void setTrackFinishedListener(TrackFinishedListener value) {
+        trackFinishedListener = value;
+    }
 
     PlaybackController(Observer observer) {
         this.observer = observer;
@@ -42,11 +52,24 @@ final class PlaybackController implements AudioTrackOutput.Listener {
     void play(PlayableSource source) { play(source, null); }
 
     void play(PlayableSource source, PlaybackTrace trace) {
-        startPlaybackSource(source, trace, operation.incrementAndGet());
+        startPlaybackSource(source, trace, operation.incrementAndGet(), null);
     }
 
-    private void startPlaybackSource(PlayableSource source, PlaybackTrace trace, long requestId) {
+    /**
+     * Starts a resolved source, reporting when the engine has accepted it.
+     *
+     * <p>{@code onStarted} fires once output has actually begun, which is what
+     * lets the session distinguish "still buffering" from "playing" without
+     * guessing from a timer.
+     */
+    void play(PlayableSource source, PlaybackTrace trace, Runnable onStarted) {
+        startPlaybackSource(source, trace, operation.incrementAndGet(), onStarted);
+    }
+
+    private void startPlaybackSource(PlayableSource source, PlaybackTrace trace, long requestId,
+                                     Runnable onStarted) {
         state = LOADING;
+        startedCallback = onStarted;
         error = "";
         notifyChanged();
         commands.execute(() -> {
@@ -62,6 +85,8 @@ final class PlaybackController implements AudioTrackOutput.Listener {
             output.awaitStopped();
             TunefoldBridge.stopAudio(handle);
             if (operation.get() != requestId) return;
+            currentSource = source;
+            currentTrace = trace;
             if (trace != null) {
                 trace.attachEngine(handle);
                 trace.mark(PlaybackTrace.PLAYABLE_SOURCE_AVAILABLE,
@@ -79,6 +104,15 @@ final class PlaybackController implements AudioTrackOutput.Listener {
         });
     }
 
+    /** Set for the play currently starting; consumed once output begins. */
+    private volatile Runnable startedCallback;
+
+    private void notifySourceStarted() {
+        Runnable callback = startedCallback;
+        startedCallback = null;
+        if (callback != null) callback.run();
+    }
+
     void playTrack(MediaTrack track, ProviderRegistry providers, PlaybackTrace trace,
                    TrackCallback callback) {
         long requestId = operation.incrementAndGet();
@@ -94,7 +128,7 @@ final class PlaybackController implements AudioTrackOutput.Listener {
                 return;
             }
             if (callback != null) callback.onTrack(track, null);
-            startPlaybackSource(source, trace, requestId);
+            startPlaybackSource(source, trace, requestId, null);
         });
     }
 
@@ -119,7 +153,7 @@ final class PlaybackController implements AudioTrackOutput.Listener {
                     fail(sourceFailure);
                     return;
                 }
-                startPlaybackSource(source, trace, requestId);
+                startPlaybackSource(source, trace, requestId, null);
             });
         });
     }
@@ -160,6 +194,25 @@ final class PlaybackController implements AudioTrackOutput.Listener {
         });
     }
 
+    /**
+     * Restarts the current track from the beginning.
+     *
+     * <p>Used by Previous when the track has been playing long enough that the
+     * user means "start again" rather than "go back".
+     */
+    void restartCurrent() {
+        // There is no seek in the Android pipeline: the honest implementation is
+        // to replay the same source, which is what a fresh play of the track is.
+        if (currentSource == null) return;
+        startPlaybackSource(currentSource, currentTrace,
+                operation.incrementAndGet(), null);
+    }
+
+    private volatile PlayableSource currentSource;
+
+    /** Trace of the play in progress, reused when Previous restarts it. */
+    private volatile PlaybackTrace currentTrace;
+
     void refresh() {
         commands.execute(this::refreshOnCommands);
     }
@@ -167,6 +220,21 @@ final class PlaybackController implements AudioTrackOutput.Listener {
     private void refreshOnCommands() {
         long handle = engine;
         if (handle == 0 || released) return;
+        diagnostics = TunefoldBridge.getRuntimeDiagnostics(handle);
+
+        // End-of-track is a distinct signal from a user stop; it is consumed
+        // here so the queue/autoplay policy sees each EOF exactly once.
+        if (TunefoldBridge.takeTrackFinished(handle)) {
+            TrackFinishedListener listener = trackFinishedListener;
+            // The listener owns the transition: it either advances the queue or
+            // stops. Adopting the engine's STOPPED afterwards would clobber
+            // whatever it just decided and briefly show "Stopped" mid-playback.
+            if (listener != null) {
+                listener.onTrackFinished();
+                return;
+            }
+        }
+
         int nativeState = TunefoldBridge.getPlaybackState(handle);
         if (nativeState == ERROR) {
             error = readError(handle, "Playback failed");

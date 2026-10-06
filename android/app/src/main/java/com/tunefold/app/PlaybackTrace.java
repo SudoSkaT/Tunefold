@@ -56,7 +56,79 @@ final class PlaybackTrace {
     /** TTFA = primer output positivo − Play tap. */
     static final String TTFA = "TTFA";
 
+    // ---- Queue and transport navigation -----------------------------------
+    /** The queue advanced to its next item. */
+    static final String QUEUE_NEXT = "QUEUE_NEXT";
+    /** The queue moved back to the previous item. */
+    static final String QUEUE_PREVIOUS = "QUEUE_PREVIOUS";
+    /** A track finished and autoplay took over. */
+    static final String AUTOPLAY_TRIGGER = "AUTOPLAY_TRIGGER";
+
+    // ---- Recommendations ----------------------------------------------------
+    /** A recommendation request started. */
+    static final String RECOMMENDATIONS_START = "RECOMMENDATIONS_START";
+    /** A recommendation request finished; carries kept/raw counts. */
+    static final String RECOMMENDATIONS_END = "RECOMMENDATIONS_END";
+    /** A candidate was chosen and queued. */
+    static final String RECOMMENDATION_SELECTED = "RECOMMENDATION_SELECTED";
+
+    // ---- Download lifecycle -------------------------------------------------
+    /** An explicit download was requested. */
+    static final String DOWNLOAD_START = "DOWNLOAD_START";
+    /** Periodic progress sample. */
+    static final String DOWNLOAD_PROGRESS = "DOWNLOAD_PROGRESS";
+    /** The download committed atomically and was registered. */
+    static final String DOWNLOAD_COMPLETE = "DOWNLOAD_COMPLETE";
+    /** The user cancelled the download. */
+    static final String DOWNLOAD_CANCELLED = "DOWNLOAD_CANCELLED";
+    /** The download failed. */
+    static final String DOWNLOAD_FAILED = "DOWNLOAD_FAILED";
+    /** A download request was refused because the file already exists. */
+    static final String DOWNLOAD_ALREADY_EXISTS = "DOWNLOAD_ALREADY_EXISTS";
+    /** A download request was refused because one was already running. */
+    static final String DOWNLOAD_ALREADY_RUNNING = "DOWNLOAD_ALREADY_RUNNING";
+    /** A committed local file was found for the track being played. */
+    static final String LOCAL_TRACK_FOUND = "LOCAL_TRACK_FOUND";
+    /** No local file existed, so a remote source was resolved. */
+    static final String LOCAL_TRACK_MISSING = "LOCAL_TRACK_MISSING";
+
+    // ---- Library -------------------------------------------------------------
+    /** L1K3D membership changed; carries liked=true/false. */
+    static final String LIKE_CHANGED = "LIKE_CHANGED";
+
+    // ---- Failures and recovery ----------------------------------------------
+    /** A user-visible failure; carries the classified kind. */
+    static final String PLAYBACK_ERROR = "PLAYBACK_ERROR";
+    /** An automatic recovery attempt was made. */
+    static final String PLAYBACK_RETRY = "PLAYBACK_RETRY";
+
     private static final String TAG = "TunefoldPerf";
+
+    /**
+     * The trace of the play currently in progress, if any.
+     *
+     * <p>Playback is owned by the service, but downloads, queue navigation and
+     * recommendations can originate from any surface. Routing their events
+     * through one holder keeps a single timeline per playback instead of making
+     * every caller thread a trace through the playback session. Explicitly
+     * {@link #clearCurrent()} when a playback ends.
+     */
+    private static volatile PlaybackTrace current;
+
+    /** Installs the trace that later events should join, or {@code null}. */
+    static void setCurrent(PlaybackTrace trace) { current = trace; }
+
+    /** Removes the current trace; called when playback stops or is replaced. */
+    static void clearCurrent() { current = null; }
+
+    /** The current trace, or {@code null} when nothing is playing. */
+    static PlaybackTrace current() { return current; }
+
+    /** Marks an event on the current playback trace, if there is one. */
+    static void markCurrent(String event, String detail) {
+        PlaybackTrace trace = current;
+        if (trace != null) trace.mark(event, detail);
+    }
 
     private final long startedNs = SystemClock.elapsedRealtimeNanos();
     private final String trackId;

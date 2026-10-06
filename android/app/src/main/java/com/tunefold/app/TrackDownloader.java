@@ -5,7 +5,8 @@ import android.os.Looper;
 import android.util.Log;
 
 import java.io.File;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * Explicit, user-initiated track download.
@@ -15,64 +16,50 @@ import java.util.concurrent.ConcurrentHashMap;
  * buffering. A download starts only when the user asks for it.
  *
  * <p>It reuses the existing Range transport and Symphonia/AudioTrack pipeline —
- * there is no second player. Once the file is committed, the very same
- * {@code PlayableSource} contract serves it as a {@code file:} source, which
- * {@link AndroidDecoder} already handles.
+ * there is no second player. Once the file is committed, the same
+ * {@code PlayableSource} contract serves it as a {@code file:} source.
  *
- * <p>Ownership rules:
+ * <h3>Why downloads cannot be duplicated (§6)</h3>
+ * All observable state lives in {@link DownloadRegistry}, keyed by
+ * {@link TrackKey}. A track that appears in search results, L1K3D,
+ * `Descargadas` and the queue resolves to one key, so:
  * <ul>
- *   <li>identity is {@code provider + track id}, never the resolved URL;</li>
- *   <li>Rust writes to {@code .part}, validates the final size and commits
- *       atomically; Java then registers it in the existing bounded
- *       {@link LocalMediaStore};</li>
- *   <li>a temporary URL is never stored as the file's identity.</li>
+ *   <li>a request for an already-downloaded track is answered from state and
+ *       starts nothing;</li>
+ *   <li>a request while a download is running is refused, so there is never a
+ *       second concurrent transfer for the same file;</li>
+ *   <li>the file itself is named by the store's digest of the same identity,
+ *       so even a hypothetical race would collide on one path rather than
+ *       creating a second file.</li>
  * </ul>
  */
 final class TrackDownloader implements AutoCloseable {
     private static final String TAG = "TunefoldPerf";
     /** How often the UI is told about progress. */
     private static final long POLL_MS = 200;
+    /** Progress is only reported once this many bytes moved, to keep it cheap. */
+    private static final long PROGRESS_STEP_BYTES = 64 * 1024;
 
-    enum State { IDLE, RUNNING, COMPLETED, CANCELLED, FAILED }
+    interface Observer { void onDownloadChanged(TrackKey key, DownloadState state); }
 
-    /** Immutable snapshot handed to the UI thread. */
-    static final class Status {
-        final State state;
-        final long received;
-        final long total;
-        final String error;
-
-        Status(State state, long received, long total, String error) {
-            this.state = state;
-            this.received = received;
-            this.total = total;
-            this.error = error;
-        }
-
-        /** 0..100 while the total size is known, otherwise -1. */
-        int percent() {
-            if (total <= 0) return -1;
-            return (int) Math.min(100L, received * 100L / total);
-        }
-    }
-
-    interface Observer { void onDownloadStatus(MediaTrack track, Status status); }
-
+    /** One in-flight native download. */
     private static final class Job {
+        final TrackKey key;
         final MediaTrack track;
         final long id;
-        volatile State state = State.RUNNING;
-        volatile long received;
-        volatile long total = -1;
-        volatile String error = "";
+        volatile long lastReported;
+        final long startedAtMs = android.os.SystemClock.elapsedRealtime();
 
-        Job(MediaTrack track, long id) {
+        Job(TrackKey key, MediaTrack track, long id) {
+            this.key = key;
             this.track = track;
             this.id = id;
         }
 
-        Status snapshot() {
-            return new Status(state, received, total, error);
+        long speed(long received) {
+            long elapsed = android.os.SystemClock.elapsedRealtime() - startedAtMs;
+            if (elapsed <= 0) return -1;
+            return received * 1000L / elapsed;
         }
     }
 
@@ -80,19 +67,21 @@ final class TrackDownloader implements AutoCloseable {
     private final LocalMediaStore store;
     private final File directory;
     private final long engineHandle;
-    private volatile Observer observer;
+    private final RecoveryPolicy recovery = new RecoveryPolicy();
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final ConcurrentHashMap<String, Job> jobs = new ConcurrentHashMap<>();
+    private final Map<TrackKey, Job> jobs = new HashMap<>();
+    private final DownloadRegistry registry;
+    private volatile Observer observer;
     private volatile boolean closed;
 
-    TrackDownloader(ProviderRegistry providers, LocalMediaStore store, long engineHandle,
-                    Observer observer) {
+    TrackDownloader(ProviderRegistry providers, LocalMediaStore store, long engineHandle) {
         this.providers = providers;
         this.store = store;
         // The store owns the location; the downloader must not invent one.
         this.directory = store.directory();
         this.engineHandle = engineHandle;
-        this.observer = observer;
+        this.registry = new DownloadRegistry(key -> store.get(key.provider(), key.providerTrackId()) != null);
+        this.registry.setListener((key, state) -> notifyChanged(key, state));
         // Abandoned `.part` files are cleaned at construction, never during Play.
         try {
             int removed = TunefoldBridge.cleanAbandonedDownloads(directory.getAbsolutePath());
@@ -102,113 +91,153 @@ final class TrackDownloader implements AutoCloseable {
         }
     }
 
+    /** The dedup authority: other components read state from here, never guess. */
+    DownloadRegistry registry() { return registry; }
+
     /** Re-points the observer when the Activity is recreated. */
     void setObserver(Observer value) { observer = value; }
 
-    private static String key(MediaTrack track) {
-        return track.provider + "/" + track.providerId;
-    }
+    /** Current download state for a track; never {@code null}. */
+    DownloadState stateOf(MediaTrack track) { return registry.stateOf(track); }
+
+    DownloadState stateOf(TrackKey key) { return registry.stateOf(key); }
+
+    /** True when a valid local file exists for this identity. */
+    boolean isDownloaded(MediaTrack track) { return registry.isDownloaded(track); }
 
     /**
-     * Current status for a track.
+     * Seeds committed files discovered on disk.
      *
-     * <p>The store is the authority: a track that is already on disk reports
-     * COMPLETED even with no job in memory, so the UI offers "remove" after an
-     * app restart instead of pretending it was never downloaded.
+     * <p>This is what backs `Descargadas`: the view is the store's contents, not
+     * a second copy of the library, so a deleted file disappears from it
+     * automatically and a downloaded track shows up without ever being added.
      */
-    Status statusOf(MediaTrack track) {
-        Job job = jobs.get(key(track));
-        if (job != null && job.state != State.IDLE) return job.snapshot();
-        long size = sizeOf(track);
-        if (size > 0) return new Status(State.COMPLETED, size, size, "");
-        return new Status(State.IDLE, 0, -1, "");
-    }
-
-    /** True when a valid local file already exists for this track. */
-    boolean isDownloaded(MediaTrack track) {
-        return store.get(track.provider, track.providerId) != null;
-    }
-
-    /**
-     * Starts the download of {@code track}.
-     *
-     * <p>Resolves the playable source first (exactly as Play does) so the
-     * signed URL is fresh, then streams it to a {@code .part} file. Never
-     * called implicitly.
-     */
-    void start(MediaTrack track) {
-        if (closed) return;
-        String key = key(track);
-        Job existing = jobs.get(key);
-        if (existing != null && existing.state == State.RUNNING) return;
-        // Already on disk: nothing to do, the UI must offer "remove".
-        if (isDownloaded(track)) {
-            publish(track, new Status(State.COMPLETED, sizeOf(track), sizeOf(track), ""));
-            return;
-        }
-        providers.playableSource(track, null, (source, failure) -> {
-            if (failure != null || source == null) {
-                publish(track, new Status(State.FAILED, 0, -1,
-                        failure == null ? "Source resolution failed" : failure));
-                return;
-            }
-            if (closed) return;
-            long id = TunefoldBridge.startDownload(engineHandle, directory.getAbsolutePath(),
-                    track.provider, track.providerId, source.url, source.headersJson);
-            if (id <= 0) {
-                publish(track, new Status(State.FAILED, 0, -1, "Download could not start"));
-                return;
-            }
-            Job job = new Job(track, id);
-            jobs.put(key, job);
-            publish(track, job.snapshot());
-            poll(job);
+    void seedFromStore() {
+        providers.localEntries((entries, error) -> {
+            if (closed || entries == null) return;
+            registry.seedStored(entries);
         });
     }
 
+    /**
+     * Starts the download of {@code track}, unless that would duplicate work.
+     *
+     * <p>Refusals are reported through the observer rather than silently ignored
+     * (§26: every action gets a visible response).
+     *
+     * @return {@code true} when a new download actually started.
+     */
+    boolean start(MediaTrack track) {
+        if (closed) return false;
+        TrackKey key = TrackKey.of(track);
+        if (key == null) {
+            notifyChanged(null, registry.stateOf(key));
+            return false;
+        }
+
+        // §6: consult the LocalMediaStore through the logical identity FIRST.
+        if (registry.isDownloaded(key)) {
+            // Size comes from the seeded scan, not from a disk read: this runs
+            // on the thread that received the tap (§27).
+            registry.alreadyDownloaded(key, registry.storedSize(key));
+            Log.i(TAG, "event=DOWNLOAD_ALREADY_EXISTS id=" + key);
+            return false;
+        }
+        if (registry.isActive(key)) {
+            Log.i(TAG, "event=DOWNLOAD_ALREADY_RUNNING id=" + key);
+            return false;
+        }
+
+        synchronized (jobs) {
+            if (jobs.containsKey(key)) return false;
+        }
+        registry.beginResolving(key);
+        PlaybackTrace.markCurrent(PlaybackTrace.DOWNLOAD_START, "id=" + key);
+        providers.playableSource(track, null, (source, failure) -> {
+            if (closed) return;
+            if (failure != null || source == null) {
+                registry.fail(key, failure == null ? "Source resolution failed" : failure);
+                return;
+            }
+            if (!registry.canStart(key)) return;
+            long id = TunefoldBridge.startDownload(engineHandle, directory.getAbsolutePath(),
+                    key.provider(), key.providerTrackId(), source.url, source.headersJson);
+            if (id <= 0) {
+                registry.fail(key, "Download could not start");
+                return;
+            }
+            Job job = new Job(key, track, id);
+            synchronized (jobs) { jobs.put(key, job); }
+            poll(job);
+        });
+        return true;
+    }
+
     /** Cancels an in-flight download. The {@code .part} file is removed. */
-    void cancel(MediaTrack track) {
-        Job job = jobs.get(key(track));
-        if (job == null || job.state != State.RUNNING) return;
-        TunefoldBridge.cancelDownload(engineHandle, job.id);
-        job.state = State.CANCELLED;
-        publish(track, job.snapshot());
+    boolean cancel(MediaTrack track) { return cancel(TrackKey.of(track)); }
+
+    boolean cancel(TrackKey key) {
+        if (key == null) return false;
+        Job job;
+        synchronized (jobs) { job = jobs.remove(key); }
+        if (job != null) TunefoldBridge.cancelDownload(engineHandle, job.id);
+        DownloadState state = registry.cancel(key);
+        PlaybackTrace.markCurrent(PlaybackTrace.DOWNLOAD_CANCELLED, "id=" + key);
+        return state.phase == DownloadState.Phase.CANCELLED;
+    }
+
+    /** Retries a failed or cancelled download, subject to the retry budget. */
+    boolean retry(MediaTrack track) {
+        TrackKey key = TrackKey.of(track);
+        if (key == null) return false;
+        if (!recovery.takeDownloadRetry()) {
+            // Budget exhausted: the failure becomes terminal rather than looping.
+            registry.fail(key, "Too many download attempts");
+            return false;
+        }
+        return start(track);
     }
 
     /** Removes a committed download. Playback falls back to streaming. */
-    void remove(MediaTrack track) {
-        cancel(track);
-        if (!store.remove(track.provider, track.providerId)) {
-            publish(track, new Status(State.FAILED, 0, -1, "Download could not be removed"));
-            return;
+    boolean remove(MediaTrack track) {
+        TrackKey key = TrackKey.of(track);
+        if (key == null) return false;
+        cancel(key);
+        if (!store.remove(key.provider(), key.providerTrackId())) {
+            registry.fail(key, "Download could not be removed");
+            return false;
         }
-        jobs.remove(key(track));
-        publish(track, new Status(State.IDLE, 0, -1, ""));
+        // Forget the in-memory state so `Descargadas` drops the track at once.
+        registry.forget(key);
+        return true;
     }
 
     /**
-     * Polls the native download while it runs and registers the committed file
-     * in the bounded {@link LocalMediaStore} when it finishes.
+     * Polls the native download and registers the committed file when it ends.
      */
     private void poll(Job job) {
-        if (closed || job.state != State.RUNNING) return;
+        if (closed || job.key == null) return;
         String raw = TunefoldBridge.getDownloadProgress(engineHandle, job.id);
         if (raw == null) {
-            // The native job is gone: it either committed or failed. The store
-            // is the authority on whether a valid file exists.
+            synchronized (jobs) { jobs.remove(job.key); }
             finish(job);
             return;
         }
         String[] parts = raw.split("\t");
         if (parts.length >= 2) {
             try {
-                job.received = Long.parseLong(parts[0]);
-                job.total = Long.parseLong(parts[1]);
+                long received = Long.parseLong(parts[0]);
+                long total = Long.parseLong(parts[1]);
+                if (received - job.lastReported >= PROGRESS_STEP_BYTES) {
+                    job.lastReported = received;
+                    registry.progress(job.key, received, total, job.speed(received));
+                    PlaybackTrace.markCurrent(PlaybackTrace.DOWNLOAD_PROGRESS,
+                            "id=" + job.key + " received=" + received + " total=" + total);
+                }
             } catch (NumberFormatException malformed) {
                 Log.w(TAG, "malformed download progress: " + raw);
             }
         }
-        publish(job.track, job.snapshot());
         main.postDelayed(() -> poll(job), POLL_MS);
     }
 
@@ -217,35 +246,35 @@ final class TrackDownloader implements AutoCloseable {
      *
      * <p>Rust already renamed {@code .part} to the final file; the store is
      * still the authority on validity, so we ask it to register the file it
-     * owns rather than trusting the download's own success.
+     * owns rather than trusting the download's own success. A track is only
+     * reported as downloaded once that registration succeeded — never before the
+     * atomic commit (§9).
      */
     private void finish(Job job) {
+        recovery.onDownloadFinished();
+        TrackKey key = job.key;
         String committed = TunefoldBridge.localMediaPath(directory.getAbsolutePath(),
-                job.track.provider, job.track.providerId);
+                key.provider(), key.providerTrackId());
         boolean registered = committed != null
-                && store.register(job.track.provider, job.track.providerId, new File(committed));
+                && store.register(key.provider(), key.providerTrackId(), new File(committed));
         if (!registered) {
-            // Nothing usable on disk: cancelled, interrupted or rejected.
             String message = readError();
-            job.state = message.isEmpty() ? State.CANCELLED : State.FAILED;
-            job.error = message;
-            publish(job.track, job.snapshot());
+            if (message.isEmpty()) {
+                // No file and no error: the user cancelled.
+                registry.cancel(key);
+                PlaybackTrace.markCurrent(PlaybackTrace.DOWNLOAD_CANCELLED, "id=" + key);
+            } else {
+                registry.fail(key, message);
+                PlaybackTrace.markCurrent(PlaybackTrace.DOWNLOAD_FAILED,
+                        "id=" + key + " error=" + message);
+            }
             return;
         }
-        File audio = store.get(job.track.provider, job.track.providerId);
+        File audio = store.get(key.provider(), key.providerTrackId());
         long size = audio == null ? 0 : audio.length();
-        job.received = size;
-        job.total = size;
-        job.state = State.COMPLETED;
-        job.error = "";
-        Log.i(TAG, "event=DOWNLOAD_COMPLETE provider=" + job.track.provider
-                + " id=" + job.track.providerId + " bytes=" + size);
-        publish(job.track, job.snapshot());
-    }
-
-    private long sizeOf(MediaTrack track) {
-        File audio = store.get(track.provider, track.providerId);
-        return audio == null ? 0 : audio.length();
+        registry.complete(key, size);
+        PlaybackTrace.markCurrent(PlaybackTrace.DOWNLOAD_COMPLETE, "id=" + key + " bytes=" + size);
+        Log.i(TAG, "event=DOWNLOAD_COMPLETE id=" + key + " bytes=" + size);
     }
 
     private String readError() {
@@ -257,18 +286,24 @@ final class TrackDownloader implements AutoCloseable {
         }
     }
 
-    private void publish(MediaTrack track, Status status) {
-        if (observer == null) return;
+    private void notifyChanged(TrackKey key, DownloadState state) {
+        Observer current = observer;
+        if (current == null) return;
         main.post(() -> {
-            if (!closed) observer.onDownloadStatus(track, status);
+            if (!closed && current != null) current.onDownloadChanged(key, state);
         });
     }
 
+    /** A short summary of the recovery budget, for the diagnostics panel. */
+    String recoverySummary() { return recovery.describe(); }
+
     @Override public void close() {
         closed = true;
-        for (Job job : jobs.values()) {
-            if (job.state == State.RUNNING) TunefoldBridge.cancelDownload(engineHandle, job.id);
+        synchronized (jobs) {
+            for (Job job : jobs.values()) {
+                TunefoldBridge.cancelDownload(engineHandle, job.id);
+            }
+            jobs.clear();
         }
-        jobs.clear();
     }
 }

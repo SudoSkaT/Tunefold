@@ -57,6 +57,63 @@ final class ProviderRegistry implements AutoCloseable {
     /** The bounded local-media store, owned by this registry. */
     LocalMediaStore localMediaStore() { return localMediaStore; }
 
+    /**
+     * Tracks related to a video, for Home and autoplay (§15).
+     *
+     * <p>Uses the provider's own related list. Deduplication is NOT done here:
+     * {@link Recommendations} owns that policy so it can be unit-tested without a
+     * provider, and so there is exactly one set of rules.
+     *
+     * <p>Always completes; a failure yields an empty list, because a failed
+     * recommendation must never become a global error (§25).
+     */
+    void related(String videoId, Callback<List<MediaTrack>> callback) {
+        worker.execute(() -> {
+            if (!available || videoId == null || videoId.isEmpty()) {
+                deliver(callback, new ArrayList<>(), "Provider is not initialized");
+                return;
+            }
+            long started = android.os.SystemClock.elapsedRealtimeNanos();
+            String response = TunefoldBridge.relatedYoutube(videoId, 20);
+            parseTracks(response, (tracks, error) -> {
+                if (error != null) {
+                    android.util.Log.i("TunefoldPerf", "event=RECOMMENDATIONS_FAILED " + error);
+                    deliver(callback, new ArrayList<>(), null);
+                    return;
+                }
+                android.util.Log.i("TunefoldPerf", "event=RECOMMENDATIONS_COMPLETE count="
+                        + (tracks == null ? 0 : tracks.size()) + " elapsed_ms="
+                        + ((android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000_000L));
+                deliver(callback, tracks, null);
+            });
+        });
+    }
+
+    /**
+     * The committed local audio file for a track, or {@code null}.
+     *
+     * <p>Reads off the UI thread: {@link LocalMediaStore} touches the filesystem
+     * and must never be called from the UI thread (§27).
+     */
+    void localFile(MediaTrack track, Callback<java.io.File> callback) {
+        worker.execute(() -> {
+            LocalMediaStore store = localMediaStore;
+            java.io.File file = (store == null || track == null)
+                    ? null : store.get(track.provider, track.providerId);
+            deliver(callback, file, null);
+        });
+    }
+
+    /** Enumerates committed local media, backing the derived `Descargadas` view. */
+    void localEntries(Callback<List<LocalMediaStore.Entry>> callback) {
+        worker.execute(() -> {
+            LocalMediaStore store = localMediaStore;
+            List<LocalMediaStore.Entry> entries =
+                    store == null ? java.util.Collections.emptyList() : store.entries();
+            deliver(callback, entries, null);
+        });
+    }
+
     private static android.graphics.Bitmap decodeArtwork(java.io.File file) {
         android.graphics.BitmapFactory.Options bounds = new android.graphics.BitmapFactory.Options();
         bounds.inJustDecodeBounds = true;

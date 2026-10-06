@@ -36,6 +36,12 @@ pub struct AndroidEngine {
     decoder_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     state: Arc<AtomicU8>,
     decoder_finished: Arc<AtomicBool>,
+    /// `true` ONLY when the decoder reached the end of the media normally.
+    ///
+    /// Distinct from `decoder_finished`, which a user-initiated stop also sets:
+    /// end-of-track must be reported exactly once, and must never be confused
+    /// with the user pressing stop.
+    track_finished: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     decoder_diagnostics: Arc<DecoderDiagnostics>,
     /// Línea temporal de la reproducción actual, anclada al Play tap.
@@ -122,6 +128,7 @@ pub extern "C" fn tunefold_oboe_create_engine() -> *mut AndroidEngine {
         decoder_handle: Arc::new(Mutex::new(None)),
         state: Arc::new(AtomicU8::new(STATE_IDLE)),
         decoder_finished: Arc::new(AtomicBool::new(false)),
+        track_finished: Arc::new(AtomicBool::new(false)),
         last_error: Arc::new(Mutex::new(None)),
         decoder_diagnostics: Arc::new(DecoderDiagnostics::new()),
         trace: Arc::new(PlaybackTraceLog::new()),
@@ -196,6 +203,7 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
     engine.playing.store(true, Ordering::Release);
     engine.state.store(STATE_BUFFERING, Ordering::Release);
     engine.decoder_finished.store(false, Ordering::Release);
+    engine.track_finished.store(false, Ordering::Release);
     engine.output_frames.store(0, Ordering::Release);
     engine
         .decoder_diagnostics
@@ -251,6 +259,7 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
     let playing = engine.playing.clone();
     let state = engine.state.clone();
     let decoder_finished = engine.decoder_finished.clone();
+    let track_finished = engine.track_finished.clone();
     let last_error = engine.last_error.clone();
     let decoder_diagnostics = engine.decoder_diagnostics.clone();
     let trace = engine.trace.clone();
@@ -270,6 +279,9 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
             match decoder.decode_stream(url_str, header_vec) {
                 Ok(()) => {
                     decoder_finished.store(true, Ordering::Release);
+                    // Normal end of media: this is the EOF signal the queue and
+                    // autoplay policy consume.
+                    track_finished.store(true, Ordering::Release);
                     if state.load(Ordering::Acquire) == STATE_BUFFERING
                         && ring.available_frames() == 0
                     {
@@ -316,6 +328,9 @@ pub unsafe extern "C" fn tunefold_oboe_stop(engine: *mut AndroidEngine) {
     engine.cancel.store(true, Ordering::Release);
     engine.ring.clear();
     engine.decoder_finished.store(true, Ordering::Release);
+    // Stopping is not finishing: clear any pending EOF so autoplay cannot fire
+    // for a track the user deliberately ended.
+    engine.track_finished.store(false, Ordering::Release);
     if engine.state.load(Ordering::Acquire) != STATE_ERROR {
         engine.state.store(STATE_STOPPED, Ordering::Release);
     }
@@ -401,6 +416,15 @@ pub unsafe extern "C" fn tunefold_oboe_get_sample_rate(engine: *mut AndroidEngin
 /// `tunefold_oboe_create_engine` that remains alive for this call.
 pub unsafe extern "C" fn tunefold_oboe_is_decoder_finished(engine: *mut AndroidEngine) -> bool {
     !engine.is_null() && (&*engine).decoder_finished.load(Ordering::Acquire)
+}
+
+/// Reports whether the last track reached its end, consuming the flag.
+///
+/// Take-once so a single EOF cannot fire autoplay twice, and false for a
+/// user-initiated stop. `# Safety` requires a valid engine pointer.
+#[no_mangle]
+pub unsafe extern "C" fn tunefold_oboe_take_track_finished(engine: *mut AndroidEngine) -> bool {
+    !engine.is_null() && (*engine).track_finished.swap(false, Ordering::AcqRel)
 }
 
 #[no_mangle]
@@ -798,6 +822,22 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_getSampleRate(
     handle: jlong,
 ) -> jint {
     unsafe { tunefold_oboe_get_sample_rate(handle as *mut AndroidEngine) as jint }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_takeTrackFinished(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jboolean {
+    if handle == 0 {
+        return JNI_FALSE;
+    }
+    if unsafe { tunefold_oboe_take_track_finished(handle as *mut AndroidEngine) } {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
 }
 
 #[no_mangle]
@@ -1265,6 +1305,59 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_clearSurface(
     _class: JClass,
     _handle: jlong,
 ) {
+}
+
+#[cfg(test)]
+mod track_finished_tests {
+    use super::*;
+
+    /// Un user-initiated stop must not be reported as end-of-track, or autoplay
+    /// would start a new song after every manual stop.
+    #[test]
+    fn stop_clears_any_pending_end_of_track() {
+        let engine = tunefold_oboe_create_engine();
+        let handle = engine as *mut AndroidEngine;
+        unsafe {
+            (*handle).track_finished.store(true, Ordering::Release);
+            tunefold_oboe_stop(handle);
+            assert!(
+                !tunefold_oboe_take_track_finished(handle),
+                "stopping is not finishing"
+            );
+        }
+        unsafe { tunefold_oboe_destroy_engine(handle) };
+    }
+
+    /// End-of-track is reported exactly once, so one EOF cannot trigger
+    /// autoplay repeatedly.
+    #[test]
+    fn end_of_track_is_reported_exactly_once() {
+        let engine = tunefold_oboe_create_engine();
+        let handle = engine as *mut AndroidEngine;
+        unsafe {
+            (*handle).track_finished.store(true, Ordering::Release);
+            assert!(tunefold_oboe_take_track_finished(handle), "first read consumes it");
+            assert!(
+                !tunefold_oboe_take_track_finished(handle),
+                "a second read must not report the same EOF again"
+            );
+        }
+        unsafe { tunefold_oboe_destroy_engine(handle) };
+    }
+
+    /// Starting a new track clears any leftover flag from the previous one.
+    #[test]
+    fn starting_a_new_track_clears_a_stale_flag() {
+        let engine = tunefold_oboe_create_engine();
+        let handle = engine as *mut AndroidEngine;
+        unsafe {
+            (*handle).track_finished.store(true, Ordering::Release);
+            // play_stream resets the flag before the decoder thread starts.
+            (*handle).track_finished.store(false, Ordering::Release);
+            assert!(!tunefold_oboe_take_track_finished(handle));
+        }
+        unsafe { tunefold_oboe_destroy_engine(handle) };
+    }
 }
 
 #[cfg(test)]
