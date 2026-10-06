@@ -23,9 +23,153 @@
 //! completa ni parámetros firmados), rango pedido, status, cabeceras clave,
 //! bytes, latencia, intento y clasificación.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::media::FailureCategory;
+
+/// Una petición Range individual observada por la traza de reproducción.
+///
+/// NUNCA contiene la URL completa ni cabeceras firmadas: solo host, offsets,
+/// status y tiempos. Es la unidad que permite reconstruir qué hizo cada
+/// request de una reproducción concreta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeRequestRecord {
+    /// Identificador correlativo dentro del stream lógico (empieza en 1).
+    pub request_id: u64,
+    /// Offset inicial solicitado.
+    pub start: u64,
+    /// Offset final solicitado.
+    pub end: u64,
+    /// Bytes pedidos (`end - start + 1`).
+    pub requested_bytes: u64,
+    /// Bytes realmente recibidos en el cuerpo.
+    pub received_bytes: u64,
+    /// Estado HTTP observado (`None` si la petición no llegó a respuesta).
+    pub status: Option<u16>,
+    /// Latencia hasta recibir las cabeceras de la respuesta.
+    pub headers_us: u64,
+    /// Latencia total de la petición (envío → cuerpo completo).
+    pub total_us: u64,
+    /// Número de reintento: 0 para el primer intento.
+    pub retry: u32,
+    /// Clasificación del resultado (`ok`, `timeout`, `network`, …).
+    pub classification: &'static str,
+    /// Posición lógica del `StreamReader` cuando se emitió la petición.
+    pub reader_position: u64,
+    /// `true` si la petición es consecuencia de un `seek`.
+    pub from_seek: bool,
+    /// Host (nunca la ruta ni los parámetros firmados).
+    pub host: String,
+}
+
+/// Receptor de telemetría por petición Range. Se invoca desde el hilo del
+/// decoder durante `fetch_window`, por lo que NUNCA debe bloquear.
+pub trait RangeTraceSink: Send + Sync {
+    /// Una petición Range terminó (con éxito o con fallo clasificado).
+    fn range_request(&self, record: &RangeRequestRecord);
+
+    /// Evento semántico del transporte (p. ej. `HTTP_FIRST_RESPONSE`).
+    fn event(&self, _event: &str, _detail: &str) {}
+}
+
+/// Contexto de traza compartido entre el stream lógico y el `StreamReader`
+/// que lo consume: sabe quién pregunta (posición lógica) y si la próxima
+/// petición viene de un `seek`.
+#[derive(Clone, Default)]
+pub struct RangeTraceContext {
+    sink: Option<Arc<dyn RangeTraceSink>>,
+    reader_position: Arc<AtomicU64>,
+    pending_seek: Arc<AtomicBool>,
+    /// Host cacheado: el registro de traza no debe recalcularlo por petición.
+    host: Option<String>,
+}
+
+impl std::fmt::Debug for RangeTraceContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RangeTraceContext")
+            .field("sink", &self.sink.is_some())
+            .field(
+                "reader_position",
+                &self.reader_position.load(Ordering::Relaxed),
+            )
+            .field("pending_seek", &self.pending_seek.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl RangeTraceContext {
+    /// Contexto sin observador: coste cero para el pipeline desktop.
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// Contexto observado por `sink`.
+    pub fn with_sink(sink: Arc<dyn RangeTraceSink>) -> Self {
+        Self {
+            sink: Some(sink),
+            ..Self::default()
+        }
+    }
+
+    /// Publica la posición lógica del lector antes de consumir o reposicionar.
+    pub fn set_reader_position(&self, position: u64) {
+        self.reader_position.store(position, Ordering::Relaxed);
+    }
+
+    /// Marca que la próxima petición Range viene de un `seek` del consumidor.
+    pub fn begin_seek(&self) {
+        self.pending_seek.store(true, Ordering::Relaxed);
+    }
+
+    /// Consume y devuelve la marca de seek para la siguiente petición.
+    fn take_seek(&self) -> bool {
+        self.pending_seek.swap(false, Ordering::Relaxed)
+    }
+
+    /// Posición lógica del consumidor al emitirse la petición.
+    fn reader_position(&self) -> u64 {
+        self.reader_position.load(Ordering::Relaxed)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.sink.is_some()
+    }
+
+    fn record(&self, record: &RangeRequestRecord) {
+        if let Some(sink) = &self.sink {
+            sink.range_request(record);
+        }
+    }
+
+    fn event(&self, event: &str, detail: &str) {
+        if let Some(sink) = &self.sink {
+            sink.event(event, detail);
+        }
+    }
+
+    fn set_host(&mut self, host: String) {
+        self.host = Some(host);
+    }
+
+    fn host(&self) -> &str {
+        self.host.as_deref().unwrap_or("?")
+    }
+}
+
+/// Etiqueta estable de un fallo de transporte para la traza. Usa la
+/// categoría estructural (nunca texto libre del servidor).
+fn failure_label(failure: &TransportFailure) -> &'static str {
+    match failure {
+        TransportFailure::Restricted { .. } => "restricted",
+        TransportFailure::UrlRejected(_) => "url_rejected",
+        TransportFailure::NotFound(_) => "not_found",
+        TransportFailure::InvalidResponse(_) => "invalid_response",
+        TransportFailure::Timeout(_) => "timeout",
+        TransportFailure::Network(_) => "network",
+    }
+}
 
 /// Política de ventanas de descarga (pura, configurable).
 ///
@@ -176,6 +320,49 @@ pub struct TransportMetrics {
     pub elapsed_ms: u64,
     /// Tiempo hasta las cabeceras de la primera respuesta Range.
     pub first_response_us: u64,
+    /// Latencia acumulada hasta las CABECERAS de todas las respuestas.
+    pub headers_us: u64,
+    /// `Seek` solicitados por el consumidor.
+    pub seeks: u64,
+    /// Peticiones Range que fueron consecuencia de un `seek`.
+    pub seek_requests: u64,
+}
+
+impl HttpRangeStream {
+    /// Descarga el stream lógico COMPLETO y lo entrega en trozos.
+    ///
+    /// Es la vía explícita de adquisición completa de un track (Download). No
+    /// la usa la reproducción: Play consume `next_chunk` y sigue.
+    ///
+    /// El llamador decide el destino; esta función no escribe nada, no decide
+    /// rutas y no conserva identidad de medios: solo entrega bytes. Quien
+    /// decide si eso es caché, descarga o prebuffering es el llamador.
+    pub async fn download_full<F>(&mut self, mut on_chunk: F) -> Result<u64, TransportFailure>
+    where
+        F: FnMut(&[u8]) -> Result<(), TransportFailure>,
+    {
+        let mut delivered = 0u64;
+        while let Some(chunk) = self.next_chunk(256 * 1024).await? {
+            on_chunk(&chunk)?;
+            delivered += chunk.len() as u64;
+        }
+        Ok(delivered)
+    }
+
+    /// Descarga el recurso completo desde cero como un `Vec<u8>`.
+    ///
+    /// Azúcar sobre [`HttpRangeStream::download_full`] para usos acotados
+    /// (diagnóstico, pruebas). El límite de memoria lo impone el llamante:
+    /// para persistencia se usa la variante con `on_chunk`.
+    pub async fn download_to_vec(&mut self) -> Result<Vec<u8>, TransportFailure> {
+        let mut out = Vec::new();
+        self.download_full(|chunk| {
+            out.extend_from_slice(chunk);
+            Ok(())
+        })
+        .await?;
+        Ok(out)
+    }
 }
 
 /// Convierte un error reqwest en fallo de transporte SIN filtrar la URL
@@ -192,6 +379,22 @@ fn map_reqwest(e: reqwest::Error) -> TransportFailure {
     }
 }
 
+/// Petición Range que llegó a respuesta y supera la validación de contrato.
+struct RequestOutcome {
+    bytes: Vec<u8>,
+    status: u16,
+    headers_us: u64,
+}
+
+/// Petición Range fallida: conserva el fallo clasificado más lo que se observó
+/// antes de fallar (status, latencia de cabeceras) para la traza.
+#[derive(Debug)]
+struct RequestFailure {
+    failure: TransportFailure,
+    status: Option<u16>,
+    headers_us: u64,
+}
+
 /// Stream lógico continuo sobre peticiones HTTP Range encadenadas.
 pub struct HttpRangeStream {
     http: reqwest::Client,
@@ -204,9 +407,13 @@ pub struct HttpRangeStream {
     pos: u64,
     pending: Vec<u8>,
     cursor: usize,
+    /// Offset absoluto de `pending[0]`. Permite reconocer un `seek` que cae
+    /// dentro de la ventana ya descargada y reutilizarla en vez de pedirla.
+    window_start: u64,
     eof: bool,
     rid: u64,
     metrics: TransportMetrics,
+    trace: RangeTraceContext,
 }
 
 impl std::fmt::Debug for HttpRangeStream {
@@ -229,7 +436,21 @@ impl HttpRangeStream {
         headers: Vec<(String, String)>,
         policy: RangePolicy,
     ) -> Result<Self, TransportFailure> {
+        Self::open_with_trace(http, url, headers, policy, RangeTraceContext::disabled()).await
+    }
+
+    /// Igual que [`HttpRangeStream::open`] pero publica cada petición Range en
+    /// `trace`. El contexto también es el que el `StreamReader` usa para
+    /// publicar su posición lógica y marcar los `seek`.
+    pub async fn open_with_trace(
+        http: reqwest::Client,
+        url: impl Into<String>,
+        headers: Vec<(String, String)>,
+        policy: RangePolicy,
+        mut trace: RangeTraceContext,
+    ) -> Result<Self, TransportFailure> {
         let url = url.into();
+        trace.set_host(host_of(&url).to_string());
         let mut s = Self {
             http,
             url,
@@ -239,13 +460,16 @@ impl HttpRangeStream {
             pos: 0,
             pending: Vec::new(),
             cursor: 0,
+            window_start: 0,
             eof: false,
             rid: 0,
             metrics: TransportMetrics::default(),
+            trace,
         };
         let len = s.policy.window_len_at(0);
         s.pending = s.fetch_window(0, len).await?;
         s.cursor = 0;
+        s.window_start = 0;
         Ok(s)
     }
 
@@ -262,19 +486,37 @@ impl HttpRangeStream {
     /// Reposition the byte stream and fetch the next ranged window at that
     /// offset. This is used by container probes such as MP4, whose parser
     /// seeks while inspecting atom tables.
+    ///
+    /// Si la posición cae dentro de la ventana ya descargada se reposiciona
+    /// el cursor SIN pedirla de nuevo: los seeks del probe son casi siempre
+    /// corto alcance hacia delante y repetir la descarga desperdiciaba casi
+    /// toda la ventana. Solo se pide una ventana nueva cuando el destino cae
+    /// fuera de ella.
     pub async fn seek_to(&mut self, position: u64) -> Result<(), TransportFailure> {
+        self.metrics.seeks += 1;
+        if self.trace.is_active() {
+            self.trace.set_reader_position(position);
+            self.trace.begin_seek();
+        }
         if position > self.total {
             self.pos = position;
             self.pending.clear();
             self.cursor = 0;
+            self.window_start = position;
             self.eof = true;
             return Ok(());
         }
         self.pos = position;
+        if self.contains_position(position) {
+            self.cursor = (position - self.window_start) as usize;
+            self.eof = position >= self.total;
+            return Ok(());
+        }
         self.pending.clear();
         self.cursor = 0;
         self.eof = position == self.total;
         if self.eof {
+            self.window_start = position;
             return Ok(());
         }
         let len = self
@@ -283,8 +525,14 @@ impl HttpRangeStream {
             .min(self.total.saturating_sub(position))
             .max(1);
         self.pending = self.fetch_window(position, len).await?;
+        self.window_start = position;
         self.eof = false;
         Ok(())
+    }
+
+    /// `true` si `position` ya está dentro de la ventana descargada.
+    fn contains_position(&self, position: u64) -> bool {
+        position >= self.window_start && position - self.window_start < self.pending.len() as u64
     }
 
     pub fn metrics(&self) -> TransportMetrics {
@@ -314,6 +562,7 @@ impl HttpRangeStream {
                 .max(1);
             let start = self.pos;
             self.pending = self.fetch_window(start, len).await?;
+            self.window_start = start;
             self.cursor = 0;
         }
     }
@@ -330,24 +579,48 @@ impl HttpRangeStream {
             let elapsed = started.elapsed();
 
             match outcome {
-                Ok(bytes) => {
-                    self.metrics.bytes_received += bytes.len() as u64;
+                Ok(ok) => {
+                    self.metrics.bytes_received += ok.bytes.len() as u64;
                     self.metrics.elapsed_ms += elapsed.as_millis() as u64;
+                    self.metrics.headers_us += ok.headers_us;
+                    self.record_request(
+                        rid,
+                        start,
+                        len,
+                        attempt,
+                        Some(ok.status),
+                        ok.headers_us,
+                        ok.bytes.len() as u64,
+                        elapsed,
+                        "ok",
+                    );
                     tracing::debug!(
                         rid,
                         host = host_of(&self.url),
                         range = %format!("{start}-{}", start + len - 1),
-                        bytes = bytes.len(),
+                        bytes = ok.bytes.len(),
                         elapsed_ms = elapsed.as_millis() as u64,
                         attempt,
                         class = "Ok",
                         "transport_request"
                     );
-                    return Ok(bytes);
+                    return Ok(ok.bytes);
                 }
                 Err(f) => {
                     self.metrics.elapsed_ms += elapsed.as_millis() as u64;
-                    let class = f.category();
+                    self.metrics.headers_us += f.headers_us;
+                    let class = f.failure.category();
+                    self.record_request(
+                        rid,
+                        start,
+                        len,
+                        attempt,
+                        f.status,
+                        f.headers_us,
+                        0,
+                        elapsed,
+                        failure_label(&f.failure),
+                    );
                     tracing::debug!(
                         rid,
                         host = host_of(&self.url),
@@ -355,19 +628,57 @@ impl HttpRangeStream {
                         elapsed_ms = elapsed.as_millis() as u64,
                         attempt,
                         class = %class,
-                        error = %f,
+                        error = %f.failure,
                         "transport_request_failed"
                     );
-                    if f.is_transient() && attempt < self.policy.max_retries {
+                    if f.failure.is_transient() && attempt < self.policy.max_retries {
                         attempt += 1;
                         self.metrics.retries += 1;
                         tokio::time::sleep(self.policy.retry_delay * attempt).await;
                         continue;
                     }
-                    return Err(f);
+                    return Err(f.failure);
                 }
             }
         }
+    }
+
+    /// Publica una petición Range en la traza (sin coste si no hay observador).
+    #[allow(clippy::too_many_arguments)]
+    fn record_request(
+        &mut self,
+        rid: u64,
+        start: u64,
+        len: u64,
+        attempt: u32,
+        status: Option<u16>,
+        headers_us: u64,
+        received_bytes: u64,
+        elapsed: Duration,
+        classification: &'static str,
+    ) {
+        if !self.trace.is_active() {
+            return;
+        }
+        let from_seek = self.trace.take_seek();
+        if from_seek {
+            self.metrics.seek_requests += 1;
+        }
+        self.trace.record(&RangeRequestRecord {
+            request_id: rid,
+            start,
+            end: start + len - 1,
+            requested_bytes: len,
+            received_bytes,
+            status,
+            headers_us,
+            total_us: elapsed.as_micros() as u64,
+            retry: attempt,
+            classification,
+            reader_position: self.trace.reader_position(),
+            from_seek,
+            host: self.trace.host().to_string(),
+        });
     }
 
     /// Petición individual SIN reintentos, con validación de contrato.
@@ -377,20 +688,37 @@ impl HttpRangeStream {
         start: u64,
         len: u64,
         request_started: Instant,
-    ) -> Result<Vec<u8>, TransportFailure> {
+    ) -> Result<RequestOutcome, RequestFailure> {
         let end = start + len - 1;
         let mut req = self.http.get(&self.url);
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
-        let resp = req
+        let sent = req
             .header("Range", format!("bytes={start}-{end}"))
             .timeout(self.policy.request_timeout)
             .send()
-            .await
-            .map_err(map_reqwest)?;
+            .await;
+        let resp = match sent {
+            Ok(resp) => resp,
+            Err(error) => {
+                return Err(RequestFailure {
+                    failure: map_reqwest(error),
+                    status: None,
+                    headers_us: request_started.elapsed().as_micros() as u64,
+                })
+            }
+        };
+        let headers_us = request_started.elapsed().as_micros() as u64;
         if self.metrics.first_response_us == 0 {
-            self.metrics.first_response_us = request_started.elapsed().as_micros() as u64;
+            self.metrics.first_response_us = headers_us;
+            self.trace.event(
+                "HTTP_FIRST_RESPONSE",
+                &format!(
+                    "req={rid} range={start}-{end} status={} headers_us={headers_us}",
+                    resp.status().as_u16()
+                ),
+            );
         }
 
         let status = resp.status().as_u16();
@@ -431,42 +759,56 @@ impl HttpRangeStream {
             "transport_response"
         );
 
+        let invalid = |failure: TransportFailure| RequestFailure {
+            failure,
+            status: Some(status),
+            headers_us,
+        };
+
         if let Some(e) = read_err {
-            return Err(map_reqwest(e));
+            return Err(RequestFailure {
+                failure: map_reqwest(e),
+                status: Some(status),
+                headers_us,
+            });
         }
 
         match status {
             206 => {
                 let Some((s, e, total)) = content_range.as_deref().and_then(parse_content_range)
                 else {
-                    return Err(TransportFailure::InvalidResponse(format!(
+                    return Err(invalid(TransportFailure::InvalidResponse(format!(
                         "206 sin Content-Range válido en byte {start}"
-                    )));
+                    ))));
                 };
                 if s != start {
-                    return Err(TransportFailure::InvalidResponse(format!(
+                    return Err(invalid(TransportFailure::InvalidResponse(format!(
                         "Content-Range empieza en {s}, se pidió {start}"
-                    )));
+                    ))));
                 }
                 if let Some(t) = total {
                     if self.total == 0 {
                         self.total = t;
                     } else if self.total != t {
-                        return Err(TransportFailure::InvalidResponse(format!(
+                        return Err(invalid(TransportFailure::InvalidResponse(format!(
                             "total cambió: {} != {}",
                             t, self.total
-                        )));
+                        ))));
                     }
                 }
                 if buf.len() as u64 != e - s + 1 {
                     // Truncado: transitorio (el rango es idempotente).
-                    return Err(TransportFailure::Network(format!(
+                    return Err(invalid(TransportFailure::Network(format!(
                         "cuerpo truncado: {} de {} bytes",
                         buf.len(),
                         e - s + 1
-                    )));
+                    ))));
                 }
-                Ok(buf)
+                Ok(RequestOutcome {
+                    bytes: buf,
+                    status,
+                    headers_us,
+                })
             }
             200 => {
                 // Servidor que ignora Range: válido SOLO cubriendo desde 0.
@@ -475,34 +817,42 @@ impl HttpRangeStream {
                 if start == 0 {
                     self.total = content_length.unwrap_or(buf.len() as u64);
                     self.eof = true;
-                    Ok(buf)
+                    Ok(RequestOutcome {
+                        bytes: buf,
+                        status,
+                        headers_us,
+                    })
                 } else {
-                    Err(TransportFailure::InvalidResponse(format!(
+                    Err(invalid(TransportFailure::InvalidResponse(format!(
                         "200 ignoró Range en byte {start}"
-                    )))
+                    ))))
                 }
             }
             403 | 401 => {
                 if self.pos == 0 && start == 0 {
-                    Err(TransportFailure::UrlRejected(format!("HTTP {status}")))
+                    Err(invalid(TransportFailure::UrlRejected(format!(
+                        "HTTP {status}"
+                    ))))
                 } else {
-                    Err(TransportFailure::Restricted {
+                    Err(invalid(TransportFailure::Restricted {
                         limit: Some(start),
                         msg: format!("HTTP {status} pidiendo byte {start}"),
-                    })
+                    }))
                 }
             }
-            404 => Err(TransportFailure::NotFound(format!("HTTP 404 byte {start}"))),
-            416 => Err(TransportFailure::InvalidResponse(format!(
+            404 => Err(invalid(TransportFailure::NotFound(format!(
+                "HTTP 404 byte {start}"
+            )))),
+            416 => Err(invalid(TransportFailure::InvalidResponse(format!(
                 "416 en byte {start} (total={})",
                 self.total
-            ))),
-            500..=599 => Err(TransportFailure::Network(format!(
+            )))),
+            500..=599 => Err(invalid(TransportFailure::Network(format!(
                 "HTTP {status} en byte {start}"
-            ))),
-            other => Err(TransportFailure::InvalidResponse(format!(
+            )))),
+            other => Err(invalid(TransportFailure::InvalidResponse(format!(
                 "HTTP {other} inesperado en byte {start}"
-            ))),
+            )))),
         }
     }
 }
@@ -625,6 +975,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod fake_server;
+pub(crate) mod fake_server;
 #[cfg(test)]
 mod integration;

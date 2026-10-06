@@ -14,7 +14,8 @@ use jni::sys::{jboolean, jfloat, jint, jlong, jobject, jstring, JNI_FALSE, JNI_T
 use jni::JNIEnv;
 
 use crate::analysis::{AnalysisConfig, AnalysisRuntime};
-use crate::platform::android_decoder::DecoderDiagnostics;
+use crate::platform::android_decoder::{DecoderDiagnostics, PlaybackTraceLog};
+use crate::platform::android_download::{self, DownloadProgress};
 
 const STATE_IDLE: u8 = 0;
 const STATE_BUFFERING: u8 = 1;
@@ -37,7 +38,69 @@ pub struct AndroidEngine {
     decoder_finished: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     decoder_diagnostics: Arc<DecoderDiagnostics>,
+    /// Línea temporal de la reproducción actual, anclada al Play tap.
+    trace: Arc<PlaybackTraceLog>,
     output_frames: AtomicU64,
+    /// Descargas explícitas en curso. Registro compartido con los hilos de
+    /// descarga mediante `Arc`: el hilo nunca recibe el puntero del engine.
+    downloads: Arc<DownloadRegistry>,
+}
+
+/// Una descarga explícita viva. Nunca se toca desde el hilo de audio.
+#[derive(Clone)]
+struct DownloadHandle {
+    cancel: Arc<AtomicBool>,
+    progress: Arc<Mutex<DownloadProgress>>,
+}
+
+/// Registro de descargas explícitas en curso.
+///
+/// Vive detrás de un `Arc` para que los hilos de descarga compartan el estado
+/// sin recibir el puntero crudo del engine (que no es `Send`).
+#[derive(Default)]
+struct DownloadRegistry {
+    inner: Mutex<std::collections::HashMap<u64, DownloadHandle>>,
+    next_id: AtomicU64,
+}
+
+impl DownloadRegistry {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(std::collections::HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn register(&self, cancel: Arc<AtomicBool>, progress: Arc<Mutex<DownloadProgress>>) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.insert(id, DownloadHandle { cancel, progress });
+        }
+        id
+    }
+
+    fn finish(&self, id: u64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.remove(&id);
+        }
+    }
+
+    fn cancel(&self, id: u64) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.get(&id).cloned())
+            .map(|handle| {
+                handle.cancel.store(true, Ordering::Release);
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    fn progress(&self, id: u64) -> Option<DownloadProgress> {
+        let handle = self.inner.lock().ok()?.get(&id).cloned()?;
+        handle.progress.lock().ok().map(|slot| *slot)
+    }
 }
 
 /// C ABI functions exported to the C++ Oboe adapter.
@@ -61,7 +124,9 @@ pub extern "C" fn tunefold_oboe_create_engine() -> *mut AndroidEngine {
         decoder_finished: Arc::new(AtomicBool::new(false)),
         last_error: Arc::new(Mutex::new(None)),
         decoder_diagnostics: Arc::new(DecoderDiagnostics::new()),
+        trace: Arc::new(PlaybackTraceLog::new()),
         output_frames: AtomicU64::new(0),
+        downloads: Arc::new(DownloadRegistry::new()),
     });
 
     Box::into_raw(engine)
@@ -90,6 +155,7 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
     url: *const std::os::raw::c_char,
     headers: *const std::os::raw::c_char,
     num_headers: usize,
+    tap_to_decoder_us: u64,
 ) {
     if engine.is_null() || url.is_null() {
         return;
@@ -97,8 +163,14 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
     let engine = &*engine;
 
     let url_str = std::ffi::CStr::from_ptr(url).to_string_lossy().into_owned();
-    if !(url_str.starts_with("https://") || url_str.starts_with("http://")) {
-        set_engine_error(engine, "URL must use http or https".to_string());
+    // `file:` reaches the decoder's local-media branch: a downloaded track is
+    // played by the SAME pipeline (Symphonia -> PCM ring -> AudioTrack) with no
+    // network at all. The decoder validates the path itself.
+    let playable = url_str.starts_with("https://")
+        || url_str.starts_with("http://")
+        || url_str.starts_with("file:");
+    if !playable {
+        set_engine_error(engine, "URL must use http, https or file".to_string());
         return;
     }
 
@@ -150,9 +222,20 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
         &engine.decoder_diagnostics.range_requests,
         &engine.decoder_diagnostics.range_bytes,
         &engine.decoder_diagnostics.range_elapsed_ms,
+        &engine.decoder_diagnostics.tap_to_decoder_us,
+        &engine.decoder_diagnostics.seeks,
+        &engine.decoder_diagnostics.seek_requests,
+        &engine.decoder_diagnostics.headers_us,
     ] {
         metric.store(0, Ordering::Release);
     }
+    // El desplazamiento Play tap → decoder se fija DESPUÉS del reset: es la
+    // entrada de la línea temporal que comparten Java y Rust, no un contador
+    // de esta reproducción.
+    engine
+        .decoder_diagnostics
+        .tap_to_decoder_us
+        .store(tap_to_decoder_us, Ordering::Release);
     if let Ok(mut diagnostic) = engine.decoder_diagnostics.stage.lock() {
         *diagnostic = "play requested; decoder starting".to_string();
     }
@@ -170,6 +253,7 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
     let decoder_finished = engine.decoder_finished.clone();
     let last_error = engine.last_error.clone();
     let decoder_diagnostics = engine.decoder_diagnostics.clone();
+    let trace = engine.trace.clone();
 
     let handle = std::thread::spawn(move || {
         if let Some(analysis_tap) = analysis_tap {
@@ -181,6 +265,7 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
                 analysis_tap,
                 playing,
                 decoder_diagnostics,
+                trace,
             );
             match decoder.decode_stream(url_str, header_vec) {
                 Ok(()) => {
@@ -559,6 +644,7 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_playStream(
     handle: jlong,
     url: JString,
     headers_json: JString,
+    tap_to_decoder_us: jlong,
 ) -> jboolean {
     if handle == 0 {
         let _ = env.throw_new(
@@ -567,6 +653,7 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_playStream(
         );
         return JNI_FALSE;
     }
+    let tap_to_decoder_us = tap_to_decoder_us.max(0) as u64;
     let url = match env.get_string(&url) {
         Ok(value) => value.to_string_lossy().into_owned(),
         Err(error) => {
@@ -611,6 +698,7 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_playStream(
             url.as_ptr(),
             headers.as_ptr(),
             header_count,
+            tap_to_decoder_us,
         );
         if tunefold_oboe_get_playback_state(handle as *mut AndroidEngine) == STATE_ERROR {
             JNI_FALSE
@@ -807,6 +895,248 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_getLastError(
         .unwrap_or(std::ptr::null_mut())
 }
 
+/// Arranca una descarga EXPLÍCITA de un track completo.
+///
+/// Recibe la `PlayableSource` ya resuelta (URL temporal + cabeceras) y la
+/// identidad lógica `provider + track id`. La URL nunca se persiste: el
+/// archivo se nombra por el digest de la identidad y el destino lo confirma
+/// después el `LocalMediaStore` de Java, que valida tamaño y límites.
+///
+/// Devuelve el id de la descarga (>0) o 0 si no se pudo arrancar.
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_startDownload(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    directory: JString,
+    provider: JString,
+    track_id: JString,
+    url: JString,
+    headers_json: JString,
+) -> jlong {
+    if handle == 0 {
+        return 0;
+    }
+    let engine = unsafe { &*(handle as *mut AndroidEngine) };
+    let read = |env: &mut JNIEnv, value: &JString| -> Option<String> {
+        env.get_string(value)
+            .ok()
+            .map(|v| v.to_string_lossy().into_owned())
+    };
+    let (Some(directory), Some(provider), Some(track_id), Some(url), Some(headers_json)) = (
+        read(&mut env, &directory),
+        read(&mut env, &provider),
+        read(&mut env, &track_id),
+        read(&mut env, &url),
+        read(&mut env, &headers_json),
+    ) else {
+        return 0;
+    };
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return 0;
+    }
+    let headers: Vec<(String, String)> = match serde_json::from_str(&headers_json) {
+        Ok(headers) => headers,
+        Err(_) => return 0,
+    };
+    let Some((_encoded, _count)) = encode_http_headers(headers.clone()).ok() else {
+        return 0;
+    };
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(Mutex::new(DownloadProgress::default()));
+    let headers = Arc::new(headers);
+    let registry = engine.downloads.clone();
+    let thread_registry = registry.clone();
+    let last_error = engine.last_error.clone();
+    let id = registry.register(cancel.clone(), progress.clone());
+
+    let directory = std::path::PathBuf::from(directory);
+    let spawned = std::thread::Builder::new()
+        .name("tunefold-download".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    if let Ok(mut slot) = last_error.lock() {
+                        *slot = Some(format!("download runtime: {error}"));
+                    }
+                    thread_registry.finish(id);
+                    return;
+                }
+            };
+            let mut observed = 0u64;
+            let progress_for_thread = progress.clone();
+            let cancel_for_thread = cancel.clone();
+            let headers_for_thread = headers.clone();
+            let outcome = runtime.block_on(android_download::download_to_local_media(
+                &url,
+                headers_for_thread.as_ref().clone(),
+                &provider,
+                &track_id,
+                &directory,
+                &cancel_for_thread,
+                |value| {
+                    // Se notifica al avanzar lo suficiente para que el progreso
+                    // sea observable sin espamear la línea temporal.
+                    if value.received.saturating_sub(observed) >= 64 * 1024 || value.is_complete() {
+                        observed = value.received;
+                        if let Ok(mut slot) = progress_for_thread.lock() {
+                            *slot = value;
+                        }
+                    }
+                },
+            ));
+            match outcome {
+                Ok(_) => {
+                    if let Ok(mut slot) = progress_for_thread.lock() {
+                        slot.total = Some(slot.received);
+                    }
+                }
+                Err(error) => {
+                    if let Ok(mut slot) = last_error.lock() {
+                        *slot = Some(format!("download: {error}"));
+                    }
+                }
+            }
+            thread_registry.finish(id);
+        });
+    if spawned.is_err() {
+        registry.finish(id);
+        return 0;
+    }
+    id as jlong
+}
+
+/// Progreso de una descarga: `received\ttotal` (total `-1` si se desconoce).
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_getDownloadProgress(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    download_id: jlong,
+) -> jstring {
+    if handle == 0 {
+        return std::ptr::null_mut();
+    }
+    let engine = unsafe { &*(handle as *mut AndroidEngine) };
+    let Some(value) = engine.downloads.progress(download_id as u64) else {
+        return std::ptr::null_mut();
+    };
+    let text = format!(
+        "{}\t{}",
+        value.received,
+        value.total.map_or(-1i64, |total| total as i64)
+    );
+    _env.new_string(text)
+        .map(|value| value.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Cancela una descarga en curso. Devuelve `true` si había una.
+///
+/// La descarga para entre trozos: no se cancela un `write` a medio hacer, y el
+/// `.part` se borra, así que nunca queda un archivo a medias.
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_cancelDownload(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    download_id: jlong,
+) -> jboolean {
+    if handle == 0 {
+        return JNI_FALSE;
+    }
+    let engine = unsafe { &*(handle as *mut AndroidEngine) };
+    if engine.downloads.cancel(download_id as u64) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Ruta canónica que Rust usa para un track descargado.
+///
+/// Es la fuente de verdad del destino: la UI no adivina nombres ni replica el
+/// digest en Java. `FileLocalMediaStore` la recibe y escribe su propio sidecar
+/// de identidad/tamaño, que es lo que valida thereafter.
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_localMediaPath(
+    mut env: JNIEnv,
+    _class: JClass,
+    directory: JString,
+    provider: JString,
+    track_id: JString,
+) -> jstring {
+    let read = |env: &mut JNIEnv, value: &JString| -> Option<String> {
+        env.get_string(value)
+            .ok()
+            .map(|v| v.to_string_lossy().into_owned())
+    };
+    let (Some(directory), Some(provider), Some(track_id)) = (
+        read(&mut env, &directory),
+        read(&mut env, &provider),
+        read(&mut env, &track_id),
+    ) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(stem) = android_download::local_media_stem(&provider, &track_id) else {
+        return std::ptr::null_mut();
+    };
+    let path = std::path::Path::new(&directory).join(format!("{stem}.audio"));
+    env.new_string(path.to_string_lossy().into_owned())
+        .map(|value| value.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Limpia los `.part` abandonados. Se llama al abrir el store, NO durante Play.
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_cleanAbandonedDownloads(
+    mut env: JNIEnv,
+    _class: JClass,
+    directory: JString,
+) -> jint {
+    let Ok(directory) = env.get_string(&directory) else {
+        return 0;
+    };
+    let directory = directory.to_string_lossy().into_owned();
+    android_download::clean_abandoned_parts(
+        std::path::Path::new(&directory),
+        std::time::Duration::from_secs(3600),
+    ) as jint
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_drainPlaybackTrace(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    if handle == 0 {
+        return std::ptr::null_mut();
+    }
+    let engine = unsafe { &*(handle as *mut AndroidEngine) };
+    // Un evento por línea: `at_us<TAB>event<TAB>detail`. `at_us` son
+    // microsegundos desde el Play tap, no desde el inicio del decoder.
+    let mut text = String::new();
+    for line in engine.trace.snapshot() {
+        text.push_str(&line.at_us.to_string());
+        text.push('\t');
+        text.push_str(&line.event);
+        if !line.detail.is_empty() {
+            text.push('\t');
+            text.push_str(&line.detail);
+        }
+        text.push('\n');
+    }
+    env.new_string(text)
+        .map(|value| value.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_getRuntimeDiagnostics(
     env: JNIEnv,
@@ -831,7 +1161,7 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_getRuntimeDiagnostic
             waveform.left.peak().max(waveform.right.peak())
         });
     let message = format!(
-        "{diagnostic}\npackets={} decoded={}f ring={}f analysis={}f output={}f waveform={analysis_peak:.3}\nhttp_open_us={} first_response_us={} probe_us={} first_decode_us={} first_pcm_us={} range_requests={} range_bytes={} range_elapsed_ms={}",
+        "{diagnostic}\npackets={} decoded={}f ring={}f analysis={}f output={}f waveform={analysis_peak:.3}\nhttp_open_us={} first_response_us={} probe_us={} first_decode_us={} first_pcm_us={} range_requests={} range_bytes={} range_elapsed_ms={} range_headers_us={} seeks={} seek_requests={} tap_to_decoder_us={}",
         engine
             .decoder_diagnostics
             .decoded_packets
@@ -857,6 +1187,16 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_getRuntimeDiagnostic
         engine.decoder_diagnostics.range_requests.load(Ordering::Relaxed),
         engine.decoder_diagnostics.range_bytes.load(Ordering::Relaxed),
         engine.decoder_diagnostics.range_elapsed_ms.load(Ordering::Relaxed),
+        engine.decoder_diagnostics.headers_us.load(Ordering::Relaxed),
+        engine.decoder_diagnostics.seeks.load(Ordering::Relaxed),
+        engine
+            .decoder_diagnostics
+            .seek_requests
+            .load(Ordering::Relaxed),
+        engine
+            .decoder_diagnostics
+            .tap_to_decoder_us
+            .load(Ordering::Relaxed),
     );
     env.new_string(message)
         .map(|value| value.into_raw())

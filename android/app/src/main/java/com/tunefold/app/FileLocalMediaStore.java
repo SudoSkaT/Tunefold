@@ -21,6 +21,8 @@ final class FileLocalMediaStore implements LocalMediaStore {
 
     FileLocalMediaStore(File directory) { this.directory = directory; }
 
+    @Override public File directory() { return directory; }
+
     @Override public synchronized boolean contains(String provider, String id) {
         return get(provider, id) != null;
     }
@@ -91,6 +93,43 @@ final class FileLocalMediaStore implements LocalMediaStore {
             return false;
         } finally {
             part.delete();
+            metadataPart.delete();
+        }
+    }
+
+    @Override public synchronized boolean register(String provider, String id, File path) {
+        if (provider == null || provider.isEmpty() || id == null || id.isEmpty()) return false;
+        if (path == null || !path.isFile()) return false;
+        File target = audioFile(provider, id);
+        File metadata = metadataFile(provider, id);
+        if (target == null || metadata == null) return false;
+        long size = path.length();
+        if (size <= 0 || size > MAX_ITEM_BYTES) return false;
+        if (!directory.isDirectory() && !directory.mkdirs()) return false;
+        File metadataPart = new File(directory, metadata.getName() + ".part");
+        try {
+            if (!path.getCanonicalFile().equals(target.getCanonicalFile())) {
+                // The downloader must write exactly where the store looks; this
+                // guards against registering a file the store does not own.
+                return false;
+            }
+            JSONObject entry = new JSONObject();
+            entry.put("provider", provider);
+            entry.put("id", id);
+            entry.put("size", size);
+            entry.put("updated_at_ms", System.currentTimeMillis());
+            try (FileOutputStream output = new FileOutputStream(metadataPart)) {
+                output.write(entry.toString().getBytes(StandardCharsets.UTF_8));
+                output.getFD().sync();
+            }
+            if (!metadataPart.renameTo(metadata)) return false;
+            evictOldEntries();
+            return true;
+        } catch (Exception failure) {
+            Log.d("TunefoldCache",
+                    "Local media register failed: " + failure.getClass().getSimpleName());
+            return false;
+        } finally {
             metadataPart.delete();
         }
     }

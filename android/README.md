@@ -45,8 +45,8 @@ repository's existing YouTube terms restrictions.
 
 ## Runtime smoke test
 
-Install the APK on an Android device or emulator, launch **Tunefold Android
-Runtime Test**, and enter a YouTube URL or search query. Direct HTTP(S) audio
+Install the APK on an Android device or emulator and launch **Tunefold**. Enter
+a YouTube URL or a search query. Direct HTTP(S) audio
 URLs remain supported for decoder smoke tests. The screen reports buffering,
 playing, pause, stop, provider metadata, decoder/output errors, and the analysis
 waveform peak after analysis publishes a snapshot.
@@ -71,17 +71,71 @@ Android's audio system may convert the stream to the physical device rate. A
 successful build or app launch does not demonstrate audible device output;
 verify playback on a device/emulator with a functioning audio backend.
 
+## Interface
+
+The screen is organised around real playback states, in this order: artwork,
+title/artist, playback state, progress, transport controls, secondary actions,
+then search results. Technical diagnostics are **not** part of the normal
+surface: the `Diagnostics` button toggles `PlaybackDebugPanel`, which shows the
+decoder counters and the ordered playback timeline.
+
+Layout is responsive: the cover is sized from the current window (never a fixed
+dimension), portrait stacks it above the details, landscape puts it beside them,
+and the page is scrollable so a short window never collapses a control. All
+dimensions are expressed in `dp`/`sp` and interactive controls are at least
+48dp high.
+
+States surfaced by the UI: Idle, Searching, Resolving metadata, Resolving
+source, Buffering, Playing, Paused, Downloading, Downloaded, Error.
+
 ## Playback timing and cache
 
-The Android host writes per-play monotonic events to Logcat under
-`TunefoldPerf`: the Play tap, controller receipt, metadata/source readiness,
-engine start, AudioTrack start, and first positive AudioTrack write. Decoder
-diagnostics report HTTP open and first-response-header durations, Symphonia
-probe time, first decoded packet, first PCM ring write, range request count,
-accepted range bytes, and accumulated request time. The first positive output
-write is the reproducible TTFA proxy; it does not measure acoustic onset.
+Each play writes an ordered, per-play timeline to Logcat under the `TunefoldPerf`
+tag. **Every event is anchored to the Play tap**, so one run can be
+reconstructed end to end:
 
-Cache ownership is separate by data type:
+```text
+PLAY_TAP @0ms
+CONTROLLER_RECEIVED_PLAY @13ms
+METADATA_RESOLUTION_START @26ms
+METADATA_AVAILABLE @826ms
+SOURCE_RESOLUTION_START hit=none @850ms
+PLAYABLE_SOURCE_AVAILABLE kind=http @1733ms
+HTTP_OPEN_START @1740ms
+HTTP_FIRST_RESPONSE req=1 range=0-65535 status=206 headers_us=29809 @1770ms
+RANGE_REQUEST req=1 host=… range=0-65535 requested=65536 received=65536 status=206
+            headers_us=29809 total_us=41072 retry=0 class=ok reader_pos=0 from_seek=false @1781ms
+SYMPHONIA_PROBE_START @1781ms
+RANGE_REQUEST req=2 … from_seek=true @1809ms      (seeks reuse the window: no request)
+SYMPHONIA_PROBE_END probe_us=243000 @2024ms
+DECODER_FIRST_PACKET bytes=371 ts=0 @2027ms
+DECODER_FIRST_PCM first_pcm_us=248000 frames=1024 @2027ms
+AUDIOTRACK_START sample_rate=44100 @2090ms
+AUDIOTRACK_FIRST_POSITIVE_WRITE frames=8192 @2092ms
+TTFA 2092ms
+```
+
+* `TTFA` = first positive `AudioTrack` write − Play tap. It is the reproducible
+  proxy for audible output; it does **not** measure acoustic onset.
+* `first_pcm_us` keeps its original meaning: first PCM accepted by the ring,
+  relative to **decoder entry**. Both are reported so decoder cost can be read
+  without the UI/provider prefix.
+* `RANGE_REQUEST` records one request: id, host, offsets, requested/received
+  bytes, HTTP status, header latency, total latency, retry number, result
+  classification, reader position and whether a `seek` caused it. Signed URLs
+  and request headers are never logged.
+
+Honour/Huawei builds filter `Log.i` per tag by default, which makes the app look
+silently hung. Enable it once before measuring:
+
+```sh
+adb shell setprop log.tag.TunefoldPerf I
+```
+
+`tools/measure_playback.sh <cold|warm> <runs>` replays the reference track and
+reports min/median/p95/max for TTFA and every stage.
+
+Cache ownership stays separate by data type:
 
 - Rustypipe's own provider cache stays below `cacheDir/rustypipe`.
 - Tunefold track metadata is stored separately by provider ID for seven days,
@@ -92,12 +146,38 @@ Cache ownership is separate by data type:
 - Resolved source URIs remain in the provider/resolver memory caches with their
   existing 20-minute expiry and live validation; they are not persisted as
   permanent media references.
-- `LocalMediaStore` is a separate explicit-save API with atomic files, sidecar
-  identity/size/timestamp checks, a 200 MiB per-item limit, and a 512 MiB total
-  limit. Normal Play never fills it automatically. A cache hit uses a `file:`
-  source handled by the same Symphonia, PCM ring, analysis tap, and AudioTrack
-  path; a miss streams from the provider.
+- `LocalMediaStore` is the persistent store of audio the user explicitly
+  downloaded. Atomic files, sidecar identity/size/timestamp checks, a 200 MiB
+  per-item limit and a 512 MiB total limit. Normal Play never fills it.
 
-No audio file is downloaded before playback. The store accepts bytes only when
-an explicit caller supplies them; this Android runtime host currently exposes
-the storage hook to the provider layer but has no download/offline UI.
+## Explicit download
+
+A download is a capability of its own, never a side effect of playback. It never
+runs during Play, metadata resolution, artwork fetch, preload or buffering; it
+starts only from the **Download** action.
+
+```text
+MediaTrack → resolve PlayableSource → HTTP Range (full) → .part
+           → validate final size → atomic commit → LocalMediaStore → file:
+```
+
+* It reuses the existing Range transport; there is no second HTTP stack and no
+  second player. A downloaded track is played as `file:` through the **same**
+  Symphonia → PCM ring → analysis tap → AudioTrack path.
+* Progress, cancellation and byte counts are surfaced in the UI
+  (`Downloading 34% · 42.1 MB / 123.8 MB`).
+* Cancellation removes the `.part` file; no half-written file is ever committed.
+* Identity is `provider + track id`. The resolved URL is never used as the file
+  name or persisted as media identity.
+* Abandoned `.part` files from interrupted downloads are cleaned when the store
+  is created, not during playback.
+* `resolution cache != downloaded audio`: a resolved temporary URL is never
+  converted into permanent storage.
+
+Scripted validation:
+
+```sh
+adb shell am start -n com.tunefold.app/.MainActivity \
+  --ez runtime_smoke_test true --ez runtime_download true \
+  --es runtime_stream_url https://www.youtube.com/watch?v=dQw4w9WgXcQ
+```

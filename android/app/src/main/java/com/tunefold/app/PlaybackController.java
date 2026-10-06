@@ -62,8 +62,15 @@ final class PlaybackController implements AudioTrackOutput.Listener {
             output.awaitStopped();
             TunefoldBridge.stopAudio(handle);
             if (operation.get() != requestId) return;
-            if (trace != null) trace.mark("T5_ENGINE_PLAY_REQUEST");
-            if (!TunefoldBridge.playStream(handle, source.url, source.headersJson)) {
+            if (trace != null) {
+                trace.attachEngine(handle);
+                trace.mark(PlaybackTrace.PLAYABLE_SOURCE_AVAILABLE,
+                        source.url.startsWith("file:") ? "kind=local_media" : "kind=http");
+            }
+            // The engine anchors its own timeline to this offset so every Rust
+            // event (HTTP, probe, decode) lands on the same Play-tap origin.
+            long tapToDecoderUs = trace == null ? 0L : trace.elapsedUs();
+            if (!TunefoldBridge.playStream(handle, source.url, source.headersJson, tapToDecoderUs)) {
                 fail(readError(handle, "Could not start stream"));
                 return;
             }
@@ -75,12 +82,11 @@ final class PlaybackController implements AudioTrackOutput.Listener {
     void playTrack(MediaTrack track, ProviderRegistry providers, PlaybackTrace trace,
                    TrackCallback callback) {
         long requestId = operation.incrementAndGet();
-        if (trace != null) trace.mark("T1_CONTROLLER_RECEIVED_PLAY");
-        if (trace != null) trace.mark("T3_METADATA_AVAILABLE");
+        if (trace != null) trace.mark(PlaybackTrace.CONTROLLER_RECEIVED_PLAY);
         state = LOADING;
         error = "";
         notifyChanged();
-        providers.playableSource(track, (source, failure) -> {
+        providers.playableSource(track, trace, (source, failure) -> {
             if (operation.get() != requestId) return;
             if (failure != null) {
                 fail(failure);
@@ -95,11 +101,11 @@ final class PlaybackController implements AudioTrackOutput.Listener {
     void playUrl(String url, ProviderRegistry providers, PlaybackTrace trace,
                  TrackCallback callback) {
         long requestId = operation.incrementAndGet();
-        if (trace != null) trace.mark("T1_CONTROLLER_RECEIVED_PLAY");
+        if (trace != null) trace.mark(PlaybackTrace.CONTROLLER_RECEIVED_PLAY);
         state = LOADING;
         error = "";
         notifyChanged();
-        providers.resolve(url, (track, failure) -> {
+        providers.resolve(url, trace, (track, failure) -> {
             if (operation.get() != requestId) return;
             if (failure != null) {
                 fail(failure);
@@ -107,8 +113,7 @@ final class PlaybackController implements AudioTrackOutput.Listener {
                 return;
             }
             if (callback != null) callback.onTrack(track, null);
-            if (trace != null) trace.mark("T3_METADATA_AVAILABLE");
-            providers.playableSource(track, (source, sourceFailure) -> {
+            providers.playableSource(track, trace, (source, sourceFailure) -> {
                 if (operation.get() != requestId) return;
                 if (sourceFailure != null) {
                     fail(sourceFailure);
@@ -186,6 +191,15 @@ final class PlaybackController implements AudioTrackOutput.Listener {
     }
 
     int state() { return state; }
+
+    /** Native engine handle, or 0 when the engine is not initialized. */
+    long engineHandle() { return engine; }
+
+    /** Playback position in milliseconds as tracked by the decoder. */
+    long positionMs() {
+        long handle = engine;
+        return handle == 0 ? 0L : TunefoldBridge.getPositionMs(handle);
+    }
     String error() { return error; }
     String diagnostics() { return diagnostics; }
 

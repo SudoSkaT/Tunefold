@@ -13,3 +13,6 @@ pub mod android_decoder;
 
 #[cfg(feature = "android")]
 pub mod android_playback;
+
+#[cfg(feature = "android")]
+pub mod android_download;

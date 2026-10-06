@@ -19,11 +19,35 @@ public final class ForegroundPlaybackService extends Service {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private PlaybackController controller;
     private ProviderRegistry providers;
+    private TrackDownloader downloader;
     private boolean foreground;
 
     public final class LocalBinder extends Binder {
         PlaybackController controller() { return controller; }
         ProviderRegistry providers() { return providers; }
+
+        /** Native engine handle, needed by the downloader's progress API. */
+        long engineHandle() { return controller == null ? 0 : controller.engineHandle(); }
+
+        /**
+         * The Activity owns no durable state, so the downloader is created here
+         * and survives Activity recreation.
+         *
+         * <p>Returns {@code null} until the provider registry has published its
+         * LocalMediaStore: the store is what owns the download directory, so the
+         * downloader cannot be built before it exists. Callers poll until it is
+         * available instead of racing initialization.
+         */
+        TrackDownloader downloader(long engineHandle) {
+            if (providers == null) return null;
+            LocalMediaStore store = providers.localMediaStore();
+            if (store == null) return null;
+            if (downloader == null) {
+                downloader = new TrackDownloader(providers, store, engineHandle,
+                        (track, status) -> { });
+            }
+            return downloader;
+        }
     }
 
     @Override public void onCreate() {
@@ -120,6 +144,7 @@ public final class ForegroundPlaybackService extends Service {
 
     @Override public void onDestroy() {
         handler.removeCallbacks(poll);
+        if (downloader != null) downloader.close();
         if (controller != null) controller.release();
         if (providers != null) providers.close();
         stopForegroundCompat();

@@ -110,7 +110,8 @@ final class AudioTrackOutput {
                     track = localTrack;
                     localTrack.play();
                     TunefoldBridge.setOutputState(engine, PlaybackController.PLAYING);
-                    if (trace != null) trace.mark("T10_AUDIOTRACK_PLAY");
+                    if (trace != null) trace.mark(PlaybackTrace.AUDIOTRACK_START,
+                            "sample_rate=" + sampleRate);
                     message("AudioTrack started at " + sampleRate + " Hz");
                 }
 
@@ -139,9 +140,9 @@ final class AudioTrackOutput {
                 pcm.limit(bytes);
                 while (running && pcm.hasRemaining()) {
                     int written = localTrack.write(pcm, pcm.remaining(), AudioTrack.WRITE_BLOCKING);
-                    if (trace != null && !firstWriteMarked && written > 0) {
+                    if (!firstWriteMarked && written > 0) {
                         firstWriteMarked = true;
-                        trace.mark("T11_FIRST_AUDIOTRACK_WRITE");
+                        if (trace != null) trace.markFirstPositiveWrite(written);
                     }
                     if (written < 0) {
                         throw new IllegalStateException("AudioTrack.write failed: " + written);

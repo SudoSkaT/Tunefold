@@ -54,6 +54,9 @@ final class ProviderRegistry implements AutoCloseable {
         });
     }
 
+    /** The bounded local-media store, owned by this registry. */
+    LocalMediaStore localMediaStore() { return localMediaStore; }
+
     private static android.graphics.Bitmap decodeArtwork(java.io.File file) {
         android.graphics.BitmapFactory.Options bounds = new android.graphics.BitmapFactory.Options();
         bounds.inJustDecodeBounds = true;
@@ -76,15 +79,13 @@ final class ProviderRegistry implements AutoCloseable {
         });
     }
 
-    void resolve(String url, Callback<MediaTrack> callback) {
+    void resolve(String url, PlaybackTrace trace, Callback<MediaTrack> callback) {
         worker.execute(() -> {
             if (!available) { deliver(callback, null, "YouTube provider is not initialized"); return; }
-            long start = android.os.SystemClock.elapsedRealtimeNanos();
-            android.util.Log.i("TunefoldPerf", "event=T2_PROVIDER_RESOLUTION_START");
+            if (trace != null) trace.mark("METADATA_RESOLUTION_START");
             String response = TunefoldBridge.resolveYoutubeUrl(url);
             parseTracks(response, (tracks, error) -> {
-                android.util.Log.i("TunefoldPerf", "event=T3_METADATA_AVAILABLE elapsed_ms="
-                        + ((android.os.SystemClock.elapsedRealtimeNanos() - start) / 1_000_000L));
+                if (trace != null) trace.mark(PlaybackTrace.METADATA_AVAILABLE);
                 deliver(callback,
                         error == null && tracks != null && !tracks.isEmpty() ? tracks.get(0) : null,
                         error != null ? error : tracks == null || tracks.isEmpty() ? "No track found" : null);
@@ -92,23 +93,30 @@ final class ProviderRegistry implements AutoCloseable {
         });
     }
 
-    void playableSource(MediaTrack track, Callback<PlayableSource> callback) {
+    /**
+     * Track → PlayableSource.
+     *
+     * <p>Strictly a resolution step: a hit in the LocalMediaStore short-circuits
+     * it with a {@code file:} source, otherwise the provider resolves a
+     * temporary URL. Resolution never downloads the whole track, and a resolved
+     * URL is never stored as a permanent media reference.
+     */
+    void playableSource(MediaTrack track, PlaybackTrace trace, Callback<PlayableSource> callback) {
         worker.execute(() -> {
             LocalMediaStore local = localMediaStore;
             java.io.File localFile = local == null ? null : local.get(track.provider, track.providerId);
             if (localFile != null) {
-                android.util.Log.i("TunefoldPerf", "event=local_media_cache_hit provider="
-                        + track.provider + " id=" + track.providerId);
+                if (trace != null) trace.mark(PlaybackTrace.SOURCE_RESOLUTION_START,
+                        "hit=local_media bytes=" + localFile.length());
+                if (trace != null) trace.mark(PlaybackTrace.PLAYABLE_SOURCE_AVAILABLE,
+                        "kind=local_media");
                 deliver(callback, new PlayableSource(localFile.toURI().toString(), "[]"), null);
                 return;
             }
+            if (trace != null) trace.mark(PlaybackTrace.SOURCE_RESOLUTION_START, "hit=none");
             if (!available) { deliver(callback, null, "YouTube provider is not initialized"); return; }
-            android.util.Log.i("TunefoldPerf", "event=local_media_cache_miss provider="
-                    + track.provider + " id=" + track.providerId);
             try {
                 long start = android.os.SystemClock.elapsedRealtimeNanos();
-                android.util.Log.i("TunefoldPerf", "event=T4_SOURCE_RESOLUTION_START provider="
-                        + track.provider + " id=" + track.providerId);
                 JSONObject root = new JSONObject(TunefoldBridge.resolveYoutubeSource(track.rawJson));
                 if (!root.optBoolean("ok")) {
                     deliver(callback, null, root.optString("category", "source_resolution_failed")
@@ -116,10 +124,10 @@ final class ProviderRegistry implements AutoCloseable {
                     return;
                 }
                 JSONObject source = root.getJSONObject("source");
-                android.util.Log.i("TunefoldPerf", "event=source_resolution_complete cache="
-                        + root.optString("source_cache", "unknown"));
-                android.util.Log.i("TunefoldPerf", "event=T4_PLAYABLE_SOURCE_AVAILABLE elapsed_ms="
-                        + ((android.os.SystemClock.elapsedRealtimeNanos() - start) / 1_000_000L));
+                long elapsedMs = (android.os.SystemClock.elapsedRealtimeNanos() - start) / 1_000_000L;
+                if (trace != null) trace.mark(PlaybackTrace.PLAYABLE_SOURCE_AVAILABLE,
+                        "source_cache=" + root.optString("source_cache", "unknown")
+                                + " resolution_ms=" + elapsedMs);
                 deliver(callback, new PlayableSource(source.getString("uri"),
                         source.optJSONArray("headers") == null ? "[]"
                                 : source.getJSONArray("headers").toString()), null);

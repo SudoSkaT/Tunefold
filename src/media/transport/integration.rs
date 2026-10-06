@@ -208,3 +208,107 @@ async fn final_partial_window_ends_cleanly() {
     assert_eq!(got.len(), n);
     assert_eq!(got, *data);
 }
+
+/// Un `seek` que cae dentro de la ventana ya descargada se resuelve SIN
+/// pedirla de nuevo: los seeks del probe de MP4 son de corto alcance y hacia
+/// delante, así que repetir la descarga desperdiciaba casi toda la ventana.
+#[tokio::test]
+async fn seek_inside_the_downloaded_window_reuses_it_without_a_request() {
+    let data = payload(1024 * 1024);
+    let server = FakeServer::start(Scenario::Normal(data.clone())).await;
+    // Una sola ventana grande cubre todo el archivo.
+    let mut s = open(&server, test_policy(512)).await;
+    let before = server.request_count();
+
+    // La ventana inicial son 32 KiB (initial_window): todo lo que siga dentro
+    // de ella debe servirse sin red.
+    let target = 8 * 1024;
+    s.seek_to(target).await.expect("seek dentro de la ventana");
+    let got = s.next_chunk(64).await.unwrap().unwrap();
+    assert_eq!(got, data[target as usize..target as usize + 64]);
+    assert_eq!(
+        server.request_count(),
+        before,
+        "un seek dentro de la ventana no debe generar peticiones"
+    );
+
+    // Un seek al final exacto no necesita red tampoco.
+    s.seek_to(s.total()).await.expect("seek al final");
+    assert_eq!(
+        server.request_count(),
+        before,
+        "seek al final del archivo no necesita red"
+    );
+    assert!(s.next_chunk(16).await.unwrap().is_none());
+}
+
+/// Un seek FUERA de la ventana descargada sí pide una ventana nueva, y los
+/// bytes entregados siguen siendo correctos.
+#[tokio::test]
+async fn seek_outside_the_downloaded_window_fetches_and_stays_correct() {
+    let data = payload(1024 * 1024);
+    let server = FakeServer::start(Scenario::Normal(data.clone())).await;
+    let mut s = open(&server, test_policy(64)).await;
+    let before = server.request_count();
+
+    let target = 700 * 1024;
+    s.seek_to(target).await.expect("seek fuera de la ventana");
+    assert!(
+        server.request_count() > before,
+        "un seek fuera de la ventana sí debe pedirla"
+    );
+    let got = s.next_chunk(128).await.unwrap().unwrap();
+    assert_eq!(got, data[target as usize..target as usize + 128]);
+}
+
+/// La reutilización no puede alterar la secuencia de bytes ni el EOF.
+///
+/// Reproduce el patrón real del probe de MP4 en Android: saltos cortos hacia
+/// delante que caen dentro de la ventana recién descargada. Cada tramo debe
+/// coincidir con el original en su offset lógico, y el recorrido debe llegar
+/// al final sin bytes perdidos ni peticiones explosivas.
+#[tokio::test]
+async fn short_forward_seeks_preserve_byte_order_and_bound_requests() {
+    let n = 1024 * 1024 + 37;
+    let data = payload(n);
+    let server = FakeServer::start(Scenario::Normal(data.clone())).await;
+    let mut s = open(&server, test_policy(64)).await;
+
+    let mut hops = 0usize;
+    loop {
+        let position = s.position() as usize;
+        match s.next_chunk(24 * 1024).await.expect("chunk") {
+            None => break,
+            Some(chunk) => {
+                assert_eq!(
+                    chunk.as_slice(),
+                    &data[position..position + chunk.len()],
+                    "tramo descolocado en el offset lógico {position}"
+                );
+            }
+        }
+        let position = s.position() as usize;
+        if position + 40 * 1024 < n {
+            s.seek_to((position + 40 * 1024) as u64)
+                .await
+                .expect("seek corto hacia delante");
+            hops += 1;
+        }
+    }
+
+    assert_eq!(
+        s.position() as usize,
+        n,
+        "el recorrido con seeks intercalados llega hasta el final"
+    );
+    assert!(
+        s.metrics().seeks >= hops as u64,
+        "los seeks se contabilizaron"
+    );
+    assert!(
+        s.metrics().requests <= (n / (24 * 1024)) as u64 + 4,
+        "la reutilización acota las peticiones: {} para {} hops",
+        s.metrics().requests,
+        hops
+    );
+}
