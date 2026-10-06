@@ -32,6 +32,14 @@ pub struct DecoderDiagnostics {
     pub(crate) decoded_frames: AtomicU64,
     pub(crate) ring_frames: AtomicU64,
     pub(crate) analysis_frames: AtomicU64,
+    pub(crate) http_open_us: AtomicU64,
+    pub(crate) first_response_us: AtomicU64,
+    pub(crate) probe_us: AtomicU64,
+    pub(crate) first_decode_us: AtomicU64,
+    pub(crate) first_pcm_us: AtomicU64,
+    pub(crate) range_requests: AtomicU64,
+    pub(crate) range_bytes: AtomicU64,
+    pub(crate) range_elapsed_ms: AtomicU64,
 }
 
 impl DecoderDiagnostics {
@@ -42,6 +50,14 @@ impl DecoderDiagnostics {
             decoded_frames: AtomicU64::new(0),
             ring_frames: AtomicU64::new(0),
             analysis_frames: AtomicU64::new(0),
+            http_open_us: AtomicU64::new(0),
+            first_response_us: AtomicU64::new(0),
+            probe_us: AtomicU64::new(0),
+            first_decode_us: AtomicU64::new(0),
+            first_pcm_us: AtomicU64::new(0),
+            range_requests: AtomicU64::new(0),
+            range_bytes: AtomicU64::new(0),
+            range_elapsed_ms: AtomicU64::new(0),
         }
     }
 }
@@ -75,6 +91,49 @@ impl std::fmt::Display for DecoderError {
 }
 
 impl std::error::Error for DecoderError {}
+
+fn file_path_from_uri(uri: &str) -> Result<std::path::PathBuf, DecoderError> {
+    let encoded = uri
+        .strip_prefix("file://")
+        .or_else(|| uri.strip_prefix("file:"))
+        .ok_or_else(|| DecoderError::Stream("unsupported local URI".to_string()))?;
+    if !encoded.starts_with('/') {
+        return Err(DecoderError::Stream(
+            "local URI must contain an absolute path".to_string(),
+        ));
+    }
+    let input = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' {
+            let Some(pair) = input.get(index + 1..index + 3) else {
+                return Err(DecoderError::Stream(
+                    "malformed local URI escape".to_string(),
+                ));
+            };
+            let hex = std::str::from_utf8(pair)
+                .ok()
+                .and_then(|value| u8::from_str_radix(value, 16).ok())
+                .ok_or_else(|| DecoderError::Stream("malformed local URI escape".to_string()))?;
+            decoded.push(hex);
+            index += 3;
+        } else {
+            decoded.push(input[index]);
+            index += 1;
+        }
+    }
+    let path = String::from_utf8(decoded)
+        .map_err(|_| DecoderError::Stream("local URI path is not UTF-8".to_string()))?;
+    let path = std::path::PathBuf::from(path);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(DecoderError::Stream(
+            "local URI must contain an absolute path".to_string(),
+        ))
+    }
+}
 
 /// A reader that implements `MediaSource` for HTTP range streams.
 struct HttpMediaSource {
@@ -155,42 +214,74 @@ impl AndroidDecoder {
         }
     }
 
-    /// Decode an HTTP stream and feed PCM to the ring buffer.
+    /// Decode a remote range stream or an explicitly cached local media file.
     /// This runs on a dedicated decoder thread (not the audio callback).
     pub fn decode_stream(
         &self,
         url: String,
         headers: Vec<(String, String)>,
     ) -> Result<(), DecoderError> {
+        let decode_started = std::time::Instant::now();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| DecoderError::Stream(e.to_string()))?;
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .map_err(|error| DecoderError::Stream(error.to_string()))?;
-        let transport = runtime
-            .block_on(crate::media::transport::HttpRangeStream::open(
-                client,
-                url,
-                headers,
-                crate::media::transport::RangePolicy::default(),
-            ))
-            .map_err(|e| DecoderError::Stream(e.to_string()))?;
+        let mss = if url.starts_with("file:") {
+            if !headers.is_empty() {
+                return Err(DecoderError::Stream(
+                    "local media source cannot use HTTP headers".to_string(),
+                ));
+            }
+            let path = file_path_from_uri(&url)?;
+            let file = std::fs::File::open(&path).map_err(|error| {
+                DecoderError::Stream(format!("local media open failed: {error}"))
+            })?;
+            let content_length = file
+                .metadata()
+                .map_err(|error| DecoderError::Stream(format!("local media stat failed: {error}")))?
+                .len();
+            self.set_diagnostic(format!("local media opened · {content_length} bytes"));
+            if content_length == 0 {
+                return Err(DecoderError::Stream("empty local media file".to_string()));
+            }
+            MediaSourceStream::new(
+                Box::new(HttpMediaSource::new(Box::new(file), content_length)),
+                MediaSourceStreamOptions::default(),
+            )
+        } else {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .build()
+                .map_err(|error| DecoderError::Stream(error.to_string()))?;
+            let http_started = std::time::Instant::now();
+            let transport = runtime
+                .block_on(crate::media::transport::HttpRangeStream::open(
+                    client,
+                    url,
+                    headers,
+                    crate::media::transport::RangePolicy::default(),
+                ))
+                .map_err(|e| DecoderError::Stream(e.to_string()))?;
+            self.diagnostics
+                .http_open_us
+                .store(http_started.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-        let content_length = transport.total();
-        self.set_diagnostic(format!("HTTP stream opened · {content_length} bytes"));
-        if content_length == 0 {
-            return Err(DecoderError::Stream("empty stream".to_string()));
-        }
+            let content_length = transport.total();
+            self.diagnostics
+                .first_response_us
+                .store(transport.metrics().first_response_us, Ordering::Relaxed);
+            self.set_diagnostic(format!("HTTP stream opened · {content_length} bytes"));
+            if content_length == 0 {
+                return Err(DecoderError::Stream("empty stream".to_string()));
+            }
 
-        let reader = StreamReader::new(transport);
-        let mss = MediaSourceStream::new(
-            Box::new(HttpMediaSource::new(Box::new(reader), content_length)),
-            MediaSourceStreamOptions::default(),
-        );
+            let reader = StreamReader::new(transport, self.diagnostics.clone());
+            MediaSourceStream::new(
+                Box::new(HttpMediaSource::new(Box::new(reader), content_length)),
+                MediaSourceStreamOptions::default(),
+            )
+        };
 
         let mut hint = Hint::new();
         hint.with_extension("mp4");
@@ -199,9 +290,14 @@ impl AndroidDecoder {
         let metadata_opts = MetadataOptions::default();
         let decoder_opts = DecoderOptions::default();
 
+        let probe_started = std::time::Instant::now();
         let probed = symphonia::default::get_probe()
             .format(&hint, mss, &format_opts, &metadata_opts)
             .map_err(|e| DecoderError::Format(e.to_string()))?;
+        self.diagnostics.probe_us.store(
+            probe_started.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
 
         let mut format = probed.format;
 
@@ -269,6 +365,12 @@ impl AndroidDecoder {
 
             match decoder.decode(&packet) {
                 Ok(decoded) => {
+                    if self.diagnostics.decoded_packets.load(Ordering::Relaxed) == 0 {
+                        self.diagnostics.first_decode_us.store(
+                            decode_started.elapsed().as_micros() as u64,
+                            Ordering::Relaxed,
+                        );
+                    }
                     let packet_count = self
                         .diagnostics
                         .decoded_packets
@@ -284,7 +386,7 @@ impl AndroidDecoder {
                     if let Some(ref mut buf) = sample_buf {
                         buf.copy_interleaved_ref(decoded);
                         let samples = buf.samples();
-                        if !self.feed_pcm(samples, channels, &mut stereo) {
+                        if !self.feed_pcm(samples, channels, &mut stereo, decode_started) {
                             return Ok(());
                         }
                     }
@@ -309,7 +411,13 @@ impl AndroidDecoder {
         Ok(())
     }
 
-    fn feed_pcm(&self, samples: &[f32], channels: u16, stereo: &mut Vec<f32>) -> bool {
+    fn feed_pcm(
+        &self,
+        samples: &[f32],
+        channels: u16,
+        stereo: &mut Vec<f32>,
+        decode_started: std::time::Instant,
+    ) -> bool {
         let channels = channels as usize;
         let frames = samples.len() / channels;
         self.diagnostics
@@ -349,6 +457,12 @@ impl AndroidDecoder {
             self.diagnostics
                 .ring_frames
                 .fetch_add(written_frames as u64, Ordering::Relaxed);
+            let _ = self.diagnostics.first_pcm_us.compare_exchange(
+                0,
+                decode_started.elapsed().as_micros() as u64,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
 
             let written_samples = written_frames * 2;
             let mut analysis_offset = 0;
@@ -396,6 +510,7 @@ impl AndroidDecoder {
 /// A reader that wraps `HttpRangeStream` and implements `Read + Seek`.
 struct StreamReader {
     transport: crate::media::transport::HttpRangeStream,
+    diagnostics: Arc<DecoderDiagnostics>,
     position: u64,
     buffer: Vec<u8>,
     buffer_pos: usize,
@@ -404,13 +519,17 @@ struct StreamReader {
 }
 
 impl StreamReader {
-    fn new(transport: crate::media::transport::HttpRangeStream) -> Self {
+    fn new(
+        transport: crate::media::transport::HttpRangeStream,
+        diagnostics: Arc<DecoderDiagnostics>,
+    ) -> Self {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
         Self {
             transport,
+            diagnostics,
             position: 0,
             buffer: Vec::new(),
             buffer_pos: 0,
@@ -426,6 +545,7 @@ impl StreamReader {
         let result = self
             .runtime
             .block_on(async { self.transport.next_chunk(256 * 1024).await });
+        self.sync_metrics();
         match result {
             Ok(Some(chunk)) => {
                 if chunk.is_empty() {
@@ -443,6 +563,22 @@ impl StreamReader {
             }
             Err(e) => Err(std::io::Error::other(e.to_string())),
         }
+    }
+
+    fn sync_metrics(&self) {
+        let metrics = self.transport.metrics();
+        self.diagnostics
+            .range_requests
+            .store(metrics.requests, Ordering::Relaxed);
+        self.diagnostics
+            .first_response_us
+            .store(metrics.first_response_us, Ordering::Relaxed);
+        self.diagnostics
+            .range_bytes
+            .store(metrics.bytes_received, Ordering::Relaxed);
+        self.diagnostics
+            .range_elapsed_ms
+            .store(metrics.elapsed_ms, Ordering::Relaxed);
     }
 }
 
@@ -471,10 +607,16 @@ impl std::io::Seek for StreamReader {
             SeekFrom::Current(n) => (self.position as i64 + n) as u64,
             SeekFrom::End(n) => (self.transport.total() as i64 + n) as u64,
         };
+        if new_pos == self.position {
+            return Ok(new_pos);
+        }
+        let seek_result = self.runtime.block_on(self.transport.seek_to(new_pos));
+        self.sync_metrics();
+        seek_result.map_err(|error| std::io::Error::other(error.to_string()))?;
         self.position = new_pos;
         self.buffer.clear();
         self.buffer_pos = 0;
-        self.eof = false;
+        self.eof = new_pos >= self.transport.total();
         Ok(new_pos)
     }
 }

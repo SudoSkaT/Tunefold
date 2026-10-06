@@ -54,7 +54,6 @@ pub fn parse_link(raw: &str) -> LinkKind {
     let path_query = &after_scheme[host_end..];
 
     let is_youtube_host = host == "youtube.com"
-        || host.ends_with(".youtube.com")
         || host == "youtu.be"
         || host == "www.youtube.com"
         || host == "music.youtube.com"
@@ -65,7 +64,10 @@ pub fn parse_link(raw: &str) -> LinkKind {
 
     // youtu.be/ID
     if host == "youtu.be" {
-        let id = take_segment(path_query.trim_start_matches('/'));
+        let Some(segment) = path_query.strip_prefix('/') else {
+            return LinkKind::Invalid;
+        };
+        let id = take_segment(segment);
         return valid_video(&id)
             .map(LinkKind::VideoId)
             .unwrap_or(LinkKind::Invalid);
@@ -80,7 +82,7 @@ pub fn parse_link(raw: &str) -> LinkKind {
     }
 
     // /playlist?list=PLID
-    if path_query.starts_with("/playlist") {
+    if path_query.split(['?', '#']).next() == Some("/playlist") {
         if let Some(list) = query_param(path_query, "list") {
             return valid_list(&list)
                 .map(LinkKind::PlaylistId)
@@ -90,7 +92,7 @@ pub fn parse_link(raw: &str) -> LinkKind {
     }
 
     // /watch?v=ID (&list=PLID opcional: manda el video por decisión Q2 copia)
-    if path_query.starts_with("/watch") {
+    if path_query.split(['?', '#']).next() == Some("/watch") {
         if let Some(v) = query_param(path_query, "v") {
             if let Some(id) = valid_video(&v) {
                 return LinkKind::VideoId(id);
@@ -148,8 +150,8 @@ fn query_param(path_query: &str, key: &str) -> Option<String> {
 
 fn valid_video(id: &str) -> Option<String> {
     let id = id.trim();
-    // IDs reales: 11 chars base64url; se acepta 6..64 por tolerancia futura.
-    if (6..=64).contains(&id.len())
+    // Los IDs canónicos de video YouTube tienen 11 caracteres base64url.
+    if id.len() == 11
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -240,5 +242,25 @@ mod tests {
         assert!(looks_like_url("  www.youtube.com/watch?v=x  "));
         assert!(!looks_like_url("queen bohemian rhapsody"));
         assert!(!looks_like_url("watch?v=algo"));
+    }
+
+    #[test]
+    fn canonical_identity_ignores_tracking_parameters() {
+        let a = parse_link("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        let b = parse_link("https://youtube.com/watch?feature=share&si=tracking&v=dQw4w9WgXcQ");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rejects_noncanonical_hosts_paths_and_ids() {
+        for raw in [
+            "https://evil.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtube.com.evil.test/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch-more?v=dQw4w9WgXcQ",
+            "https://youtu.be//dQw4w9WgXcQ",
+            "https://youtu.be/short",
+        ] {
+            assert_eq!(parse_link(raw), LinkKind::Invalid, "{raw}");
+        }
     }
 }

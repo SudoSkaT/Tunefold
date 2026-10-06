@@ -172,6 +172,10 @@ pub struct TransportMetrics {
     pub requests: u64,
     pub retries: u64,
     pub bytes_received: u64,
+    /// Latencia acumulada de cada petición hasta recibir y validar su cuerpo.
+    pub elapsed_ms: u64,
+    /// Tiempo hasta las cabeceras de la primera respuesta Range.
+    pub first_response_us: u64,
 }
 
 /// Convierte un error reqwest en fallo de transporte SIN filtrar la URL
@@ -255,6 +259,34 @@ impl HttpRangeStream {
         self.pos
     }
 
+    /// Reposition the byte stream and fetch the next ranged window at that
+    /// offset. This is used by container probes such as MP4, whose parser
+    /// seeks while inspecting atom tables.
+    pub async fn seek_to(&mut self, position: u64) -> Result<(), TransportFailure> {
+        if position > self.total {
+            self.pos = position;
+            self.pending.clear();
+            self.cursor = 0;
+            self.eof = true;
+            return Ok(());
+        }
+        self.pos = position;
+        self.pending.clear();
+        self.cursor = 0;
+        self.eof = position == self.total;
+        if self.eof {
+            return Ok(());
+        }
+        let len = self
+            .policy
+            .window_len_at(position)
+            .min(self.total.saturating_sub(position))
+            .max(1);
+        self.pending = self.fetch_window(position, len).await?;
+        self.eof = false;
+        Ok(())
+    }
+
     pub fn metrics(&self) -> TransportMetrics {
         self.metrics
     }
@@ -294,11 +326,13 @@ impl HttpRangeStream {
             self.metrics.requests += 1;
             let rid = self.rid;
             let started = Instant::now();
-            let outcome = self.single_request(rid, start, len).await;
+            let outcome = self.single_request(rid, start, len, started).await;
             let elapsed = started.elapsed();
 
             match outcome {
                 Ok(bytes) => {
+                    self.metrics.bytes_received += bytes.len() as u64;
+                    self.metrics.elapsed_ms += elapsed.as_millis() as u64;
                     tracing::debug!(
                         rid,
                         host = host_of(&self.url),
@@ -312,6 +346,7 @@ impl HttpRangeStream {
                     return Ok(bytes);
                 }
                 Err(f) => {
+                    self.metrics.elapsed_ms += elapsed.as_millis() as u64;
                     let class = f.category();
                     tracing::debug!(
                         rid,
@@ -341,6 +376,7 @@ impl HttpRangeStream {
         rid: u64,
         start: u64,
         len: u64,
+        request_started: Instant,
     ) -> Result<Vec<u8>, TransportFailure> {
         let end = start + len - 1;
         let mut req = self.http.get(&self.url);
@@ -353,6 +389,9 @@ impl HttpRangeStream {
             .send()
             .await
             .map_err(map_reqwest)?;
+        if self.metrics.first_response_us == 0 {
+            self.metrics.first_response_us = request_started.elapsed().as_micros() as u64;
+        }
 
         let status = resp.status().as_u16();
         let hdr = |name: &str| {

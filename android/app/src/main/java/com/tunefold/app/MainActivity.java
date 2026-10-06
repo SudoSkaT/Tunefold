@@ -1,96 +1,67 @@
 package com.tunefold.app;
 
 import android.app.Activity;
+import android.content.ComponentName;
+import android.content.Intent;
+import android.content.ServiceConnection;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
-import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.List;
 
-public final class MainActivity extends Activity implements AudioTrackOutput.Listener {
-    static final int STATE_IDLE = 0;
-    static final int STATE_BUFFERING = 1;
-    static final int STATE_PLAYING = 2;
-    static final int STATE_PAUSED = 3;
-    static final int STATE_STOPPED = 4;
-    static final int STATE_ERROR = 5;
-
+public final class MainActivity extends Activity {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final ExecutorService commands = Executors.newSingleThreadExecutor();
-    private volatile long engine;
-    private volatile boolean destroyed;
+    private PlaybackController controller;
+    private ProviderRegistry providers;
+    private boolean bound;
+    private boolean destroyed;
     private EditText urlInput;
     private TextView stateText;
-    private AudioTrackOutput output;
-    private final float[] visualFeatures = new float[13];
-    private final float[] waveformBars = new float[24];
+    private ImageView artworkView;
+    private LinearLayout results;
+    private String providerMessage = "";
+    private String activeArtworkId = "";
+
+    private final ServiceConnection connection = new ServiceConnection() {
+        @Override public void onServiceConnected(ComponentName name, IBinder service) {
+            controller = ((ForegroundPlaybackService.LocalBinder) service).controller();
+            providers = ((ForegroundPlaybackService.LocalBinder) service).providers();
+            if (getIntent().getBooleanExtra("runtime_smoke_test", false)) resolveAndPlay();
+        }
+        @Override public void onServiceDisconnected(ComponentName name) { controller = null; providers = null; }
+    };
 
     private final Runnable statePoll = new Runnable() {
         @Override public void run() {
             if (destroyed) return;
-            if (engine != 0) {
-                int state = TunefoldBridge.getPlaybackState(engine);
-                int rate = TunefoldBridge.getSampleRate(engine);
-                String label = stateLabel(state);
-                if (rate > 0) label += " · " + rate + " Hz";
-                TunefoldBridge.getVisualState(engine, visualFeatures, waveformBars);
-                float peak = 0.0f;
-                for (float bar : waveformBars) peak = Math.max(peak, bar);
-                if (peak > 0.0f || visualFeatures[1] > 0.0f) {
-                    label += " · analysis peak " + Math.round(peak * 1000.0f) + "‰";
-                }
-                String diagnostics = TunefoldBridge.getRuntimeDiagnostics(engine);
-                if (diagnostics != null && !diagnostics.isEmpty()) {
-                    label += "\n" + diagnostics;
-                }
-                if (state == STATE_ERROR) {
-                    String error = TunefoldBridge.getLastError(engine);
-                    if (error != null && !error.isEmpty()) label += " · " + error;
-                    output.requestStop();
-                }
+            PlaybackController active = controller;
+            if (active != null) {
+                active.refresh();
+                String label = stateLabel(active.state());
+                String details = active.error();
+                if (details != null && !details.isEmpty()) label += " · " + details;
+                if (!providerMessage.isEmpty()) label += "\n" + providerMessage;
+                String diagnostics = active.diagnostics();
+                if (diagnostics != null && !diagnostics.isEmpty()) label += "\n" + diagnostics;
                 stateText.setText(label);
             }
-            mainHandler.postDelayed(this, 300);
+            mainHandler.postDelayed(this, 400);
         }
     };
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         buildMinimalHost();
-        output = new AudioTrackOutput(this);
-        stateText.setText("Initializing Rust engine…");
-        commands.execute(() -> {
-            long created;
-            try {
-                created = TunefoldBridge.createEngine();
-            } catch (Throwable error) {
-                String message = "JNI initialization failed: " + error;
-                mainHandler.post(() -> {
-                    if (!destroyed) stateText.setText(message);
-                });
-                return;
-            }
-            mainHandler.post(() -> {
-                if (destroyed) {
-                    // Initialization may finish while the Activity is shutting down.
-                    new Thread(() -> TunefoldBridge.destroyEngine(created),
-                            "tunefold-engine-cleanup").start();
-                    return;
-                }
-                engine = created;
-                stateText.setText(created == 0
-                        ? "Rust engine initialization failed" : "Ready");
-                if (created != 0 && getIntent().getBooleanExtra("runtime_smoke_test", false)) {
-                    startPlayback();
-                }
-            });
-        });
+        Intent service = new Intent(this, ForegroundPlaybackService.class);
+        bound = bindService(service, connection, BIND_AUTO_CREATE);
         mainHandler.post(statePoll);
     }
 
@@ -99,124 +70,153 @@ public final class MainActivity extends Activity implements AudioTrackOutput.Lis
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(padding, padding, padding, padding);
-
         TextView title = new TextView(this);
         title.setText("Tunefold Android Runtime Test");
         title.setTextSize(20);
-        root.addView(title, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
+        root.addView(title, new LinearLayout.LayoutParams(-1, -2));
+        artworkView = new ImageView(this);
+        artworkView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        int artworkSize = (int) (112 * getResources().getDisplayMetrics().density);
+        root.addView(artworkView, new LinearLayout.LayoutParams(artworkSize, artworkSize));
         urlInput = new EditText(this);
         urlInput.setSingleLine(true);
-        urlInput.setHint("HTTPS audio URL (AAC/M4A, FLAC, WAV, or Ogg Vorbis)");
-        urlInput.setInputType( android.text.InputType.TYPE_CLASS_TEXT
+        urlInput.setHint("YouTube URL or search query");
+        urlInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT
                 | android.text.InputType.TYPE_TEXT_VARIATION_URI);
-        // Small real CC0 Vorbis sample used for the runtime smoke test.
-        urlInput.setText("https://upload.wikimedia.org/wikipedia/commons/e/e3/Example_sound_file_in_Ogg_Vorbis_format.ogg");
+        urlInput.setText("https://www.youtube.com/watch?v=");
         String runtimeUrl = getIntent().getStringExtra("runtime_stream_url");
         if (runtimeUrl != null) urlInput.setText(runtimeUrl);
-        root.addView(urlInput, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
+        root.addView(urlInput, new LinearLayout.LayoutParams(-1, -2));
         LinearLayout buttons = new LinearLayout(this);
-        Button play = new Button(this);
-        play.setText("Play URL");
-        play.setOnClickListener(view -> startPlayback());
-        buttons.addView(play, new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-
+        Button search = new Button(this);
+        search.setText("Search / Play URL");
+        search.setOnClickListener(view -> searchOrResolve());
+        buttons.addView(search, new LinearLayout.LayoutParams(0, -2, 1));
         Button pauseResume = new Button(this);
         pauseResume.setText("Pause / Resume");
-        pauseResume.setOnClickListener(view -> togglePause());
-        buttons.addView(pauseResume, new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-
+        pauseResume.setOnClickListener(view -> { if (controller != null) controller.togglePause(); });
+        buttons.addView(pauseResume, new LinearLayout.LayoutParams(0, -2, 1));
         Button stop = new Button(this);
         stop.setText("Stop");
-        stop.setOnClickListener(view -> stopPlayback());
-        buttons.addView(stop, new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        stop.setOnClickListener(view -> { if (controller != null) controller.stop(); });
+        buttons.addView(stop, new LinearLayout.LayoutParams(0, -2, 1));
         root.addView(buttons);
-
+        results = new LinearLayout(this);
+        results.setOrientation(LinearLayout.VERTICAL);
+        root.addView(results, new LinearLayout.LayoutParams(-1, -2));
         stateText = new TextView(this);
         stateText.setTextIsSelectable(true);
-        stateText.setText("Initializing");
-        root.addView(stateText, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        stateText.setText("Connecting to playback service…");
+        root.addView(stateText, new LinearLayout.LayoutParams(-1, -2));
         setContentView(root);
     }
 
-    private void startPlayback() {
-        String url = urlInput.getText().toString().trim();
-        if (!(url.startsWith("https://") || url.startsWith("http://"))) {
-            stateText.setText("Enter an http or https audio URL");
-            return;
+    private void searchOrResolve() {
+        String query = urlInput.getText().toString().trim();
+        if (providers == null) { stateText.setText("Provider service is not connected"); return; }
+        if (query.contains("youtube.com/") || query.contains("youtu.be/")) {
+            resolve(query, new PlaybackTrace("url"));
+        } else if (query.startsWith("https://") || query.startsWith("http://")) {
+            playDirectUrl(query);
+        } else {
+            providerMessage = "Searching YouTube…";
+            stateText.setText("Searching YouTube…");
+            providers.search(query, (tracks, error) -> {
+                results.removeAllViews();
+                if (error != null) { providerMessage = error; stateText.setText(error); return; }
+                providerMessage = "";
+                showTracks(tracks);
+            });
         }
-        long activeEngine = engine;
-        if (activeEngine == 0) {
-            stateText.setText("Rust engine is unavailable");
-            return;
+    }
+
+    private void resolveAndPlay() {
+        String url = getIntent().getStringExtra("runtime_stream_url");
+        if (url == null) return;
+        if (url.contains("youtube.com/") || url.contains("youtu.be/")) {
+            resolve(url, new PlaybackTrace("url"));
         }
-        stateText.setText("Opening stream");
-        commands.execute(() -> {
-            output.requestStop();
-            output.awaitStopped();
-            TunefoldBridge.stopAudio(activeEngine);
-            if (!TunefoldBridge.playStream(activeEngine, url)) {
-                postMessage(errorOrDefault(activeEngine, "Could not start stream"));
-                return;
+        else playDirectUrl(url);
+    }
+
+    private void playDirectUrl(String url) {
+        if (controller == null) { stateText.setText("Playback service is not connected"); return; }
+        Intent service = new Intent(this, ForegroundPlaybackService.class);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(service);
+        else startService(service);
+        providerMessage = "Playing direct HTTP audio source";
+        PlaybackTrace trace = new PlaybackTrace("direct-http");
+        trace.mark("T1_CONTROLLER_RECEIVED_PLAY");
+        controller.play(new PlayableSource(url, "[]"), trace);
+    }
+
+    private void resolve(String url, PlaybackTrace trace) {
+        providerMessage = "Resolving YouTube metadata…";
+        stateText.setText("Resolving YouTube metadata…");
+        if (controller == null) { stateText.setText("Playback service is not connected"); return; }
+        startPlaybackService();
+        controller.playUrl(url, providers, trace, (track, error) -> {
+            if (error != null) { providerMessage = error; stateText.setText(error); return; }
+            providerMessage = "Metadata: " + track.title
+                    + (track.artist.isEmpty() ? "" : " — " + track.artist);
+            showTrackArtwork(track);
+            showTracks(java.util.Collections.singletonList(track));
+        });
+    }
+
+    private void showTracks(List<MediaTrack> tracks) {
+        results.removeAllViews();
+        for (MediaTrack track : tracks) {
+            Button row = new Button(this);
+            row.setText(track.displayText());
+            row.setOnClickListener(view -> playTrack(track));
+            results.addView(row, new LinearLayout.LayoutParams(-1, -2));
+        }
+        if (tracks.isEmpty()) providerMessage = "No results";
+        else if (providerMessage.isEmpty()) providerMessage = tracks.size() + " result(s)";
+        stateText.setText(stateLabel(controller == null ? PlaybackController.IDLE : controller.state())
+                + "\n" + providerMessage);
+    }
+
+    private void playTrack(MediaTrack track) {
+        if (controller == null || providers == null) return;
+        PlaybackTrace trace = new PlaybackTrace(track.providerId);
+        showTrackArtwork(track);
+        providerMessage = "Resolving playable source for " + track.title;
+        stateText.setText("Resolving playable source: " + track.displayText());
+        startPlaybackService();
+        controller.playTrack(track, providers, trace, (resolvedTrack, error) -> {
+            if (error != null) { providerMessage = "Source error: " + error; stateText.setText(error); return; }
+            providerMessage = "Source resolved; starting decoder for " + track.displayText();
+            stateText.setText(providerMessage);
+        });
+    }
+
+    private void startPlaybackService() {
+        Intent service = new Intent(this, ForegroundPlaybackService.class);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(service);
+        else startService(service);
+    }
+
+    private void showTrackArtwork(MediaTrack track) {
+        if (providers == null || artworkView == null) return;
+        String expectedId = track.providerId;
+        activeArtworkId = expectedId;
+        artworkView.setImageDrawable(null);
+        providers.loadArtwork(track, (bitmap, error) -> {
+            if (!destroyed && bitmap != null && expectedId.equals(activeArtworkId)) {
+                artworkView.setImageBitmap(bitmap);
             }
-            output.start(activeEngine);
         });
-    }
-
-    private void togglePause() {
-        long activeEngine = engine;
-        if (activeEngine == 0) return;
-        commands.execute(() -> {
-            int state = TunefoldBridge.getPlaybackState(activeEngine);
-            if (state == STATE_PLAYING || state == STATE_BUFFERING) {
-                TunefoldBridge.pauseAudio(activeEngine);
-                output.pause();
-            } else if (state == STATE_PAUSED) {
-                TunefoldBridge.resumeAudio(activeEngine);
-            }
-        });
-    }
-
-    private void stopPlayback() {
-        long activeEngine = engine;
-        if (activeEngine == 0) return;
-        output.requestStop();
-        commands.execute(() -> {
-            output.awaitStopped();
-            TunefoldBridge.stopAudio(activeEngine);
-            postMessage("Stopped");
-        });
-    }
-
-    @Override public void onOutputMessage(String message) {
-        postMessage(message);
-    }
-
-    private void postMessage(String message) {
-        mainHandler.post(() -> {
-            if (!destroyed && stateText != null) stateText.setText(message);
-        });
-    }
-
-    private static String errorOrDefault(long handle, String fallback) {
-        String error = TunefoldBridge.getLastError(handle);
-        return error == null || error.isEmpty() ? fallback : error;
     }
 
     private static String stateLabel(int state) {
         switch (state) {
-            case STATE_BUFFERING: return "Buffering";
-            case STATE_PLAYING: return "Playing";
-            case STATE_PAUSED: return "Paused";
-            case STATE_STOPPED: return "Stopped";
-            case STATE_ERROR: return "Error";
+            case PlaybackController.LOADING: return "Loading";
+            case PlaybackController.PLAYING: return "Playing";
+            case PlaybackController.PAUSED: return "Paused";
+            case PlaybackController.STOPPED: return "Stopped";
+            case PlaybackController.ERROR: return "Error";
             default: return "Idle";
         }
     }
@@ -224,17 +224,8 @@ public final class MainActivity extends Activity implements AudioTrackOutput.Lis
     @Override protected void onDestroy() {
         destroyed = true;
         mainHandler.removeCallbacks(statePoll);
-        output.requestStop();
-        long oldEngine = engine;
-        engine = 0;
-        if (oldEngine != 0) {
-            commands.execute(() -> {
-                output.awaitStopped();
-                TunefoldBridge.stopAudio(oldEngine);
-                TunefoldBridge.destroyEngine(oldEngine);
-            });
-        }
-        commands.shutdown();
+        if (bound) unbindService(connection);
+        controller = null;
         super.onDestroy();
     }
 }

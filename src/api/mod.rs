@@ -14,7 +14,8 @@
 
 use crate::catalog::CatalogRegistry;
 use crate::media::{
-    MemoryResolutionCache, ResolverConfig, StreamRegistry, StreamResolver, TwoTierCache,
+    MemoryResolutionCache, ResolutionCache, ResolverConfig, StreamRegistry, StreamResolver,
+    TwoTierCache,
 };
 use std::sync::Arc;
 
@@ -28,7 +29,7 @@ pub struct ComposedMedia {
 fn assemble(
     catalog: CatalogRegistry,
     stream_registry: Arc<StreamRegistry>,
-    cache: Arc<TwoTierCache>,
+    cache: Arc<dyn ResolutionCache>,
     validator: Option<Arc<dyn crate::media::StreamValidator>>,
 ) -> ComposedMedia {
     let mut resolver = StreamResolver::new(stream_registry, cache, ResolverConfig::default());
@@ -41,7 +42,7 @@ fn assemble(
     }
 }
 
-fn cache_for(db: crate::infrastructure::db::Db) -> Arc<TwoTierCache> {
+fn cache_for(db: crate::infrastructure::db::Db) -> Arc<dyn ResolutionCache> {
     Arc::new(TwoTierCache::new(
         Arc::new(MemoryResolutionCache::default()),
         Arc::new(crate::infrastructure::storage::DbResolutionCache::new(db)),
@@ -83,6 +84,17 @@ pub fn compose_media(
     db: crate::infrastructure::db::Db,
     flags: &crate::infrastructure::config::FeatureFlags,
 ) -> ComposedMedia {
+    compose_media_configured(db, flags, None)
+}
+
+/// Composición del mismo catálogo/resolver con una ubicación explícita para
+/// la caché propia del cliente YouTube (Android aporta su directorio privado).
+#[cfg(feature = "youtube")]
+pub fn compose_media_configured(
+    db: crate::infrastructure::db::Db,
+    flags: &crate::infrastructure::config::FeatureFlags,
+    youtube_cache_dir: Option<std::path::PathBuf>,
+) -> ComposedMedia {
     use crate::providers::youtube::{YouTubeAdapter, YoutubeOptions, YoutubeProvider};
 
     // El adaptador solo existe si su flag lo habilita: apagado ⇒ cero
@@ -91,6 +103,7 @@ pub fn compose_media(
         Arc::new(YouTubeAdapter::from_inner(Arc::new(
             YoutubeProvider::with_options(YoutubeOptions {
                 disable_env_proxy: !flags.proxy,
+                cache_dir: youtube_cache_dir,
             }),
         )))
     });
@@ -113,6 +126,44 @@ pub fn compose_media(
     assemble(catalog, stream_registry, cache_for(db), validator)
 }
 
+/// Composition efímera para huéspedes como Android que ya proporcionan su
+/// propio contexto de datos y solo necesitan caché de resoluciones en memoria.
+#[cfg(feature = "youtube")]
+pub fn compose_media_in_memory(
+    flags: &crate::infrastructure::config::FeatureFlags,
+    youtube_cache_dir: Option<std::path::PathBuf>,
+) -> ComposedMedia {
+    use crate::providers::youtube::{YouTubeAdapter, YoutubeOptions, YoutubeProvider};
+
+    let adapter = flags.youtube_provider.then(|| {
+        Arc::new(YouTubeAdapter::from_inner(Arc::new(
+            YoutubeProvider::with_options(YoutubeOptions {
+                disable_env_proxy: !flags.proxy,
+                cache_dir: youtube_cache_dir,
+            }),
+        )))
+    });
+    let mut catalog = CatalogRegistry::new();
+    if let Some(adapter) = &adapter {
+        catalog.register(Box::new((**adapter).clone()));
+    }
+    let registry = Arc::new(StreamRegistry::new());
+    if let Some(adapter) = adapter.clone() {
+        registry.register(adapter.clone());
+    }
+    let validator: Option<Arc<dyn crate::media::StreamValidator>> =
+        adapter.map(|provider| provider as Arc<dyn crate::media::StreamValidator>);
+    let cache: Arc<dyn ResolutionCache> = Arc::new(MemoryResolutionCache::default());
+    let mut resolver = StreamResolver::new(registry, cache, ResolverConfig::default());
+    if let Some(validator) = validator {
+        resolver = resolver.with_validator(validator);
+    }
+    ComposedMedia {
+        catalog,
+        stream_resolver: Arc::new(resolver),
+    }
+}
+
 /// Sin la feature `youtube` no se registra ni se construye ningún cliente.
 #[cfg(not(feature = "youtube"))]
 pub fn compose_media(
@@ -125,6 +176,15 @@ pub fn compose_media(
         cache_for(db),
         None,
     )
+}
+
+#[cfg(not(feature = "youtube"))]
+pub fn compose_media_configured(
+    db: crate::infrastructure::db::Db,
+    flags: &crate::infrastructure::config::FeatureFlags,
+    _youtube_cache_dir: Option<std::path::PathBuf>,
+) -> ComposedMedia {
+    compose_media(db, flags)
 }
 
 #[cfg(test)]

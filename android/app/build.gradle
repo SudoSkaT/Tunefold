@@ -7,11 +7,12 @@ def androidSdkRoot = System.getenv('ANDROID_SDK_ROOT') ?: System.getenv('ANDROID
 if (!androidSdkRoot) {
     throw new GradleException('Set ANDROID_HOME or ANDROID_SDK_ROOT to an installed Android SDK')
 }
-def ndkRoot = "${androidSdkRoot}/ndk/28.2.13676358"
+def ndkRoot = System.getenv('TUNEFOLD_NDK_ROOT') ?: "${androidSdkRoot}/ndk/28.2.13676358"
 def ndkHost = 'linux-x86_64'
 def toolchainBin = "${ndkRoot}/toolchains/llvm/prebuilt/${ndkHost}/bin"
 def generatedJni = layout.buildDirectory.dir('generated/rustJniLibs')
 def generatedJniPath = generatedJni.get().asFile
+def youtubeEnabled = providers.gradleProperty('tunefoldYoutube').map { it.toBoolean() }.getOrElse(false)
 def rustTargets = [
     [suffix: 'Arm64', abi: 'arm64-v8a', target: 'aarch64-linux-android', env: 'AARCH64_LINUX_ANDROID', cc: 'aarch64_linux_android'],
     [suffix: 'X86_64', abi: 'x86_64', target: 'x86_64-linux-android', env: 'X86_64_LINUX_ANDROID', cc: 'x86_64_linux_android']
@@ -29,7 +30,10 @@ android {
         versionCode 1
         versionName '0.1.0-runtime'
         ndk { abiFilters 'arm64-v8a', 'x86_64' }
+        buildConfigField 'boolean', 'YOUTUBE_ENABLED', youtubeEnabled.toString()
     }
+
+    buildFeatures { buildConfig true }
 
     sourceSets {
         main.jniLibs.srcDir(generatedJniPath)
@@ -43,10 +47,14 @@ def rustBuildTasks = rustTargets.collect { rustTarget ->
                 "target/${rustTarget.target}/release/libtunefold.so")
         workingDir repositoryRoot
         commandLine 'cargo', 'build', '--lib', '--release', '--target', rustTarget.target,
-            '--no-default-features', '--features', 'android'
+            '--no-default-features', '--features', youtubeEnabled ? 'android-youtube' : 'android'
         environment "CARGO_TARGET_${rustTarget.env}_LINKER", rustLinker
         environment "CC_${rustTarget.cc}", rustLinker
         environment "AR_${rustTarget.cc}", "${toolchainBin}/llvm-ar"
+        if (youtubeEnabled) {
+            def ndkSysroot = "${ndkRoot}/toolchains/llvm/prebuilt/${ndkHost}/sysroot"
+            environment 'BINDGEN_EXTRA_CLANG_ARGS', "--sysroot=${ndkSysroot}"
+        }
         inputs.files fileTree(repositoryRoot) {
             include 'Cargo.toml', 'Cargo.lock', 'build.rs', 'src/**'
         }

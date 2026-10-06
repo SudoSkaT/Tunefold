@@ -23,6 +23,9 @@ default = ["clipboard", "rodio"]
 youtube = ["dep:rustypipe"]
 # Android platform (JNI bridge + Oboe audio backend). Requires NDK + cargo-ndk.
 android = ["dep:jni", "dep:symphonia", "symphonia/ogg"]
+# Custom Android builds may explicitly include the separately licensed and
+# ToS-sensitive optional YouTube provider; official builds keep `android` only.
+android-youtube = ["android", "youtube", "dep:rquickjs-core", "rquickjs-core/bindgen"]
 # Desktop clipboard support (arboard). Disabled on Android.
 clipboard = ["dep:arboard"]
 # Desktop audio backend (rodio/cpal). Disabled on Android.
@@ -37,6 +40,9 @@ futures-util = "0.3"
 rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-all"], optional = true }
 symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4", "alac", "adpcm", "pcm", "vorbis", "flac", "wav"], optional = true }
 rustypipe = { version = "0.11.4", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+# rustypipe's bundled QuickJS bindings omit Android triples; the custom Android
+# YouTube feature generates bindings for the active NDK target using libclang.
+rquickjs-core = { version = "0.9", features = ["bindgen"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"

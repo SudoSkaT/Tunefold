@@ -141,6 +141,18 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
         .decoder_diagnostics
         .analysis_frames
         .store(0, Ordering::Release);
+    for metric in [
+        &engine.decoder_diagnostics.http_open_us,
+        &engine.decoder_diagnostics.first_response_us,
+        &engine.decoder_diagnostics.probe_us,
+        &engine.decoder_diagnostics.first_decode_us,
+        &engine.decoder_diagnostics.first_pcm_us,
+        &engine.decoder_diagnostics.range_requests,
+        &engine.decoder_diagnostics.range_bytes,
+        &engine.decoder_diagnostics.range_elapsed_ms,
+    ] {
+        metric.store(0, Ordering::Release);
+    }
     if let Ok(mut diagnostic) = engine.decoder_diagnostics.stage.lock() {
         *diagnostic = "play requested; decoder starting".to_string();
     }
@@ -494,6 +506,44 @@ pub unsafe extern "C" fn tunefold_oboe_get_visual_state(
 // JNI functions called from Kotlin
 // ============================================================================
 
+fn encode_http_headers(
+    headers: Vec<(String, String)>,
+) -> Result<(std::ffi::CString, usize), String> {
+    let mut lines = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        if name.is_empty()
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+            || value.contains(['\r', '\n', '\0'])
+        {
+            return Err("Invalid HTTP header received from provider".to_string());
+        }
+        lines.push(format!("{name}: {value}"));
+    }
+    let count = lines.len();
+    let encoded = std::ffi::CString::new(lines.join("\n"))
+        .map_err(|_| "HTTP headers contain a NUL byte".to_string())?;
+    Ok((encoded, count))
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_createEngine(
     _env: JNIEnv,
@@ -508,6 +558,7 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_playStream(
     _class: JClass,
     handle: jlong,
     url: JString,
+    headers_json: JString,
 ) -> jboolean {
     if handle == 0 {
         let _ = env.throw_new(
@@ -533,13 +584,33 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_playStream(
             return JNI_FALSE;
         }
     };
-    let empty_headers = std::ffi::CString::default();
+    let headers_json = match env.get_string(&headers_json) {
+        Ok(value) => value.to_string_lossy().into_owned(),
+        Err(error) => {
+            let _ = env.throw_new("java/lang/IllegalArgumentException", error.to_string());
+            return JNI_FALSE;
+        }
+    };
+    let headers: Vec<(String, String)> = match serde_json::from_str(&headers_json) {
+        Ok(headers) => headers,
+        Err(error) => {
+            let _ = env.throw_new("java/lang/IllegalArgumentException", error.to_string());
+            return JNI_FALSE;
+        }
+    };
+    let (headers, header_count) = match encode_http_headers(headers) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = env.throw_new("java/lang/IllegalArgumentException", error);
+            return JNI_FALSE;
+        }
+    };
     unsafe {
         tunefold_oboe_play_stream(
             handle as *mut AndroidEngine,
             url.as_ptr(),
-            empty_headers.as_ptr(),
-            0,
+            headers.as_ptr(),
+            header_count,
         );
         if tunefold_oboe_get_playback_state(handle as *mut AndroidEngine) == STATE_ERROR {
             JNI_FALSE
@@ -760,7 +831,7 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_getRuntimeDiagnostic
             waveform.left.peak().max(waveform.right.peak())
         });
     let message = format!(
-        "{diagnostic}\npackets={} decoded={}f ring={}f analysis={}f output={}f waveform={analysis_peak:.3}",
+        "{diagnostic}\npackets={} decoded={}f ring={}f analysis={}f output={}f waveform={analysis_peak:.3}\nhttp_open_us={} first_response_us={} probe_us={} first_decode_us={} first_pcm_us={} range_requests={} range_bytes={} range_elapsed_ms={}",
         engine
             .decoder_diagnostics
             .decoded_packets
@@ -778,6 +849,14 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_getRuntimeDiagnostic
             .analysis_frames
             .load(Ordering::Relaxed),
         engine.output_frames.load(Ordering::Relaxed),
+        engine.decoder_diagnostics.http_open_us.load(Ordering::Relaxed),
+        engine.decoder_diagnostics.first_response_us.load(Ordering::Relaxed),
+        engine.decoder_diagnostics.probe_us.load(Ordering::Relaxed),
+        engine.decoder_diagnostics.first_decode_us.load(Ordering::Relaxed),
+        engine.decoder_diagnostics.first_pcm_us.load(Ordering::Relaxed),
+        engine.decoder_diagnostics.range_requests.load(Ordering::Relaxed),
+        engine.decoder_diagnostics.range_bytes.load(Ordering::Relaxed),
+        engine.decoder_diagnostics.range_elapsed_ms.load(Ordering::Relaxed),
     );
     env.new_string(message)
         .map(|value| value.into_raw())
@@ -846,4 +925,31 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_clearSurface(
     _class: JClass,
     _handle: jlong,
 ) {
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::encode_http_headers;
+
+    #[test]
+    fn provider_headers_encode_as_http_lines() {
+        let (headers, count) = encode_http_headers(vec![
+            ("User-Agent".into(), "Tunefold/1".into()),
+            ("Referer".into(), "https://example.test/".into()),
+        ])
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            headers.to_str().unwrap(),
+            "User-Agent: Tunefold/1\nReferer: https://example.test/"
+        );
+    }
+
+    #[test]
+    fn provider_headers_reject_line_injection() {
+        assert!(
+            encode_http_headers(vec![("X-Test".into(), "safe\r\nInjected: yes".into())]).is_err()
+        );
+        assert!(encode_http_headers(vec![("Bad:Name".into(), "value".into())]).is_err());
+    }
 }

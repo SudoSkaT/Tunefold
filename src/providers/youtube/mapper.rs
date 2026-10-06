@@ -4,7 +4,7 @@
 //! de rustypipe NO salen de este módulo; hacia dentro solo llegan modelos de
 //! dominio ya firmados.
 
-use rustypipe::model::TrackItem;
+use rustypipe::model::{TrackItem, VideoDetails};
 
 use crate::domain::source::Source;
 use crate::domain::track::Thumbnail as TrackThumbnail;
@@ -29,15 +29,7 @@ pub(crate) fn map_track(item: &TrackItem) -> Track {
         })
         .collect();
 
-    let mut track = Track::new(
-        item.name.clone(),
-        if artists.is_empty() {
-            vec![Artist::new("Desconocido".to_string(), None, None, None)]
-        } else {
-            artists
-        },
-        Source::YouTube,
-    );
+    let mut track = Track::new(item.name.clone(), artists, Source::YouTube);
     track.external_id = Some(item.id.clone());
     track.thumbnail = best_thumbnail(&item.cover).map(|url| TrackThumbnail { url });
     if let Some(secs) = item.duration {
@@ -48,6 +40,25 @@ pub(crate) fn map_track(item: &TrackItem) -> Track {
         .as_ref()
         .map(|a| Album::new(a.name.clone(), None, None, None));
     track.url = Some(format!("https://www.youtube.com/watch?v={}", item.id));
+    track
+}
+
+/// Mapea un video general cuando no está catalogado como track de YouTube
+/// Music. El canal se conserva como canal y la duración permanece desconocida.
+pub(crate) fn map_video(details: &VideoDetails) -> Track {
+    let channel = Artist::channel(
+        details.channel.name.clone(),
+        Some(details.channel.id.clone()),
+        best_thumbnail(&details.channel.avatar),
+    );
+    let mut track = Track::new(details.name.clone(), vec![channel], Source::YouTube);
+    track.external_id = Some(details.id.clone());
+    // `VideoDetails` does not expose the video thumbnail list in Rustypipe;
+    // YouTube's stable video thumbnail endpoint is the provider fallback.
+    track.thumbnail = Some(TrackThumbnail {
+        url: format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", details.id),
+    });
+    track.url = Some(format!("https://www.youtube.com/watch?v={}", details.id));
     track
 }
 
@@ -100,5 +111,15 @@ mod tests {
             track.thumbnail.as_ref().map(|t| t.url.as_str()),
             Some("cover.jpg")
         );
+    }
+
+    #[test]
+    fn missing_artist_stays_missing() {
+        use rustypipe::model::TrackItem;
+        let item: TrackItem = serde_json::from_str(
+            r#"{"id":"dQw4w9WgXcQ","name":"Title","duration":null,"track_type":"track","by_va":false,"cover":[],"artists":[],"album":null}"#,
+        )
+        .unwrap();
+        assert!(map_track(&item).artists.is_empty());
     }
 }

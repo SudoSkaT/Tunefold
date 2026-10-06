@@ -11,7 +11,7 @@ final class TunefoldBridge {
 
     static native long createEngine();
     static native void destroyEngine(long handle);
-    static native boolean playStream(long handle, String url);
+    static native boolean playStream(long handle, String url, String headersJson);
     static native void pauseAudio(long handle);
     static native void resumeAudio(long handle);
     static native void stopAudio(long handle);
@@ -25,4 +25,9 @@ final class TunefoldBridge {
     static native void reportAudioError(long handle, String error);
     static native void getVisualState(long handle, float[] features, float[] bars);
     static native String getRuntimeDiagnostics(long handle);
+
+    static native boolean initializeYoutube(String cacheDir);
+    static native String searchYoutube(String query, int limit);
+    static native String resolveYoutubeUrl(String url);
+    static native String resolveYoutubeSource(String trackJson);
 }

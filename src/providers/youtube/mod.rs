@@ -21,7 +21,12 @@ use chrono::Utc;
 
 pub mod link;
 pub mod mapper;
+#[cfg(feature = "youtube")]
+pub(crate) mod metadata_cache;
 pub mod provider;
+
+#[cfg(all(feature = "android", feature = "youtube"))]
+mod android;
 
 pub use provider::{
     classify_rp_error, context_headers, CategorizedFail, YoutubeOptions, YoutubeProvider,

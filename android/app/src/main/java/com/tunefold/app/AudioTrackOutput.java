@@ -23,11 +23,15 @@ final class AudioTrackOutput {
     }
 
     void start(long engine) {
+        start(engine, null);
+    }
+
+    void start(long engine, PlaybackTrace trace) {
         requestStop();
         joinWorker(0);
         synchronized (this) {
             running = true;
-            worker = new Thread(() -> pump(engine), "tunefold-audio-output");
+            worker = new Thread(() -> pump(engine, trace), "tunefold-audio-output");
             worker.start();
         }
     }
@@ -73,14 +77,15 @@ final class AudioTrackOutput {
         if (!current.isAlive()) worker = null;
     }
 
-    private void pump(long engine) {
+    private void pump(long engine, PlaybackTrace trace) {
         AudioTrack localTrack = null;
+        boolean firstWriteMarked = false;
         ByteBuffer pcm = ByteBuffer.allocateDirect(CHUNK_FRAMES * 2 * Float.BYTES)
                 .order(ByteOrder.nativeOrder());
         try {
             while (running) {
                 int state = TunefoldBridge.getPlaybackState(engine);
-                if (state == MainActivity.STATE_ERROR) {
+                if (state == PlaybackController.ERROR) {
                     message(TunefoldBridge.getLastError(engine));
                     return;
                 }
@@ -89,10 +94,10 @@ final class AudioTrackOutput {
                 int available = TunefoldBridge.getAvailableFrames(engine);
                 if (sampleRate <= 0 || available <= 0) {
                     if (TunefoldBridge.isDecoderFinished(engine)) {
-                        if (state == MainActivity.STATE_BUFFERING) {
+                        if (state == PlaybackController.LOADING) {
                             message(nonEmptyError(engine, "Decoder finished before audio output started"));
                         } else {
-                            TunefoldBridge.setOutputState(engine, MainActivity.STATE_STOPPED);
+                            TunefoldBridge.setOutputState(engine, PlaybackController.STOPPED);
                         }
                         return;
                     }
@@ -104,22 +109,23 @@ final class AudioTrackOutput {
                     localTrack = createTrack(sampleRate);
                     track = localTrack;
                     localTrack.play();
-                    TunefoldBridge.setOutputState(engine, MainActivity.STATE_PLAYING);
+                    TunefoldBridge.setOutputState(engine, PlaybackController.PLAYING);
+                    if (trace != null) trace.mark("T10_AUDIOTRACK_PLAY");
                     message("AudioTrack started at " + sampleRate + " Hz");
                 }
 
                 state = TunefoldBridge.getPlaybackState(engine);
-                if (state == MainActivity.STATE_PAUSED) {
+                if (state == PlaybackController.PAUSED) {
                     if (localTrack.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
                         localTrack.pause();
                     }
                     sleepBriefly();
                     continue;
                 }
-                if (state == MainActivity.STATE_BUFFERING
+                if (state == PlaybackController.LOADING
                         && localTrack.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) {
                     localTrack.play();
-                    TunefoldBridge.setOutputState(engine, MainActivity.STATE_PLAYING);
+                    TunefoldBridge.setOutputState(engine, PlaybackController.PLAYING);
                 }
 
                 pcm.clear();
@@ -133,6 +139,10 @@ final class AudioTrackOutput {
                 pcm.limit(bytes);
                 while (running && pcm.hasRemaining()) {
                     int written = localTrack.write(pcm, pcm.remaining(), AudioTrack.WRITE_BLOCKING);
+                    if (trace != null && !firstWriteMarked && written > 0) {
+                        firstWriteMarked = true;
+                        trace.mark("T11_FIRST_AUDIOTRACK_WRITE");
+                    }
                     if (written < 0) {
                         throw new IllegalStateException("AudioTrack.write failed: " + written);
                     }

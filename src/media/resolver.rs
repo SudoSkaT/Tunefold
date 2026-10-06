@@ -119,6 +119,8 @@ pub struct StreamResolver {
     cache: Arc<dyn ResolutionCache>,
     validator: Option<Arc<dyn StreamValidator>>,
     config: ResolverConfig,
+    cache_hits: std::sync::atomic::AtomicU64,
+    cache_misses: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for StreamResolver {
@@ -141,6 +143,8 @@ impl StreamResolver {
             cache,
             validator: None,
             config,
+            cache_hits: std::sync::atomic::AtomicU64::new(0),
+            cache_misses: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -156,6 +160,15 @@ impl StreamResolver {
 
     pub fn cache(&self) -> &Arc<dyn ResolutionCache> {
         &self.cache
+    }
+
+    /// Cumulative cache decisions; useful to report per-play deltas at adapters.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.cache_hits.load(Ordering::Relaxed),
+            self.cache_misses.load(Ordering::Relaxed),
+        )
     }
 
     /// Invalida la resolución cacheada de un track (p. ej. fallo en caliente
@@ -184,6 +197,8 @@ impl StreamResolver {
         // ------------------------------------------------------- caché
         if let Some(mut cached) = self.cache.get(&key).await {
             if cached.is_expired() {
+                self.cache_misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(key = %key, "stream_expired: entrada de caché caducada");
                 self.cache.invalidate(&key).await;
             } else {
@@ -199,11 +214,18 @@ impl StreamResolver {
                         provider = %cached.provider,
                         "resolution_cache_hit"
                     );
+                    self.cache_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(cached);
                 }
+                self.cache_misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(key = %key, "resolution_cache_hit_stale");
                 self.cache.invalidate(&key).await;
             }
+        } else {
+            self.cache_misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         tracing::debug!(key = %key, "resolution_started");
@@ -420,11 +442,13 @@ mod tests {
 
         let first = r.resolve(&yt_track("v1")).await.unwrap();
         assert_eq!(first.uri, "https://cdn.fake/one");
+        assert_eq!(r.cache_stats(), (0, 1));
 
         // Segunda resolución: servida de caché, cero llamadas nuevas.
         let second = r.resolve(&yt_track("v1")).await.unwrap();
         assert_eq!(second.uri, "https://cdn.fake/one");
         assert_eq!(a.call_count(), 1);
+        assert_eq!(r.cache_stats(), (1, 1));
     }
 
     #[tokio::test]
@@ -442,6 +466,7 @@ mod tests {
         let r = resolver(reg, cache.clone(), fast_policy());
         let res = r.resolve(&yt_track("v1")).await.unwrap();
         assert_eq!(res.uri, "https://cdn.fake/fresh");
+        assert_eq!(r.cache_stats(), (0, 1));
         assert_eq!(a.call_count(), 1);
         assert_eq!(
             cache.get("v1").await.unwrap().uri,

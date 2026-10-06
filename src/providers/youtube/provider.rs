@@ -19,6 +19,7 @@ use rustypipe::client::{ClientType, RustyPipe};
 use rustypipe::model::{MusicAlbum, MusicArtist};
 
 use super::mapper::{best_thumbnail, map_track, THUMB_FALLBACK};
+use super::metadata_cache::MetadataCache;
 use crate::catalog::{CatalogError as ProviderError, CatalogProvider};
 use crate::domain::source::Source;
 use crate::domain::{album::Album, artist::Artist, track::Track};
@@ -74,11 +75,13 @@ const FAR_PROBE_START: u64 = 1536 * 1024;
 const FAR_PROBE_LEN: u64 = 64 * 1024;
 
 /// Opciones de construcción del proveedor.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct YoutubeOptions {
     /// Ignorar los proxies del entorno (`PROXY_ENABLED=false`): todos los
     /// clientes HTTP internos se construyen con `.no_proxy()`.
     pub disable_env_proxy: bool,
+    /// Ubicación privada del caché cuando el host no usa rutas XDG (Android).
+    pub cache_dir: Option<std::path::PathBuf>,
 }
 
 pub struct YoutubeProvider {
@@ -101,6 +104,7 @@ pub struct YoutubeProvider {
     /// espera el resultado del primero en vez de duplicar toda la ronda (y
     /// arriesgar el anti-bot con peticiones encadenadas).
     inflight: Arc<InflightRegistry>,
+    metadata_cache: MetadataCache,
 }
 
 /// Resultado de una resolución de stream compartido entre hilos concurrentes
@@ -133,8 +137,9 @@ impl YoutubeProvider {
     /// Construye el proveedor con opciones (política de proxy).
     pub fn with_options(options: YoutubeOptions) -> Self {
         // Asegura el directorio de caché de rustypipe (usage en write).
-        let cache_dir = cache_dir();
+        let cache_dir = options.cache_dir.unwrap_or_else(cache_dir);
         let _ = std::fs::create_dir_all(&cache_dir);
+        let metadata_cache = MetadataCache::new(cache_dir.join("track_metadata"));
         let client = RustyPipe::builder()
             .storage_dir(cache_dir.to_str().unwrap_or("data/youtube"))
             .build()
@@ -167,6 +172,7 @@ impl YoutubeProvider {
             next_primary: std::sync::atomic::AtomicU8::new(0),
             stream_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            metadata_cache,
         }
     }
 
@@ -670,13 +676,22 @@ impl CatalogProvider for YoutubeProvider {
     }
 
     async fn get_track(&self, external_id: &str) -> Result<Track, ProviderError> {
-        let details = self
-            .client
-            .query()
-            .music_details(external_id)
-            .await
-            .map_err(|e| map_error(e, "music_details"))?;
-        Ok(map_track(&details.track))
+        if let Some(track) = self.metadata_cache.get(external_id) {
+            return Ok(track);
+        }
+        let track = match self.client.query().music_details(external_id).await {
+            Ok(details) => Ok(map_track(&details.track)),
+            Err(music_error) => match self.client.query().video_details(external_id).await {
+                Ok(details) => Ok(super::mapper::map_video(&details)),
+                Err(video_error) => Err(ProviderError::Other(format!(
+                    "metadata unavailable (Music: {}; video: {})",
+                    map_error(music_error, "music_details"),
+                    map_error(video_error, "video_details")
+                ))),
+            },
+        }?;
+        self.metadata_cache.put(&track);
+        Ok(track)
     }
 
     async fn get_artist(&self, external_id: &str) -> Result<Artist, ProviderError> {

@@ -57,6 +57,19 @@ async fn streams_across_many_windows_over_one_mib_without_premature_eof() {
     assert!(server.request_count() >= n / (128 * 1024));
 }
 
+#[tokio::test]
+async fn seek_to_refetches_the_requested_byte_range() {
+    let data = payload(512 * 1024);
+    let server = FakeServer::start(Scenario::Normal(data.clone())).await;
+    let mut stream = open(&server, test_policy(64)).await;
+
+    let first = stream.next_chunk(16).await.unwrap().unwrap();
+    assert_eq!(first, data[..16]);
+    stream.seek_to(128 * 1024 + 7).await.unwrap();
+    let sought = stream.next_chunk(32).await.unwrap().unwrap();
+    assert_eq!(sought, data[128 * 1024 + 7..128 * 1024 + 39]);
+}
+
 /// El techo posicional se reporta como `Restricted` DESPUÉS de entregar el
 /// prefijo servible íntegro.
 #[tokio::test]
