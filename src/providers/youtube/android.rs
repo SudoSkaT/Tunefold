@@ -134,8 +134,11 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_relatedYoutube(
     mut env: JNIEnv,
     _class: JClass,
     video_id: JString,
-    limit: jint,
+    _limit: jint,
 ) -> jstring {
+    // The limit is accepted for symmetry with the other JNI entry points, but the
+    // Android layer owns selection and dedup, so the provider returns its own
+    // list untouched.
     let video_id = match read_string(&mut env, &video_id) {
         Ok(id) if !id.trim().is_empty() => id,
         _ => return return_json(&mut env, failure("invalid_request", "video id is empty")),

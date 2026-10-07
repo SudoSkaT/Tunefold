@@ -39,6 +39,15 @@ final class TrackDownloader implements AutoCloseable {
     private static final long POLL_MS = 200;
     /** Progress is only reported once this many bytes moved, to keep it cheap. */
     private static final long PROGRESS_STEP_BYTES = 64 * 1024;
+    /**
+     * How long source resolution may take before the download fails.
+     *
+     * <p>Resolution is a network call to a provider that can hang. Without a
+     * deadline the button would read "Resolving source" forever and cancelling
+     * would only change the label, leaving the user with no outcome and no way
+     * forward (§26).
+     */
+    private static final long RESOLVE_TIMEOUT_MS = 30_000;
 
     interface Observer { void onDownloadChanged(TrackKey key, DownloadState state); }
 
@@ -153,24 +162,67 @@ final class TrackDownloader implements AutoCloseable {
         }
         registry.beginResolving(key);
         PlaybackTrace.markCurrent(PlaybackTrace.DOWNLOAD_START, "id=" + key);
-        providers.playableSource(track, null, (source, failure) -> {
-            if (closed) return;
-            if (failure != null || source == null) {
-                registry.fail(key, failure == null ? "Source resolution failed" : failure);
-                return;
-            }
-            if (!registry.canStart(key)) return;
-            long id = TunefoldBridge.startDownload(engineHandle, directory.getAbsolutePath(),
-                    key.provider(), key.providerTrackId(), source.url, source.headersJson);
-            if (id <= 0) {
-                registry.fail(key, "Download could not start");
-                return;
-            }
-            Job job = new Job(key, track, id);
-            synchronized (jobs) { jobs.put(key, job); }
-            poll(job);
-        });
+        // Deadline for this attempt. Guards the case where the resolver never
+        // calls back at all, which would otherwise strand the state machine.
+        Job pending = new Job(key, track, 0);
+        scheduleResolveTimeout(pending);
+        providers.playableSource(track, null, (source, failure) ->
+                main.post(() -> onSourceResolved(pending, source, failure)));
         return true;
+    }
+
+    /** Fails a download whose source resolution never answered. */
+    private void scheduleResolveTimeout(Job pending) {
+        main.postDelayed(() -> {
+            if (closed) return;
+            TrackKey key = pending.key;
+            if (registry.stateOf(key).phase != DownloadState.Phase.RESOLVING_SOURCE) return;
+            Log.i(TAG, "event=DOWNLOAD_RESOLVE_TIMEOUT id=" + key);
+            registry.fail(key, "Source resolution timed out");
+        }, RESOLVE_TIMEOUT_MS);
+    }
+
+    /**
+     * Starts the transfer once a source exists.
+     *
+     * <p>Isolated so a throw here becomes a reported failure instead of a
+     * download frozen in RESOLVING_SOURCE forever.
+     */
+    private void onSourceResolved(Job pending, PlayableSource source, String failure) {
+        if (closed) return;
+        TrackKey key = pending.key;
+        if (failure != null || source == null) {
+            registry.fail(key, failure == null ? "Source resolution failed" : failure);
+            return;
+        }
+        // Deliberately NOT registry.canStart(): that answers "may the user start
+        // a download", and it counts RESOLVING_SOURCE as already running, so it
+        // refused the attempt that set it. Here the question is whether THIS
+        // attempt is still the live one.
+        if (registry.stateOf(key).phase != DownloadState.Phase.RESOLVING_SOURCE) {
+            Log.i(TAG, "event=DOWNLOAD_SUPERSEDED id=" + key);
+            return;
+        }
+        if (registry.isDownloaded(key)) {
+            registry.alreadyDownloaded(key, registry.storedSize(key));
+            Log.i(TAG, "event=DOWNLOAD_ALREADY_EXISTS id=" + key);
+            return;
+        }
+        long id;
+        try {
+            id = TunefoldBridge.startDownload(engineHandle, directory.getAbsolutePath(),
+                    key.provider(), key.providerTrackId(), source.url, source.headersJson);
+        } catch (Throwable failureStarting) {
+            registry.fail(key, "Download could not start: " + failureStarting);
+            return;
+        }
+        if (id <= 0) {
+            registry.fail(key, "Download could not start");
+            return;
+        }
+        Job job = new Job(key, pending.track, id);
+        synchronized (jobs) { jobs.put(key, job); }
+        poll(job);
     }
 
     /** Cancels an in-flight download. The {@code .part} file is removed. */

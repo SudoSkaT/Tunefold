@@ -22,6 +22,8 @@ public final class ForegroundPlaybackService extends Service {
 
     private final LocalBinder binder = new LocalBinder();
     private final Handler handler = new Handler(Looper.getMainLooper());
+    /** Stable observer identity so add and remove pair up. */
+    private final PlaybackSession.Observer sessionObserver = this::onSessionChanged;
 
     private PlaybackController controller;
     private ProviderRegistry providers;
@@ -47,9 +49,10 @@ public final class ForegroundPlaybackService extends Service {
         library.load();
         providers = new ProviderRegistry();
         session = new PlaybackSession(controller, providers, library);
-        session.addObserver(this::onSessionChanged);
+        session.addObserver(sessionObserver);
 
         providers.initialize(new java.io.File(getCacheDir(), "rustypipe").getAbsolutePath(),
+                new java.io.File(getFilesDir(), "media").getAbsolutePath(),
                 (ready, error) -> {
                     if (ready) attachDownloader();
                     else if (error != null) Log.i(TAG, error);
@@ -75,19 +78,33 @@ public final class ForegroundPlaybackService extends Service {
         // System media controls and the notification send their commands here, so
         // they land on exactly the same session the UI drives (§17).
         String action = intent == null ? null : intent.getAction();
-        if (action != null && session != null) {
-            switch (action) {
-                case PlaybackNotification.ACTION_TOGGLE: session.togglePause(); break;
-                case PlaybackNotification.ACTION_NEXT: session.next(); break;
-                case PlaybackNotification.ACTION_PREVIOUS: session.previous(); break;
-                case PlaybackNotification.ACTION_STOP: session.stop(); break;
-                default: break;
-            }
+        if (action != null) {
+            dispatchCommand(action);
             if (!foreground) startForegroundIfNeeded();
             return START_STICKY;
         }
         startForegroundIfNeeded();
         return START_STICKY;
+    }
+
+    /**
+     * The single place a transport command turns into a session call.
+     *
+     * <p>Used by the notification intents, by the system (lock screen, headset,
+     * Bluetooth) and by the MediaSession callback, so every external control
+     * reaches the same {@link PlaybackController} with no second playback path.
+     */
+    void dispatchCommand(String action) {
+        if (session == null || action == null) return;
+        switch (action) {
+            case PlaybackNotification.ACTION_TOGGLE: session.togglePause(); break;
+            case PlaybackNotification.ACTION_PLAY: session.setPlaying(true); break;
+            case PlaybackNotification.ACTION_PAUSE: session.setPlaying(false); break;
+            case PlaybackNotification.ACTION_NEXT: session.next(); break;
+            case PlaybackNotification.ACTION_PREVIOUS: session.previous(); break;
+            case PlaybackNotification.ACTION_STOP: session.stop(); break;
+            default: break;
+        }
     }
 
     @Override public IBinder onBind(Intent intent) { return binder; }
@@ -99,7 +116,10 @@ public final class ForegroundPlaybackService extends Service {
             if (downloader == null) attachDownloader();
             controller.refresh();
             if (notification != null) {
-                notification.updatePosition(controller.positionMs(), 1f);
+                // The session owns the position, so the lock screen cannot drift
+                // away from what the app shows or inherit the previous track's time.
+                notification.updatePosition(
+                        session == null ? 0L : session.snapshot().positionMs, 1f);
             }
             handler.postDelayed(this, 500);
         }
@@ -145,7 +165,7 @@ public final class ForegroundPlaybackService extends Service {
     @Override public void onDestroy() {
         handler.removeCallbacks(poll);
         if (downloader != null) downloader.close();
-        if (session != null) session.removeObserver(this::onSessionChanged);
+        if (session != null) session.removeObserver(sessionObserver);
         if (controller != null) controller.release();
         if (providers != null) providers.close();
         if (notification != null) {

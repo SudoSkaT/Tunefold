@@ -12,7 +12,14 @@ final class PlaybackController implements AudioTrackOutput.Listener {
     interface Observer { void onPlaybackChanged(); }
     interface TrackCallback { void onTrack(MediaTrack track, String error); }
     /** Notified once when the current track reaches its end of media. */
-    interface TrackFinishedListener { void onTrackFinished(); }
+    /**
+     * Reports the end of a track, tagged with the play attempt that produced it.
+     *
+     * <p>The tag is what makes a stale end-of-track detectable: without it a
+     * decoder from a superseded attempt is indistinguishable from the one the
+     * user is actually hearing, and the queue advances for no reason.
+     */
+    interface TrackFinishedListener { void onTrackFinished(long attempt); }
     /** Notified once the engine accepted the source and is starting output. */
     interface SourceStartedListener { void onSourceStarted(); }
 
@@ -99,19 +106,20 @@ final class PlaybackController implements AudioTrackOutput.Listener {
                 fail(readError(handle, "Could not start stream"));
                 return;
             }
-            output.start(handle, trace);
+            output.start(handle, trace, startedCallback);
+            startedCallback = null;
             refresh();
         });
     }
 
-    /** Set for the play currently starting; consumed once output begins. */
+    /**
+     * Set for the play currently starting; consumed once output actually begins.
+     *
+     * <p>This is the only signal that the engine is playing <em>this</em> source:
+     * until it fires, the engine's position still belongs to whatever played
+     * before, so the session must not report it.
+     */
     private volatile Runnable startedCallback;
-
-    private void notifySourceStarted() {
-        Runnable callback = startedCallback;
-        startedCallback = null;
-        if (callback != null) callback.run();
-    }
 
     void playTrack(MediaTrack track, ProviderRegistry providers, PlaybackTrace trace,
                    TrackCallback callback) {
@@ -200,12 +208,25 @@ final class PlaybackController implements AudioTrackOutput.Listener {
      * <p>Used by Previous when the track has been playing long enough that the
      * user means "start again" rather than "go back".
      */
-    void restartCurrent() {
-        // There is no seek in the Android pipeline: the honest implementation is
-        // to replay the same source, which is what a fresh play of the track is.
-        if (currentSource == null) return;
+    void restartCurrent() { restartCurrent(null); }
+
+    /**
+     * Replays the current source from the beginning.
+     *
+     * <p>There is no seek in the Android pipeline: the honest implementation is
+     * to replay the same source, which is what a fresh play of the track is.
+     * {@code onRestarted} fires when output begins again, so the caller can drop
+     * the old position instead of showing it during the restart.
+     */
+    void restartCurrent(Runnable onRestarted) {
+        if (currentSource == null) {
+            // Nothing to replay: report immediately so the caller is not left
+            // waiting for a signal that can never arrive.
+            if (onRestarted != null) onRestarted.run();
+            return;
+        }
         startPlaybackSource(currentSource, currentTrace,
-                operation.incrementAndGet(), null);
+                operation.incrementAndGet(), onRestarted);
     }
 
     private volatile PlayableSource currentSource;
@@ -230,7 +251,7 @@ final class PlaybackController implements AudioTrackOutput.Listener {
             // stops. Adopting the engine's STOPPED afterwards would clobber
             // whatever it just decided and briefly show "Stopped" mid-playback.
             if (listener != null) {
-                listener.onTrackFinished();
+                listener.onTrackFinished(operation.get());
                 return;
             }
         }
@@ -259,6 +280,14 @@ final class PlaybackController implements AudioTrackOutput.Listener {
     }
 
     int state() { return state; }
+
+    /**
+     * Id of the most recently requested play.
+     *
+     * <p>Doubles as the identity of the attempt that currently owns the engine,
+     * which is what the session matches end-of-track signals against.
+     */
+    long attempt() { return operation.get(); }
 
     /** Native engine handle, or 0 when the engine is not initialized. */
     long engineHandle() { return engine; }

@@ -61,6 +61,7 @@ final class PlaybackTrace {
     static final String QUEUE_NEXT = "QUEUE_NEXT";
     /** The queue moved back to the previous item. */
     static final String QUEUE_PREVIOUS = "QUEUE_PREVIOUS";
+    static final String STALE_EOF = "STALE_EOF";
     /** A track finished and autoplay took over. */
     static final String AUTOPLAY_TRIGGER = "AUTOPLAY_TRIGGER";
 

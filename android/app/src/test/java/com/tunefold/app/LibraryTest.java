@@ -12,6 +12,7 @@ import java.util.List;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /** L1K3D membership, persistence and recents (§5, §22, §29). */
@@ -145,6 +146,53 @@ public class LibraryTest {
         library.load();
         assertTrue(library.isEmpty());
         assertEquals(Collections.emptyList(), library.likedKeys());
+    }
+
+    @Test public void likedLabelsSurviveAReload() {
+        Library writer = new Library(directory);
+        writer.setLiked(track("a"), true);
+        writer.awaitWritesForTest();
+
+        Library reader = new Library(directory);
+        reader.loadFromForTest(writer.serialize());
+        assertEquals("the title comes back, not a bare provider id",
+                "Track a", reader.labelFor(TrackKey.of("YouTube", "a")));
+    }
+
+    @Test public void escapedLabelComesBackIntact() {
+        Library writer = new Library(directory);
+        writer.toggleLiked(TestTracks.of("YouTube", "a", "Odd | Title\nSecond line", 1_000L));
+        Library reader = new Library(directory);
+        reader.loadFromForTest(writer.serialize());
+        assertEquals("Odd | Title Second line",
+                reader.labelFor(TrackKey.of("YouTube", "a")));
+    }
+
+    @Test public void aTitleContainingTheSeparatorStaysParseable() {
+        // A title with the record separator and a newline in it.
+        Library writer = new Library(directory);
+        writer.toggleLiked(TestTracks.of("YouTube", "a", "Odd | Title\nSecond line", 1_000L));
+        String document = writer.serialize();
+        assertEquals("a line break in a title cannot forge a second record", 1,
+                document.split("\n", -1).length - 1);
+
+        Library reader = new Library(directory);
+        reader.loadFromForTest(document);
+        assertTrue("membership is intact", reader.isLiked(TestTracks.of("YouTube", "a")));
+    }
+
+    @Test public void unlikingForgetsTheLabel() {
+        Library writer = new Library(directory);
+        writer.toggleLiked(TestTracks.of("YouTube", "a"));
+        writer.toggleLiked(TestTracks.of("YouTube", "a"));
+        assertNull(writer.labelFor(TrackKey.of("YouTube", "a")));
+    }
+
+    @Test public void recordsWithoutALabelStillLoad() {
+        Library reader = new Library(directory);
+        reader.loadFromForTest("l|YouTube|legacy\n");
+        assertTrue("older files keep working", reader.isLiked(TestTracks.of("YouTube", "legacy")));
+        assertNull(reader.labelFor(TrackKey.of("YouTube", "legacy")));
     }
 
     @Test public void persistedDocumentRoundTrips() {

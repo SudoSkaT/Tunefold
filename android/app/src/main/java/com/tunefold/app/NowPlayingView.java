@@ -66,8 +66,17 @@ final class NowPlayingView {
     private final Button download;
     private final Button errorAction;
     private final Button autoplay;
+    /** Phase the download button was last rendered with; drives its click action. */
+    private DownloadState.Phase downloadPhase = DownloadState.Phase.IDLE;
 
     private String activeArtworkId = "";
+    /**
+     * Identity the displayed track and elapsed time belong to.
+     *
+     * <p>Progress ticks for any other identity are refused, which is what keeps a
+     * previous track's time from appearing over the current one.
+     */
+    private TrackKey activeTrackKey;
     private Drawable placeholder;
     private boolean landscape;
     private int artworkSidePx;
@@ -271,16 +280,19 @@ final class NowPlayingView {
      * <p>One entry point so the screen can never show a half-updated mix of old
      * and new state.
      */
-    void render(PlaybackSession.Snapshot snapshot, long positionMs) {
+    void render(PlaybackSession.Snapshot snapshot) {
         MediaTrack track = snapshot.currentTrack;
+        long positionMs = snapshot.positionMs;
 
         if (track != null) {
+            activeTrackKey = snapshot.currentKey;
             activeArtworkId = track.providerId;
             title.setText(track.title);
             subtitle.setText(attribution(track));
             if (track.durationMs > 0) total.setText(formatTime(track.durationMs));
         } else {
             activeArtworkId = "";
+            activeTrackKey = null;
             title.setText("Nothing playing");
             subtitle.setText("");
             total.setText("0:00");
@@ -363,6 +375,7 @@ final class NowPlayingView {
         DownloadState state = snapshot.download;
         boolean hasTrack = snapshot.currentTrack != null;
         download.setEnabled(hasTrack);
+        downloadPhase = state == null ? DownloadState.Phase.IDLE : state.phase;
 
         if (state == null || state.phase == DownloadState.Phase.IDLE) {
             download.setText(snapshot.downloaded ? "Remove download" : "Download");
@@ -393,10 +406,21 @@ final class NowPlayingView {
         }
     }
 
-    void setPosition(long positionMs, long durationMs) {
+    /**
+     * Applies a progress tick.
+     *
+     * <p>Guarded by identity: a tick computed for a track that is no longer the
+     * active one is dropped, so a late update can never repaint the elapsed time
+     * of the previous song over the new one. This is the last line of defence
+     * behind the session's own generation check.
+     */
+    void setPosition(TrackKey key, long positionMs, long durationMs) {
+        if (key == null || !key.equals(activeTrackKey)) return;
         if (durationMs > 0) {
             progress.setProgress((int) Math.min(1000, positionMs * 1000 / durationMs));
             total.setText(formatTime(durationMs));
+        } else {
+            progress.setProgress(0);
         }
         elapsed.setText(formatTime(Math.max(0, positionMs)));
     }
@@ -409,16 +433,30 @@ final class NowPlayingView {
         });
     }
 
+    /**
+     * Binds the download button's behaviour once.
+     *
+     * <p>Dispatch is on the last rendered {@link DownloadState.Phase}, not on the
+     * label text: matching strings made the button's action depend on wording and
+     * silently routed Cancel to a repaint.
+     */
     void bindDownloadAction(Runnable onDownload, Runnable onCancel, Runnable onRetry) {
         download.setOnClickListener(ignored -> {
-            String label = download.getText().toString();
-            if (label.startsWith("Cancel") || label.contains("%")
-                    || label.startsWith("Resolving")) {
-                onCancel.run();
-            } else if (label.startsWith("Retry")) {
-                onRetry.run();
-            } else {
-                onDownload.run();
+            switch (downloadPhase) {
+                case RESOLVING_SOURCE:
+                case DOWNLOADING:
+                    onCancel.run();
+                    break;
+                case FAILED:
+                case CANCELLED:
+                    onRetry.run();
+                    break;
+                case COMPLETED:
+                    onDownload.run();
+                    break;
+                default:
+                    onDownload.run();
+                    break;
             }
         });
     }

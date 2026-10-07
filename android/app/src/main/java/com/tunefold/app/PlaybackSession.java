@@ -42,11 +42,21 @@ final class PlaybackSession {
         final boolean autoplayEnabled;
         final boolean canGoNext;
         final boolean canGoPrevious;
+        /**
+         * Position of {@link #currentTrack}, in milliseconds.
+         *
+         * <p>Carried inside the snapshot on purpose: reading the position
+         * separately and pairing it with a track from another call is what let a
+         * new track be shown with the previous track's elapsed time.
+         */
+        final long positionMs;
 
         Snapshot(PlaybackState state, MediaTrack currentTrack, TrackKey currentKey,
                  PlaybackError error, boolean liked, boolean downloaded,
                  DownloadState download, List<MediaTrack> queue, int queueIndex,
-                 boolean autoplayEnabled, boolean canGoNext, boolean canGoPrevious) {
+                 boolean autoplayEnabled, boolean canGoNext, boolean canGoPrevious,
+                 long positionMs) {
+            this.positionMs = positionMs;
             this.state = state;
             this.currentTrack = currentTrack;
             this.currentKey = currentKey;
@@ -68,10 +78,22 @@ final class PlaybackSession {
     private final Library library;
     private final Recommendations recommendations;
     private final RecoveryPolicy recovery = new RecoveryPolicy();
-    private final List<Observer> observers = new ArrayList<>();
+    /**
+     * Observers, as a set so registering the same one twice cannot deliver every
+     * notification twice (§18). Insertion order is kept so rendering stays
+     * predictable.
+     */
+    private final java.util.Set<Observer> observers = new java.util.LinkedHashSet<>();
 
     private TrackDownloader downloader;
     private PlaybackState state = PlaybackState.IDLE;
+    /**
+     * Decides which track the reported position belongs to.
+     *
+     * <p>Single owner of the temporal state, shared by the app UI, the
+     * notification and the lock screen so none of them can invent their own.
+     */
+    private final PlaybackClock clock = new PlaybackClock();
     private MediaTrack currentTrack;
     private PlaybackError error;
     private PlaybackTrace trace;
@@ -121,12 +143,12 @@ final class PlaybackSession {
         synchronized (queue.lock()) {
             canNext = queue.peekNext() != null;
             canPrevious = queue.peekPrevious(0, PREVIOUS_RESTART_MS) != null
-                    || (controller.positionMs() > PREVIOUS_RESTART_MS && track != null);
+                    || (positionMs() > PREVIOUS_RESTART_MS && track != null);
         }
         return new Snapshot(state, track, key, error,
                 library.isLiked(key), download.isDownloaded(), download,
                 queue.snapshot(), queue.currentIndex(), queue.isAutoplayEnabled(),
-                canNext, canPrevious);
+                canNext, canPrevious, positionMs());
     }
 
     // -------------------------------------------------------------- commands
@@ -187,18 +209,35 @@ final class PlaybackSession {
     }
 
     void togglePause() {
-        if (state == PlaybackState.PLAYING) {
-            controller.pause();
-        } else if (state == PlaybackState.PAUSED) {
-            controller.resume();
+        setPlaying(state != PlaybackState.PLAYING);
+    }
+
+    /**
+     * Moves to an explicit playing or paused state, ignoring the current one.
+     *
+     * <p>System controls ask for a state, not for the opposite of whatever they
+     * believe is happening. Toggling on their behalf meant a lock-screen "play"
+     * could leave the player paused, because the two could disagree.
+     */
+    void setPlaying(boolean playing) {
+        if (playing) {
+            // Nothing to resume when the engine was never started for this track.
+            if (state == PlaybackState.PLAYING || state == PlaybackState.PAUSED) {
+                controller.resume();
+            }
+            return;
         }
+        if (state == PlaybackState.PLAYING) controller.pause();
     }
 
     /** Skips to the next queued item, or stops when there is none. */
     void next() {
         MediaTrack target = queue.peekNext();
         if (target == null) {
-            // No next: keep the product rule that Next never invents content.
+            // The button stays enabled with an empty queue when autoplay is on,
+            // because it then routes to a recommendation instead of stopping
+            // (§13). With autoplay off there is nothing Next can honestly do.
+            if (queue.isAutoplayEnabled() && attemptAutoplay(queue.current())) return;
             state = PlaybackState.STOPPED;
             notifyChanged();
             return;
@@ -214,16 +253,19 @@ final class PlaybackSession {
      * otherwise step to the previous one (§13).
      */
     void previous() {
-        MediaTrack target = queue.peekPrevious(controller.positionMs(), PREVIOUS_RESTART_MS);
+        // The session's own position, not the engine's: right after a track change
+        // the engine still reports the previous stream, which would make Previous
+        // think the new track is already past the restart threshold.
+        MediaTrack target = queue.peekPrevious(positionMs(), PREVIOUS_RESTART_MS);
         if (target == null) {
-            controller.restartCurrent();
+            // Nothing before this track: the only honest action is to start it over.
+            restartActiveTrack("no_previous");
             return;
         }
         if (target == queue.current()) {
             // Past the restart threshold: Previous restarts the current track
             // instead of skipping back, so the cursor must not move.
-            PlaybackTrace.markCurrent(PlaybackTrace.QUEUE_PREVIOUS, "restart");
-            controller.restartCurrent();
+            restartActiveTrack("restart");
             return;
         }
         PlaybackTrace.markCurrent(PlaybackTrace.QUEUE_PREVIOUS, "to=" + target.key());
@@ -231,16 +273,40 @@ final class PlaybackSession {
         startCurrent();
     }
 
+    /**
+     * Replays the active track from the beginning, without moving the cursor.
+     *
+     * <p>The position is dropped for the duration of the replay: the engine is
+     * about to be told to start the same source again, and until it does, its
+     * clock still describes the playback that just ended.
+     */
+    private void restartActiveTrack(String reason) {
+        PlaybackTrace.markCurrent(PlaybackTrace.QUEUE_PREVIOUS, reason);
+        long generation = clock.generation();
+        clock.detachEngine();
+        controller.restartCurrent(() -> {
+            if (clock.adoptEngine(generation)) notifyChanged();
+        });
+        // The restart opened a new attempt synchronously, so read it back rather
+        // than assuming it is the previous one plus one.
+        clock.expectEofFrom(controller.attempt());
+        notifyChanged();
+    }
+
     void stop() {
+        traceEvent("STOP");
         controller.stop();
         state = PlaybackState.STOPPED;
         error = null;
+        // No engine reading may be reported after a stop.
+        clock.release();
         endTrace();
         notifyChanged();
     }
 
     /** Retries the failed step, subject to the bounded policy (§20). */
     void retry() {
+        traceEvent("RETRY");
         PlaybackError current = error;
         if (current != null && !current.retryable) {
             // Terminal: offer Next instead of pretending Retry will help.
@@ -313,7 +379,12 @@ final class PlaybackSession {
 
     private String trackTitle(TrackKey key) {
         MediaTrack track = findKnown(key);
-        return track == null ? key.providerTrackId() : track.title;
+        if (track != null) return track.title;
+        // After a restart the live track is gone but the like may carry a label,
+        // which beats showing the user a bare provider id.
+        String remembered = library.labelFor(key);
+        return remembered == null || remembered.isEmpty()
+                ? key.providerTrackId() : remembered;
     }
 
     /** Finds a track we already know about, by identity. */
@@ -327,6 +398,22 @@ final class PlaybackSession {
         return null;
     }
 
+    /**
+     * A track for a liked identity, reconstructed from its remembered label.
+     *
+     * <p>L1K3D is only membership, so after a restart there is no live track to
+     * find; without this the rows would read "Resolving &lt;provider/id&gt;".
+     */
+    MediaTrack describeLiked(TrackKey key) {
+        MediaTrack known = findKnown(key);
+        if (known != null) return known;
+        if (key == null) return null;
+        // providerId must stay the real identity: it is what the download registry
+        // and the queue key on. Only the display fields are synthesised.
+        return new MediaTrack(key.provider(), key.providerTrackId(), trackTitle(key),
+                "", "", "", "", -1, "", "", "{}");
+    }
+
     // ------------------------------------------------------------- download
 
     TrackDownloader downloader() { return downloader; }
@@ -337,6 +424,10 @@ final class PlaybackSession {
     private void startCurrent() {
         MediaTrack track = queue.current();
         if (track == null) return;
+        // Every track change opens a new generation. Callbacks and engine readings
+        // that belong to an older one are refused, which is what stops the previous
+        // track's position, artwork or error from landing on the new track.
+        long generation = clock.beginTrack();
         currentTrack = track;
         eofHandled = false;
         recovery.resetForNextTrack();
@@ -349,6 +440,8 @@ final class PlaybackSession {
         TrackKey key = track.key();
         PlaybackTrace active = trace;
         providers.playableSource(track, active, (source, failure) -> {
+            // A newer track was selected while this one was still resolving.
+            if (!clock.isCurrent(generation)) return;
             if (source == null) {
                 setError(PlaybackError.classify(PlaybackError.Stage.SOURCE_RESOLUTION,
                         failure == null ? "Source resolution failed" : failure));
@@ -362,12 +455,22 @@ final class PlaybackSession {
             notifyChanged();
             // The controller owns the engine; the session only supplies the
             // source and the state it should show while it starts.
+            traceEvent("SOURCE_START");
             controller.play(source, active, () -> {
+                // Output has begun for this exact track: only now may the engine's
+                // position be reported as this track's position.
+                if (!clock.adoptEngine(generation)) return;
                 if (state == PlaybackState.BUFFERING || state == PlaybackState.RESOLVING_SOURCE) {
                     state = PlaybackState.PLAYING;
-                    notifyChanged();
                 }
+                traceEvent("PLAYING");
+                notifyChanged();
             });
+            // Read the attempt back AFTER play(): it opens a new attempt
+            // synchronously, and arming the end-of-track with the previous id
+            // would make every genuine end of track look stale and silently stop
+            // the queue from advancing.
+            clock.expectEofFrom(controller.attempt());
         });
     }
 
@@ -377,9 +480,20 @@ final class PlaybackSession {
      * <p>Runs at most once per track (§16): a second EOF for the same track is
      * ignored so a duplicated signal cannot start two new tracks.
      */
-    private void onTrackFinished() {
+    private void onTrackFinished(long attempt) {
+        // §14: an end-of-track from a superseded attempt must not move the queue.
+        // Without this, a retry of A could be followed by A's older decoder
+        // finishing, which advanced to B and made a retry look like a skip.
+        if (!clock.acceptEof(attempt)) {
+            PlaybackTrace.markCurrent(PlaybackTrace.STALE_EOF,
+                    "attempt=" + attempt + " expected=" + clock.eofAttempt());
+            Log.i(TAG, "event=STALE_EOF dropped attempt=" + attempt
+                    + " expected=" + clock.eofAttempt());
+            return;
+        }
         if (eofHandled) return;
         eofHandled = true;
+        traceEvent("EOF_ACCEPTED");
 
         MediaTrack finished = queue.current();
         AutoplayPolicy.Outcome outcome = AutoplayPolicy.afterTrackFinished(
@@ -404,22 +518,30 @@ final class PlaybackSession {
         }
 
         // Autoplay: fetch a candidate. Bounded and single-flight.
-        if (finished == null || autoplayInFlight) {
+        if (!attemptAutoplay(finished)) {
             state = PlaybackState.STOPPED;
             endTrace();
             notifyChanged();
-            return;
         }
+    }
+
+    /**
+     * Starts one bounded autoplay fetch for {@code origin}.
+     *
+     * <p>Single-flight and budget-limited, so neither a repeated end-of-track
+     * signal nor a user leaning on Next can spin the provider.
+     *
+     * @return {@code true} when the fetch was started.
+     */
+    private boolean attemptAutoplay(MediaTrack origin) {
+        if (origin == null || autoplayInFlight) return false;
         if (!recovery.takeAutoplaySkip()) {
             Log.i(TAG, "event=AUTOPLAY_GAVE_UP reason=skip_budget");
-            state = PlaybackState.STOPPED;
-            endTrace();
-            notifyChanged();
-            return;
+            return false;
         }
         autoplayInFlight = true;
-        PlaybackTrace.markCurrent(PlaybackTrace.AUTOPLAY_TRIGGER, "id=" + finished.key());
-        recommendations.forTrack(finished, (candidates, failure) -> {
+        PlaybackTrace.markCurrent(PlaybackTrace.AUTOPLAY_TRIGGER, "id=" + origin.key());
+        recommendations.forTrack(origin, (candidates, failure) -> {
             autoplayInFlight = false;
             MediaTrack chosen = recommendations.select(candidates);
             if (chosen == null) {
@@ -434,6 +556,7 @@ final class PlaybackSession {
             queue.setCurrent(chosen);
             startCurrent();
         });
+        return true;
     }
 
     /** Recommendations for Home; failure yields an empty list, never an error. */
@@ -451,8 +574,26 @@ final class PlaybackSession {
     void onControllerState(int engineState, String message) {
         PlaybackState mapped = PlaybackState.fromEngine(engineState);
         if (mapped == PlaybackState.ERROR) {
+            // While a new track is still resolving, the engine is still running
+            // the attempt we replaced. Its failure must not be charged to the
+            // track the user is waiting for.
+            boolean newerAttemptInFlight = clock.eofAttempt() == 0L
+                    && (state == PlaybackState.RESOLVING_SOURCE
+                        || state == PlaybackState.RESOLVING_METADATA);
+            if (newerAttemptInFlight) {
+                Log.i(TAG, "event=STALE_ENGINE_ERROR dropped while resolving");
+                return;
+            }
             setError(PlaybackError.classify(PlaybackError.Stage.OUTPUT,
                     message == null ? "Playback failed" : message));
+            traceEvent("ERROR");
+            return;
+        }
+        if (state == PlaybackState.ERROR) {
+            // An error is sticky until the user acts or a new attempt starts.
+            // Without this, the engine's idle callback erased the message and
+            // its Retry/Skip actions within a poll interval, leaving a silent
+            // failure the user could see nothing about.
             return;
         }
         if (state != PlaybackState.SEARCHING
@@ -473,6 +614,24 @@ final class PlaybackSession {
         notifyChanged();
     }
 
+    /**
+     * One line per meaningful playback transition.
+     *
+     * <p>Carries track, generation and attempt so a long session can be
+     * reconstructed from logs alone: which song, which attempt, which callback
+     * and which state. Low volume by construction (one line per transition, never
+     * per tick), so it is safe to keep on.
+     */
+    private void traceEvent(String event) {
+        MediaTrack track = queue.current();
+        Log.i(TAG, "event=" + event
+                + " track=" + (track == null ? "-" : track.key())
+                + " gen=" + clock.generation()
+                + " attempt=" + controller.attempt()
+                + " state=" + state
+                + " pos=" + positionMs());
+    }
+
     private void beginTrace(String id) {
         trace = new PlaybackTrace(id);
         PlaybackTrace.setCurrent(trace);
@@ -488,7 +647,20 @@ final class PlaybackSession {
 
     String diagnostics() { return controller.diagnostics(); }
 
-    long positionMs() { return controller.positionMs(); }
+    /**
+     * Position of the <em>active</em> track, in milliseconds.
+     *
+     * <p>Deliberately not a raw engine reading. The engine keeps reporting the
+     * previous stream's position until the new source has actually produced
+     * audio, so reading it directly paired the old position with the new track's
+     * duration. Until the current track owns the engine clock, the session
+     * reports 0, which is the truth for a track that has not started producing
+     * audio yet.
+     */
+    long positionMs() {
+        if (queue.current() == null) return 0L;
+        return clock.positionMs(controller.positionMs());
+    }
 
     private void notifyChanged() {
         for (Observer observer : new ArrayList<>(observers)) {

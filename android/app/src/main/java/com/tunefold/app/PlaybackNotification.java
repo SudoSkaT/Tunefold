@@ -28,11 +28,14 @@ final class PlaybackNotification {
 
     /** Command actions understood by the notification and system controls. */
     static final String ACTION_TOGGLE = "com.tunefold.app.TOGGLE";
+    static final String ACTION_PLAY = "com.tunefold.app.PLAY";
+    static final String ACTION_PAUSE = "com.tunefold.app.PAUSE";
     static final String ACTION_NEXT = "com.tunefold.app.NEXT";
     static final String ACTION_PREVIOUS = "com.tunefold.app.PREVIOUS";
     static final String ACTION_STOP = "com.tunefold.app.STOP";
 
-    private final Service service;
+    /** Typed as the concrete service so commands reach the session directly. */
+    private final ForegroundPlaybackService service;
     private final MediaSession session;
     private final java.util.concurrent.ExecutorService artworkWorker =
             java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
@@ -45,34 +48,32 @@ final class PlaybackNotification {
     private volatile boolean artworkPending;
     private final NotificationManager notifications;
 
-    PlaybackNotification(Service service) {
+    PlaybackNotification(ForegroundPlaybackService service) {
         this.service = service;
         this.notifications = service.getSystemService(NotificationManager.class);
         createChannel();
         this.session = new MediaSession(service, "TunefoldPlayback");
         session.setCallback(new MediaSession.Callback() {
-            @Override public void onPlay() { command(ACTION_TOGGLE); }
-            @Override public void onPause() { command(ACTION_TOGGLE); }
+            // Explicit states, not a toggle: the system knows which one it wants.
+            @Override public void onPlay() { command(ACTION_PLAY); }
+            @Override public void onPause() { command(ACTION_PAUSE); }
             @Override public void onSkipToNext() { command(ACTION_NEXT); }
             @Override public void onSkipToPrevious() { command(ACTION_PREVIOUS); }
             @Override public void onStop() { command(ACTION_STOP); }
         });
     }
 
+    /**
+     * Handles a transport command from the MediaSession callback.
+     *
+     * <p>Dispatched straight onto the owning service instead of through an
+     * intent: a callback arrives while the app is in the background, where
+     * {@code startService} is refused, and an implicit intent has no receiver
+     * because the service declares no intent-filter. Both failures were silent,
+     * so lock-screen and headset controls did nothing at all.
+     */
     private void command(String action) {
-        Intent intent = new Intent(action).setPackage(service.getPackageName());
-        // Delivery goes through the service so a control works even when no
-        // Activity is alive, and still ends at the single PlaybackController.
-        try {
-            service.startService(intent);
-        } catch (Exception backgroundRestricted) {
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            try {
-                service.startActivity(intent);
-            } catch (Exception ignored) {
-                // Nothing else to try: the UI path remains authoritative.
-            }
-        }
+        service.dispatchCommand(action);
     }
 
     /** True while audio is or soon will be playing, so the service stays foreground. */
@@ -239,8 +240,10 @@ final class PlaybackNotification {
     }
 
     private PendingIntent actionIntent(String action, int requestCode) {
+        // Explicit component: the service declares no intent-filter, so an implicit
+        // intent could never be delivered to it.
         return PendingIntent.getService(service, requestCode,
-                new Intent(action).setPackage(service.getPackageName()),
+                new Intent(service, ForegroundPlaybackService.class).setAction(action),
                 pendingIntentFlags());
     }
 

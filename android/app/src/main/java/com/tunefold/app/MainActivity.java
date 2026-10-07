@@ -41,6 +41,8 @@ import java.util.List;
  */
 public final class MainActivity extends Activity {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    /** Stable observer identity, so add/remove pair up across reconnects. */
+    private final PlaybackSession.Observer sessionObserver = this::onSessionChanged;
 
     private PlaybackController controller;
     private ProviderRegistry providers;
@@ -65,6 +67,8 @@ public final class MainActivity extends Activity {
     private Section section = Section.HOME;
 
     /** Artwork requests in flight, keyed by identity so a late load is ignored. */
+    /** Request code for the runtime POST_NOTIFICATIONS prompt. */
+    private static final int NOTIFICATION_PERMISSION_REQUEST = 4201;
     private String artworkRequestId = "";
     /** Identity whose artwork is already decoded into the view. */
     private String artworkShownKey = "";
@@ -80,7 +84,10 @@ public final class MainActivity extends Activity {
             session = binder.session();
             library = binder.library();
             downloader = binder.downloader();
-            session.addObserver(MainActivity.this::onSessionChanged);
+            // A stable field, so adding is idempotent and removing actually
+            // matches: a method reference created twice is a different object,
+            // which let a reconnect stack duplicate observers.
+            session.addObserver(sessionObserver);
             applyOrientation(getResources().getConfiguration());
             loadSection(Section.HOME, true);
             if (getIntent().getBooleanExtra("runtime_smoke_test", false)) resolveAndPlay();
@@ -99,9 +106,26 @@ public final class MainActivity extends Activity {
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         buildInterface();
+        requestNotificationPermissionIfNeeded();
         Intent service = new Intent(this, ForegroundPlaybackService.class);
         bound = bindService(service, connection, BIND_AUTO_CREATE);
         mainHandler.post(poll);
+    }
+
+    /**
+     * Asks for {@code POST_NOTIFICATIONS} on the versions that require it.
+     *
+     * <p>Declaring the permission is not enough from Android 13 on: without the
+     * runtime grant the media notification is never shown, so lock-screen and
+     * headset controls would look broken. Asked once per install; the system
+     * remembers a refusal, and playback never depends on the answer.
+     */
+    private void requestNotificationPermissionIfNeeded() {
+        if (android.os.Build.VERSION.SDK_INT < 33) return;
+        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED) return;
+        requestPermissions(new String[] {android.Manifest.permission.POST_NOTIFICATIONS},
+                NOTIFICATION_PERMISSION_REQUEST);
     }
 
     // ------------------------------------------------------------------ UI
@@ -308,7 +332,9 @@ public final class MainActivity extends Activity {
     private void resolveAndPlay() {
         String url = getIntent().getStringExtra("runtime_stream_url");
         if (url == null || session == null) return;
-        section = Section.SEARCH;
+        // Switch the surface as well as the section, otherwise the previously
+        // rendered list stays on screen under a search header.
+        loadSection(Section.SEARCH, false);
         session.playUrl(url);
     }
 
@@ -330,6 +356,7 @@ public final class MainActivity extends Activity {
             showStatus("runtime_download needs runtime_track_label");
             return;
         }
+        loadSection(Section.SEARCH, false);
         if ("start".equals(action)) {
             session.play(track);
             startDownload();
@@ -374,6 +401,8 @@ public final class MainActivity extends Activity {
     /** Loads the content of a navigation section. */
     private void loadSection(Section target, boolean refreshContent) {
         section = target;
+        sectionTracks.clear();
+        lastDownloadSignature = downloadSignature();
         if (session == null) return;
         switch (target) {
             case HOME: renderHome(true); break;
@@ -412,7 +441,7 @@ public final class MainActivity extends Activity {
         if (!liked.isEmpty()) {
             sectionContent.addView(sectionLabel("L1K3D (" + liked.size() + ")"));
             for (TrackKey key : liked) {
-                MediaTrack track = session.findKnown(key);
+                MediaTrack track = session.describeLiked(key);
                 if (track != null) sectionContent.addView(trackRow(track, false));
             }
         }
@@ -447,7 +476,7 @@ public final class MainActivity extends Activity {
             return;
         }
         for (TrackKey key : keys) {
-            MediaTrack track = session.findKnown(key);
+            MediaTrack track = session.describeLiked(key);
             if (track != null) {
                 sectionContent.addView(trackRow(track, false));
             } else {
@@ -473,7 +502,7 @@ public final class MainActivity extends Activity {
             return;
         }
         for (TrackKey key : keys) {
-            MediaTrack track = session.findKnown(key);
+            MediaTrack track = session.describeLiked(key);
             sectionContent.addView(trackRow(track != null ? track : placeholderFor(key), false));
         }
     }
@@ -496,6 +525,9 @@ public final class MainActivity extends Activity {
      * and the download action for this specific track (§8).
      */
     private View trackRow(MediaTrack track, boolean playing) {
+        // Every list row goes through here, so this is where the section's
+        // identities are recorded for stale-label detection.
+        if (track != null && track.key() != null) sectionTracks.add(track.key());
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -571,6 +603,28 @@ public final class MainActivity extends Activity {
         for (MediaTrack track : tracks) sectionContent.addView(trackRow(track, false));
     }
 
+    /** Identities the current section lists, used to detect stale row labels. */
+    private final List<TrackKey> sectionTracks = new ArrayList<>();
+
+    /**
+     * Download state of everything the section lists.
+     *
+     * <p>Rows are built once, so a download that completes (or the store scan that
+     * discovers one) would otherwise leave a row reading "Download" for a track
+     * that is already on disk.
+     */
+    private String downloadSignature() {
+        if (downloader == null) return "";
+        StringBuilder signature = new StringBuilder();
+        for (TrackKey key : sectionTracks) {
+            signature.append(key).append('=')
+                    .append(downloader.stateOf(key).phase).append(';');
+        }
+        return signature.toString();
+    }
+
+    private String lastDownloadSignature = "\u0000none";
+
     /**
      * Decodes the artwork for {@code track} into the Now Playing view, once.
      *
@@ -601,12 +655,19 @@ public final class MainActivity extends Activity {
     private void onSessionChanged() {
         if (destroyed || session == null) return;
         render();
+        String signature = downloadSignature();
+        if (!signature.equals(lastDownloadSignature)) {
+            lastDownloadSignature = signature;
+            // Reload only when a listed row's download state really changed, so a
+            // playback tick never disturbs the scroll position.
+            loadSection(section, false);
+        }
     }
 
     private void render() {
         if (destroyed || session == null) return;
         PlaybackSession.Snapshot snapshot = session.snapshot();
-        nowPlaying.render(snapshot, session.positionMs());
+        nowPlaying.render(snapshot);
         if (snapshot.currentTrack != null) {
             loadArtwork(snapshot.currentTrack);
             showStatus("");
@@ -644,8 +705,10 @@ public final class MainActivity extends Activity {
                 }
             }
             if (session != null) {
+                // One snapshot per tick: position and track always come from the
+                // same read, so a tick can never pair one track with another's time.
                 PlaybackSession.Snapshot snapshot = session.snapshot();
-                nowPlaying.setPosition(session.positionMs(),
+                nowPlaying.setPosition(snapshot.currentKey, snapshot.positionMs,
                         snapshot.currentTrack == null ? 0 : snapshot.currentTrack.durationMs);
             }
             mainHandler.postDelayed(this, 500);
@@ -653,6 +716,23 @@ public final class MainActivity extends Activity {
     };
 
     // ------------------------------------------------------------ lifecycle
+
+    /**
+     * Re-applies the validation hooks when the Activity is already running.
+     *
+     * <p>Needed to reproduce rapid track switches deterministically: delivering a
+     * second intent while the first track is still resolving is the only way to
+     * exercise the supersede path on a real device. Validation-only, and it calls
+     * exactly the same commands a tap would.
+     */
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (destroyed || session == null) return;
+        loadSection(Section.SEARCH, false);
+        if (intent.getBooleanExtra("runtime_smoke_test", false)) resolveAndPlay();
+        applyRuntimeDownloadHook();
+    }
 
     @Override public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
@@ -681,8 +761,7 @@ public final class MainActivity extends Activity {
     @Override protected void onDestroy() {
         destroyed = true;
         mainHandler.removeCallbacks(poll);
-        if (session != null) session.removeObserver(this::render);
-        if (session != null) session.removeObserver(this::onSessionChanged);
+        if (session != null) session.removeObserver(sessionObserver);
         if (bound) unbindService(connection);
         session = null;
         controller = null;

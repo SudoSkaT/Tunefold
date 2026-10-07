@@ -68,6 +68,31 @@ These four are deliberately **separate** and must never be conflated:
 | **Resolution cache** | Temporary playback URLs with their own expiry. **A resolution cache is not downloaded audio.** |
 | **LocalMediaStore** | Persistent storage of audio the user explicitly downloaded. Bounded (200 MiB per item, 512 MiB total), atomic, with an identity/size sidecar. |
 
+## Session, queue and library
+
+| Term | Meaning |
+|---|---|
+| **TrackKey** | The stable logical identity of a track: `provider + provider_track_id`. The only key used for downloads, likes and history. |
+| **PlaybackSession** | Service-owned source of truth for playback state, queue, library and download references. The Activity renders it and never owns it, so state survives recreation. |
+| **PlaybackQueue** | Ordered list of TrackKeys with a cursor, repeat mode and the autoplay switch. Pure logic, unit-tested without Android. |
+| **Current** | The queue item at the cursor. `playNow` moves the cursor and truncates what was after it. |
+| **Previous rule** | Within the first seconds, Previous moves the cursor back; after that it restarts the current track and leaves the cursor alone. |
+| **Autoplay** | When the queue is exhausted at end of track, one provider recommendation is fetched and played. Never downloads. |
+| **PlaybackState** | `IDLE`, `RESOLVING`, `BUFFERING`, `PLAYING`, `PAUSED`, `STOPPED`, `ERROR`. Derived from the engine, never guessed by the UI. |
+| **PlaybackClock** | Decides which track a reported position belongs to. Pure logic, no Android types. |
+| **Generation** | Monotonic id of the current playback attempt. A track change opens a new one; callbacks capture it and drop themselves when it no longer matches. |
+| **Engine ownership** | The engine's position may only be reported once output has begun for the current generation. Until then the position is 0, because the engine is still describing the previous stream. |
+| **Output began** | The first positive `AudioTrack` write for a source: the earliest moment the engine can be said to be playing *that* source. `AudioTrackOutput` joins the previous worker before starting a new one, so the signal cannot arrive for a superseded source. |
+| **PlaybackError** | Classified failure with stage, message and whether a retry is allowed. Shown with Retry/Skip actions. |
+| **RecoveryPolicy** | Bounded budgets for retries and autoplay skips, so a failing item cannot loop forever. |
+| **L1K3D** | The user's liked tracks. Membership only, persisted atomically; it is **not** the download list. Records carry the title as a trailing field so the list still reads as music after a restart instead of as bare provider ids. |
+| **Descargadas** | Derived from the LocalMediaStore's valid entries. A track appears because its file exists, not because it was liked. |
+| **Recommendations** | Provider "related" list, deduplicated against current track, queue, likes and recent history. A failure yields an empty list, never an error. |
+| **MediaSession** | System integration for lock-screen and headset controls. |
+| **Transport command** | One dispatch point, `ForegroundPlaybackService.dispatchCommand`, used by the notification intents, the system and the MediaSession callback alike. Every external control therefore reaches the same `PlaybackController`. |
+| **Explicit control intent** | Notification actions name the service component. The service declares no intent-filter, so an implicit intent would resolve to nothing and the control would silently do nothing. |
+| **Resolution thread** | Source resolution runs on its own single thread, separate from the provider thread that serves search and metadata, so a resolution that hangs cannot take the rest of the app with it. |
+
 ## Download
 
 | Term | Meaning |
@@ -77,6 +102,12 @@ These four are deliberately **separate** and must never be conflated:
 | **`.part` file** | The staging file a download writes before committing. A cancelled or failed download leaves no committed file. |
 | **Commit** | The atomic rename from `.part` to the final file, performed only after the final size is validated. |
 | **Downloaded** | A Track with a valid file in the LocalMediaStore. Played as `file:` through the same decoder and output. |
+| **DownloadRegistry** | Authoritative per-TrackKey download state. One identity can hold one download, so duplicates are impossible. |
+| **Resolve deadline** | 30 s budget for a download's source resolution. Without it a resolver that never answers would leave the button reading "Resolving source" forever. |
+| **Store location** | `filesDir/media/local_media`, **not** the cache: an explicit download is user data, and Android may purge a cache directory at any time. |
+| **DownloadState** | `IDLE`, `RESOLVING_SOURCE`, `DOWNLOADING`, `COMPLETED`, `FAILED`, `CANCELLED`, `ALREADY_DOWNLOADED`. |
+| **Deduplication** | A second request for a downloaded or in-flight track is answered from state and starts no work. |
+| **Store scan** | The one background enumeration of the store that seeds the registry, so the UI never walks the filesystem to render `Descargadas`. |
 
 ## Trace events
 
@@ -98,6 +129,18 @@ Emitted to Logcat under the `TunefoldPerf` tag, anchored to the Play tap:
 | `AUDIOTRACK_START` | `AudioTrack` created and playing. |
 | `AUDIOTRACK_FIRST_POSITIVE_WRITE` | First positive `AudioTrack` write: the TTFA proxy. |
 | `TTFA` | Emitted with the final TTFA value in milliseconds. |
+| `RECOMMENDATIONS_START` / `RECOMMENDATIONS_COMPLETE` / `RECOMMENDATIONS_END` | Recommendation request start, provider answer, and candidates kept after deduplication. |
+| `AUTOPLAY_TRIGGER` | End of track with an empty queue and autoplay enabled. |
+| `AUTOPLAY_GAVE_UP` / `AUTOPLAY_NO_CANDIDATE` | Autoplay stopped instead of looping. |
+| `QUEUE_PREVIOUS` | Previous action; `restart` when it restarted the current track instead of moving the cursor. |
+| `RESOLVE_ENTER` / `RESOLVE_EXIT` | see Download |
+| `DOWNLOAD_START` / `DOWNLOAD_CANCELLED` | Explicit download started / cancelled by the user. |
+| `DOWNLOAD_COMPLETE` | The transfer committed; carries the byte count. |
+| `DOWNLOAD_RESOLVE_TIMEOUT` | Source resolution exceeded its deadline and the download failed visibly instead of hanging. |
+| `DOWNLOAD_SUPERSEDED` | The attempt was cancelled or failed while resolving, so the resolved source was discarded. |
+| `RESOLVE_ENTER` / `RESOLVE_EXIT` | Entry and exit of one source resolution, with its duration. Present so a resolution that never returns is distinguishable from one never requested. |
+| `DOWNLOAD_ALREADY_EXISTS` / `DOWNLOAD_ALREADY_RUNNING` | A duplicate download request was refused. |
+| `DOWNLOAD_CLEAN_PARTS` | Abandoned `.part` files removed at construction. |
 
 Never logged: signed stream URLs, request headers, or full resource paths of
 remote sources.
@@ -110,22 +153,32 @@ remote sources.
 Technical diagnostics never appear in the normal Now Playing surface; they live
 in the `Diagnostics` panel (`PlaybackDebugPanel`).
 
+Every control label states the **action** it will perform, not the current state:
+a playing track offers `Pause`, and the autoplay button reads `Autoplay: on`.
+
 ## Validation hooks
 
-Scripted device validation only; never used by the UI:
+Scripted device validation only; never used by the UI. They call the same
+public commands the buttons call, so there is no second code path.
 
 | Hook | Purpose |
 |---|---|
 | `runtime_smoke_test` | Play the URL given in `runtime_stream_url` on launch. |
-| `runtime_download` | Also start an explicit download of the resolved track. |
 | `runtime_stream_url` | The track or direct audio URL to use. |
+| `runtime_download` | Drive the download flows for `runtime_track_label` without screen taps. |
+| `runtime_download_action` | `start`, `cancel`, `retry`, `like` or `remove`. |
+| `runtime_track_label` | Track id used as the identity for the download hook. |
 
 Example:
 
 ```sh
 adb shell am start -n com.tunefold.app/.MainActivity \
-  --ez runtime_smoke_test true --es runtime_download true \
+  --ez runtime_smoke_test true \
   --es runtime_stream_url https://www.youtube.com/watch?v=dQw4w9WgXcQ
+
+adb shell am start -n com.tunefold.app/.MainActivity \
+  --ez runtime_download true --es runtime_download_action start \
+  --es runtime_track_label dQw4w9WgXcQ
 ```
 
 ## Benchmarking

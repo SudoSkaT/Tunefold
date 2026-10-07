@@ -23,15 +23,23 @@ final class AudioTrackOutput {
     }
 
     void start(long engine) {
-        start(engine, null);
+        start(engine, null, null);
     }
 
-    void start(long engine, PlaybackTrace trace) {
+    /**
+     * Starts pumping, reporting once when audio actually reaches the output.
+     *
+     * <p>{@code onOutputBegan} fires on the first positive write, which is the
+     * earliest moment the engine can be said to be playing <em>this</em> source.
+     * {@link #start} joins the previous worker before returning, so the callback
+     * can never arrive for a source that has already been superseded.
+     */
+    void start(long engine, PlaybackTrace trace, Runnable onOutputBegan) {
         requestStop();
         joinWorker(0);
         synchronized (this) {
             running = true;
-            worker = new Thread(() -> pump(engine, trace), "tunefold-audio-output");
+            worker = new Thread(() -> pump(engine, trace, onOutputBegan), "tunefold-audio-output");
             worker.start();
         }
     }
@@ -77,9 +85,11 @@ final class AudioTrackOutput {
         if (!current.isAlive()) worker = null;
     }
 
-    private void pump(long engine, PlaybackTrace trace) {
+    private void pump(long engine, PlaybackTrace trace, Runnable onOutputBegan) {
         AudioTrack localTrack = null;
         boolean firstWriteMarked = false;
+        // Held in a local so firing it needs no locking; cleared after the call.
+        Runnable began = onOutputBegan;
         ByteBuffer pcm = ByteBuffer.allocateDirect(CHUNK_FRAMES * 2 * Float.BYTES)
                 .order(ByteOrder.nativeOrder());
         try {
@@ -143,6 +153,10 @@ final class AudioTrackOutput {
                     if (!firstWriteMarked && written > 0) {
                         firstWriteMarked = true;
                         if (trace != null) trace.markFirstPositiveWrite(written);
+                        if (began != null) {
+                            began.run();
+                            began = null;
+                        }
                     }
                     if (written < 0) {
                         throw new IllegalStateException("AudioTrack.write failed: " + written);

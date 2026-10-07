@@ -17,6 +17,16 @@ final class ProviderRegistry implements AutoCloseable {
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor(r ->
             new Thread(r, "tunefold-provider"));
+    /**
+     * Source resolution runs on its own thread, never on {@link #worker}.
+     *
+     * <p>A resolution that never returns would otherwise occupy the single
+     * provider thread and take search, metadata and recommendations down with
+     * it: cancelling the download changes the UI but cannot unblock a call that
+     * is already stuck inside the resolver.
+     */
+    private final ExecutorService resolutionWorker = Executors.newSingleThreadExecutor(r ->
+            new Thread(r, "tunefold-resolve"));
     private final ExecutorService artworkWorker = Executors.newSingleThreadExecutor(r ->
             new Thread(r, "tunefold-artwork-cache"));
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -24,10 +34,17 @@ final class ProviderRegistry implements AutoCloseable {
     private volatile ArtworkCache artworkCache;
     private volatile LocalMediaStore localMediaStore;
 
-    void initialize(String cacheDir, Callback<Boolean> callback) {
+    /**
+     * @param cacheDir purgeable storage for caches (artwork, provider internals)
+     * @param filesDir durable storage for what the user explicitly saved
+     */
+    void initialize(String cacheDir, String filesDir, Callback<Boolean> callback) {
         worker.execute(() -> {
             artworkCache = new ArtworkCache(new java.io.File(cacheDir, "artwork"));
-            localMediaStore = new FileLocalMediaStore(new java.io.File(cacheDir, "local_media"));
+            // Downloads are user data, not a cache: under cacheDir Android is free
+            // to delete them when storage runs low, which would silently drop
+            // tracks out of `Descargadas` and lose an explicit user action.
+            localMediaStore = new FileLocalMediaStore(new java.io.File(filesDir, "local_media"));
             boolean ready = BuildConfig.YOUTUBE_ENABLED
                     && TunefoldBridge.initializeYoutube(cacheDir);
             available = ready;
@@ -159,7 +176,7 @@ final class ProviderRegistry implements AutoCloseable {
      * URL is never stored as a permanent media reference.
      */
     void playableSource(MediaTrack track, PlaybackTrace trace, Callback<PlayableSource> callback) {
-        worker.execute(() -> {
+        resolutionWorker.execute(() -> {
             LocalMediaStore local = localMediaStore;
             java.io.File localFile = local == null ? null : local.get(track.provider, track.providerId);
             if (localFile != null) {
@@ -174,7 +191,14 @@ final class ProviderRegistry implements AutoCloseable {
             if (!available) { deliver(callback, null, "YouTube provider is not initialized"); return; }
             try {
                 long start = android.os.SystemClock.elapsedRealtimeNanos();
+                // Entry/exit markers: a resolution that never returns is otherwise
+                // indistinguishable from one that was never requested.
+                android.util.Log.i("TunefoldPerf", "event=RESOLVE_ENTER id="
+                        + track.provider + "/" + track.providerId);
                 JSONObject root = new JSONObject(TunefoldBridge.resolveYoutubeSource(track.rawJson));
+                android.util.Log.i("TunefoldPerf", "event=RESOLVE_EXIT id="
+                        + track.provider + "/" + track.providerId + " ms="
+                        + ((android.os.SystemClock.elapsedRealtimeNanos() - start) / 1_000_000L));
                 if (!root.optBoolean("ok")) {
                     deliver(callback, null, root.optString("category", "source_resolution_failed")
                             + ": " + root.optString("error", "Source resolution failed"));
@@ -227,6 +251,7 @@ final class ProviderRegistry implements AutoCloseable {
 
     @Override public void close() {
         worker.shutdownNow();
+        resolutionWorker.shutdownNow();
         artworkWorker.shutdownNow();
         available = false;
     }

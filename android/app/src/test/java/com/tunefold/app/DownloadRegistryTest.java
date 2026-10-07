@@ -171,6 +171,15 @@ public class DownloadRegistryTest {
         assertEquals("COMPLETED:" + key, events.get(2));
     }
 
+    @Test public void seedingAnnouncesEveryTrackItFound() {
+        List<String> announced = new ArrayList<>();
+        registry.setListener((key, state) -> announced.add(key.toString()));
+        TrackKey a = key("a");
+        registry.seedStored(entries(a));
+        assertEquals("the UI must learn about pre-existing files", 1, announced.size());
+        assertEquals(a.toString(), announced.get(0));
+    }
+
     @Test public void storedKeysComeFromKnownStateNotDisk() {
         registry.seedStored(entries(key("a"), key("b")));
         assertEquals(2, registry.storedKeys().size());
@@ -204,6 +213,24 @@ public class DownloadRegistryTest {
             entries.add(new LocalMediaStore.Entry(key, 42, null));
         }
         return entries;
+    }
+
+    @Test public void anAttemptInProgressCountsAsActive() {
+        // Documents the trap that silently disabled every download: a caller that
+        // asks "may I start" while its own RESOLVING_SOURCE attempt is in flight is
+        // told no, because resolving is itself an active phase.
+        TrackKey key = key("a");
+        registry.beginResolving(key);
+        assertTrue("resolving is active", registry.isActive(key));
+        assertFalse("so canStart refuses the same identity", registry.canStart(key));
+    }
+
+    @Test public void cancellingClearsTheActiveRefusal() {
+        TrackKey key = key("a");
+        registry.beginResolving(key);
+        registry.cancel(key);
+        assertFalse(registry.isActive(key));
+        assertTrue("a cancelled attempt may be retried", registry.canStart(key));
     }
 
     @Test public void nullIdentityIsNeverDownloadable() {

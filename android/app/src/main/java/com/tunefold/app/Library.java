@@ -76,6 +76,13 @@ final class Library {
         boolean changed;
         synchronized (lock) {
             changed = value ? liked.add(key) : liked.remove(key);
+            // Same bookkeeping as toggleLiked, or a programmatic like would lose
+            // the label that L1K3D shows after a restart.
+            if (changed && value && track.title != null && !track.title.isEmpty()) {
+                labels.put(key, track.title);
+            } else if (changed) {
+                labels.remove(key);
+            }
         }
         if (changed) {
             persistAsync();
@@ -91,7 +98,15 @@ final class Library {
         boolean nowLiked;
         synchronized (lock) {
             nowLiked = !liked.contains(key);
-            if (nowLiked) liked.add(key); else liked.remove(key);
+            if (nowLiked) {
+                liked.add(key);
+                // Keep a label so L1K3D can show a title after a restart instead
+                // of a bare provider id, which is all the identity survives.
+                if (track.title != null && !track.title.isEmpty()) labels.put(key, track.title);
+            } else {
+                liked.remove(key);
+                labels.remove(key);
+            }
         }
         persistAsync();
         notifyChanged();
@@ -196,9 +211,24 @@ final class Library {
             String rest = line.substring(2);
             int separator = rest.indexOf(SEPARATOR);
             if (separator <= 0 || separator == rest.length() - 1) continue;
-            TrackKey key = TrackKey.of(rest.substring(0, separator), rest.substring(separator + 1));
+            // Fields are: provider, id, then an optional label that runs to the end
+            // of the line. The id must be bounded by the next separator, otherwise a
+            // label silently becomes part of the identity.
+            String provider = rest.substring(0, separator);
+            int idEnd = rest.indexOf(SEPARATOR, separator + 1);
+            String id = idEnd < 0 ? rest.substring(separator + 1)
+                    : rest.substring(separator + 1, idEnd);
+            if (provider.isEmpty() || id.isEmpty()) continue;
+            TrackKey key = TrackKey.of(provider, id);
             if (key == null) continue;
-            if (kind == 'l') liked.add(key); else if (kind == 'r') recent.add(key);
+            if (kind == 'l') {
+                liked.add(key);
+                if (idEnd > 0 && idEnd < rest.length() - 1) {
+                    labels.put(key, rest.substring(idEnd + 1));
+                }
+            } else if (kind == 'r') {
+                recent.add(key);
+            }
         }
     }
 
@@ -297,12 +327,39 @@ final class Library {
     }
 
     /** The persisted representation; the single writer and parser agree on it. */
+    /** Display label per liked identity; empty for files written before this. */
+    private final java.util.Map<TrackKey, String> labels = new java.util.HashMap<>();
+
+    /**
+     * One-line title.
+     *
+     * <p>Records are newline-delimited, so a line break in a title would forge a
+     * second record. Separators need no escaping: the label is the last field and
+     * is read to the end of the line.
+     */
+    private static String oneLine(String value) {
+        return value.replace("\r\n", " ").replace('\n', ' ').replace('\r', ' ');
+    }
+
+    /** Label remembered for a liked identity, or {@code null} when unknown. */
+    String labelFor(TrackKey key) {
+        if (key == null) return null;
+        synchronized (lock) { return labels.get(key); }
+    }
+
     String serialize() {
         StringBuilder text = new StringBuilder();
         synchronized (lock) {
             for (TrackKey key : liked) {
                 text.append('l').append(SEPARATOR).append(key.provider()).append(SEPARATOR)
-                        .append(key.providerTrackId()).append('\n');
+                        .append(key.providerTrackId());
+                String label = labels.get(key);
+                // Escaped, so a separator or newline in a title cannot corrupt
+                // the record. Files written before this simply have no field.
+                if (label != null && !label.isEmpty()) {
+                    text.append(SEPARATOR).append(oneLine(label));
+                }
+                text.append('\n');
             }
             for (TrackKey key : recent) {
                 text.append('r').append(SEPARATOR).append(key.provider()).append(SEPARATOR)

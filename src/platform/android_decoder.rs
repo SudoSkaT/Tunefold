@@ -341,6 +341,20 @@ impl MediaSource for StreamReader {
     }
 }
 
+/// Why a decode stopped.
+///
+/// Distinguishing these keeps a cancelled decode from being reported as the end
+/// of a track. `Ok(())` used to mean both, so every track change published a
+/// phantom end-of-track that the queue and autoplay policy then acted on, which
+/// is how a song could be skipped for reasons unrelated to what the user did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeOutcome {
+    /// The media really ended. Only this may drive Next, autoplay or stop.
+    EndOfMedia,
+    /// The decode was interrupted: track change, stop or error.
+    Cancelled,
+}
+
 /// Decoder state for the Android backend.
 pub struct AndroidDecoder {
     ring: Arc<PcmRing>,
@@ -383,7 +397,7 @@ impl AndroidDecoder {
         &self,
         url: String,
         headers: Vec<(String, String)>,
-    ) -> Result<(), DecoderError> {
+    ) -> Result<DecodeOutcome, DecoderError> {
         let decode_started = std::time::Instant::now();
         // Alinea la línea temporal con el Play tap medido en Java.
         self.trace.reset(
@@ -536,11 +550,11 @@ impl AndroidDecoder {
 
         loop {
             if self.cancel.load(Ordering::Relaxed) {
-                return Ok(());
+                return Ok(DecodeOutcome::Cancelled);
             }
             while !self.playing.load(Ordering::Acquire) {
                 if self.cancel.load(Ordering::Relaxed) {
-                    return Ok(());
+                    return Ok(DecodeOutcome::Cancelled);
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -590,7 +604,7 @@ impl AndroidDecoder {
                         buf.copy_interleaved_ref(decoded);
                         let samples = buf.samples();
                         if !self.feed_pcm(samples, channels, &mut stereo, decode_started) {
-                            return Ok(());
+                            return Ok(DecodeOutcome::Cancelled);
                         }
                     }
                     if packet_count == 1 || packet_count & 63 == 0 {
@@ -611,7 +625,7 @@ impl AndroidDecoder {
             self.diagnostics.decoded_packets.load(Ordering::Relaxed),
             self.diagnostics.decoded_frames.load(Ordering::Relaxed)
         ));
-        Ok(())
+        Ok(DecodeOutcome::EndOfMedia)
     }
 
     fn feed_pcm(

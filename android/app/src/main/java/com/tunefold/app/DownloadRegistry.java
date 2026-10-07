@@ -165,6 +165,7 @@ final class DownloadRegistry {
      * derived view instead of a second copy of the library.
      */
     void seedStored(Iterable<LocalMediaStore.Entry> entries) {
+        List<TrackKey> seeded = new ArrayList<>();
         for (LocalMediaStore.Entry entry : entries) {
             // Known state only: this enumeration IS the disk answer, so asking
             // the probe for an identity it is about to seed would be redundant I/O.
@@ -173,10 +174,14 @@ final class DownloadRegistry {
                 synchronized (states) {
                     states.put(entry.key, DownloadState.downloaded(entry.key, entry.size));
                 }
+                seeded.add(entry.key);
             }
         }
         // Every stored identity is now known, so later reads answer from memory.
         scanComplete = true;
+        // Rows built before the scan finished showed "Download" for tracks that were
+        // already on disk; without this they stayed wrong until the next reload.
+        for (TrackKey key : seeded) notifyChanged(key, stateOfKnown(key));
     }
 
     /**
