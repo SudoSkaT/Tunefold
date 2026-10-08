@@ -62,7 +62,7 @@ public class DownloadRegistryTest {
     @Test public void completedBlocksAFreshDownload() {
         TrackKey key = key("a");
         registry.beginResolving(key);
-        registry.complete(key, 2000);
+        registry.complete(key, 2000, null);
         assertTrue(registry.isDownloaded(key));
         assertFalse(registry.canStart(key));
     }
@@ -93,7 +93,7 @@ public class DownloadRegistryTest {
         // The same song reached from search, L1K3D, Descargadas and the queue.
         TrackKey key = key("dQw4w9WgXcQ");
         registry.beginResolving(key);
-        registry.complete(key, 3_449_447);
+        registry.complete(key, 3_449_447, null);
 
         // Membership in a playlist does not create a second identity.
         assertTrue(registry.isDownloaded(key));
@@ -105,7 +105,7 @@ public class DownloadRegistryTest {
     @Test public void forgettingReConsultsTheStoreSoDescargadasUpdates() {
         TrackKey key = key("a");
         registry.beginResolving(key);
-        registry.complete(key, 2000);
+        registry.complete(key, 2000, null);
         assertTrue(registry.isDownloaded(key));
 
         // The file is deleted: Descargadas must drop it immediately.
@@ -117,8 +117,8 @@ public class DownloadRegistryTest {
 
     @Test public void seededEntriesBecomeDownloaded() {
         List<LocalMediaStore.Entry> entries = new ArrayList<>();
-        entries.add(new LocalMediaStore.Entry(key("a"), 111L, null));
-        entries.add(new LocalMediaStore.Entry(key("b"), 222L, null));
+        entries.add(new LocalMediaStore.Entry(key("a"), 111L, null, null));
+        entries.add(new LocalMediaStore.Entry(key("b"), 222L, null, null));
         registry.seedStored(entries);
 
         assertTrue(registry.isDownloaded(key("a")));
@@ -165,7 +165,7 @@ public class DownloadRegistryTest {
         TrackKey key = key("a");
         registry.beginResolving(key);
         registry.progress(key, 1, 2, 1);
-        registry.complete(key, 2);
+        registry.complete(key, 2, null);
         assertEquals(3, events.size());
         assertEquals("RESOLVING_SOURCE:" + key, events.get(0));
         assertEquals("COMPLETED:" + key, events.get(2));
@@ -207,10 +207,55 @@ public class DownloadRegistryTest {
         assertFalse(registry.isDownloaded(key("z")));
     }
 
+    /**
+     * The title a download was committed under must be readable again after a restart,
+     * which is the whole reason it is remembered: identity alone renders a bare id.
+     */
+    @Test public void aSeededTitleIsReadableFromMemory() {
+        registry.seedStored(java.util.Collections.singletonList(
+                new LocalMediaStore.Entry(key("dl"), 42, null, "Never Gonna Give You Up")));
+        assertEquals("Never Gonna Give You Up", registry.titleOf(key("dl")));
+    }
+
+    /** The commit path remembers the title too, not just the scan. */
+    @Test public void aCommittedTitleIsReadableFromMemory() {
+        registry.complete(key("dl"), 4096, "Nice Title");
+        assertEquals("Nice Title", registry.titleOf(key("dl")));
+    }
+
+    /** A blank or missing title must never become an empty row label. */
+    @Test public void aBlankTitleIsNotRemembered() {
+        registry.complete(key("dl"), 4096, "   ");
+        assertEquals(null, registry.titleOf(key("dl")));
+        assertFalse(registry.rememberTitle(key("dl"), ""));
+        assertFalse(registry.rememberTitle(key("dl"), null));
+        assertEquals(null, registry.titleOf(key("dl")));
+    }
+
+    /** Titles are trimmed, so a stray newline cannot break the row's single line. */
+    @Test public void aTitleIsTrimmedOnce() {
+        registry.complete(key("dl"), 4096, "  Nice Title\n");
+        assertEquals("Nice Title", registry.titleOf(key("dl")));
+    }
+
+    /** An unknown identity has no title rather than a fabricated one. */
+    @Test public void anUnknownTrackHasNoTitle() {
+        assertEquals(null, registry.titleOf(key("never-seen")));
+        assertEquals(null, registry.titleOf(null));
+    }
+
+    /** Deleting the file must delete the label that described it. */
+    @Test public void forgettingATrackForgetsItsTitle() {
+        registry.complete(key("gone"), 100, "Nice Title");
+        registry.forget(key("gone"));
+        assertEquals("a label must not outlive the file it describes",
+                null, registry.titleOf(key("gone")));
+    }
+
     private static List<LocalMediaStore.Entry> entries(TrackKey... keys) {
         List<LocalMediaStore.Entry> entries = new ArrayList<>();
         for (TrackKey key : keys) {
-            entries.add(new LocalMediaStore.Entry(key, 42, null));
+            entries.add(new LocalMediaStore.Entry(key, 42, null, null));
         }
         return entries;
     }
@@ -237,5 +282,68 @@ public class DownloadRegistryTest {
         assertFalse(registry.canStart(null));
         assertFalse(registry.isDownloaded((TrackKey) null));
         assertFalse(registry.isActive((TrackKey) null));
+    }
+
+    // ------------------------------------------------- membership revision
+
+    /**
+     * Guards the "did the list itself change" signal.
+     *
+     * <p>{@code Descargadas} is a derived view. It used to be rendered once, at bind
+     * time — before the store scan that reads the download directory had reported
+     * anything — and the scan's own notification only re-bound rows. With no rows
+     * there was nothing to bind, so the view stayed empty for the rest of the
+     * session even though the files were on disk. A view needs to be able to tell
+     * "a row changed" from "this is a different list", and this counter is that.
+     */
+    @Test public void revisionMovesWhenTheStoreScanFinishes() {
+        int before = registry.revision();
+        registry.seedStored(entries(key("a"), key("b")));
+        assertTrue("the scan must be observable", registry.revision() > before);
+        assertEquals(2, registry.storedKeys().size());
+    }
+
+    @Test public void revisionDoesNotMoveWhenTheScanFindsNothing() {
+        int before = registry.revision();
+        registry.seedStored(new ArrayList<>());
+        assertEquals("an empty scan changes nothing", before, registry.revision());
+    }
+
+    @Test public void revisionMovesWhenATrackFinishesDownloading() {
+        TrackKey key = key("fresh");
+        int before = registry.revision();
+        registry.complete(key, 4096, null);
+        assertTrue("a committed download joins the derived list",
+                registry.revision() > before);
+        assertEquals(1, registry.storedKeys().size());
+    }
+
+    /** A second completion of the same track is not a new member. */
+    @Test public void revisionDoesNotMoveWhenAnAlreadyStoredTrackRepeats() {
+        TrackKey key = key("same");
+        registry.complete(key, 100, null);
+        int after = registry.revision();
+        registry.complete(key, 100, null);
+        assertEquals("re-completing is not a membership change", after, registry.revision());
+    }
+
+    @Test public void revisionMovesWhenADownloadIsRemoved() {
+        TrackKey key = key("gone");
+        registry.complete(key, 100, null);
+        int after = registry.revision();
+        registry.forget(key);
+        assertTrue("removing a download must leave the derived list",
+                registry.revision() > after);
+        assertEquals(0, registry.storedKeys().size());
+    }
+
+    /** Progress is not membership: a tick must not make a view rebuild. */
+    @Test public void progressDoesNotMoveTheRevision() {
+        TrackKey key = key("busy");
+        registry.beginResolving(key);
+        int before = registry.revision();
+        registry.progress(key, 512, 4096, 64);
+        registry.progress(key, 1024, 4096, 64);
+        assertEquals("progress is state, not membership", before, registry.revision());
     }
 }

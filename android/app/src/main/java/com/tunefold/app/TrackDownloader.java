@@ -51,6 +51,21 @@ final class TrackDownloader implements AutoCloseable {
 
     interface Observer { void onDownloadChanged(TrackKey key, DownloadState state); }
 
+    /**
+     * Supplies the native engine handle at the moment it is needed.
+     *
+     * <p>A {@code long} captured once was the root of two separate download failures.
+     * The engine is created on the controller's worker thread, so a handle read during
+     * startup could be a cached {@code 0} — every download then refused with "could not
+     * start" — and it used to be freed on every stop and error, so a handle cached
+     * before the first track ended pointed at released memory and the next call
+     * dereferenced it. Resolving per call removes both, and costs one volatile read.
+     */
+    interface EngineSource {
+        /** The live engine handle, or 0 when there is none. */
+        long handle();
+    }
+
     /** One in-flight native download. */
     private static final class Job {
         final TrackKey key;
@@ -75,7 +90,7 @@ final class TrackDownloader implements AutoCloseable {
     private final ProviderRegistry providers;
     private final LocalMediaStore store;
     private final File directory;
-    private final long engineHandle;
+    private final EngineSource engines;
     private final RecoveryPolicy recovery = new RecoveryPolicy();
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Map<TrackKey, Job> jobs = new HashMap<>();
@@ -83,22 +98,43 @@ final class TrackDownloader implements AutoCloseable {
     private volatile Observer observer;
     private volatile boolean closed;
 
-    TrackDownloader(ProviderRegistry providers, LocalMediaStore store, long engineHandle) {
+    TrackDownloader(ProviderRegistry providers, LocalMediaStore store, EngineSource engines) {
         this.providers = providers;
         this.store = store;
         // The store owns the location; the downloader must not invent one.
         this.directory = store.directory();
-        this.engineHandle = engineHandle;
+        this.engines = engines;
         this.registry = new DownloadRegistry(key -> store.get(key.provider(), key.providerTrackId()) != null);
         this.registry.setListener((key, state) -> notifyChanged(key, state));
-        // Abandoned `.part` files are cleaned at construction, never during Play.
-        try {
-            int removed = TunefoldBridge.cleanAbandonedDownloads(directory.getAbsolutePath());
-            if (removed > 0) Log.i(TAG, "event=DOWNLOAD_CLEAN_PARTS removed=" + removed);
-        } catch (Throwable failure) {
-            Log.w(TAG, "could not clean abandoned downloads: " + failure);
-        }
     }
+
+    /**
+     * Walks the download directory once, on its own thread, removing interrupted
+     * {@code .part} files.
+     *
+     * <p>Off the calling thread on purpose: it is a recursive directory walk with a
+     * {@code stat} and an {@code unlink} per entry, and it used to run inline from the
+     * constructor, which the service builds on the main looper.
+     */
+    void cleanAbandonedPartsAsync() {
+        File target = directory;
+        CLEANER.execute(() -> {
+            try {
+                int removed = TunefoldBridge.cleanAbandonedDownloads(target.getAbsolutePath());
+                if (removed > 0) Log.i(TAG, "event=DOWNLOAD_CLEAN_PARTS removed=" + removed);
+            } catch (Throwable failure) {
+                Log.w(TAG, "could not clean abandoned downloads: " + failure);
+            }
+        });
+    }
+
+    /** Daemon worker for the one-off startup directory walk. */
+    private static final java.util.concurrent.ExecutorService CLEANER =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread thread = new Thread(r, "tunefold-download-cleanup");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     /** The dedup authority: other components read state from here, never guess. */
     DownloadRegistry registry() { return registry; }
@@ -210,7 +246,7 @@ final class TrackDownloader implements AutoCloseable {
         }
         long id;
         try {
-            id = TunefoldBridge.startDownload(engineHandle, directory.getAbsolutePath(),
+            id = TunefoldBridge.startDownload(engines.handle(), directory.getAbsolutePath(),
                     key.provider(), key.providerTrackId(), source.url, source.headersJson);
         } catch (Throwable failureStarting) {
             registry.fail(key, "Download could not start: " + failureStarting);
@@ -232,7 +268,7 @@ final class TrackDownloader implements AutoCloseable {
         if (key == null) return false;
         Job job;
         synchronized (jobs) { job = jobs.remove(key); }
-        if (job != null) TunefoldBridge.cancelDownload(engineHandle, job.id);
+        if (job != null) TunefoldBridge.cancelDownload(engines.handle(), job.id);
         DownloadState state = registry.cancel(key);
         PlaybackTrace.markCurrent(PlaybackTrace.DOWNLOAD_CANCELLED, "id=" + key);
         return state.phase == DownloadState.Phase.CANCELLED;
@@ -269,7 +305,7 @@ final class TrackDownloader implements AutoCloseable {
      */
     private void poll(Job job) {
         if (closed || job.key == null) return;
-        String raw = TunefoldBridge.getDownloadProgress(engineHandle, job.id);
+        String raw = TunefoldBridge.getDownloadProgress(engines.handle(), job.id);
         if (raw == null) {
             synchronized (jobs) { jobs.remove(job.key); }
             finish(job);
@@ -307,8 +343,12 @@ final class TrackDownloader implements AutoCloseable {
         TrackKey key = job.key;
         String committed = TunefoldBridge.localMediaPath(directory.getAbsolutePath(),
                 key.provider(), key.providerTrackId());
+        // The title is registered with the file rather than kept in the session: the
+        // file is what survives, and a download row that lost its name on every restart
+        // read as a bare provider id.
+        String title = job.track == null ? null : job.track.title;
         boolean registered = committed != null
-                && store.register(key.provider(), key.providerTrackId(), new File(committed));
+                && store.register(key.provider(), key.providerTrackId(), new File(committed), title);
         if (!registered) {
             String message = readError();
             if (message.isEmpty()) {
@@ -324,14 +364,14 @@ final class TrackDownloader implements AutoCloseable {
         }
         File audio = store.get(key.provider(), key.providerTrackId());
         long size = audio == null ? 0 : audio.length();
-        registry.complete(key, size);
+        registry.complete(key, size, title);
         PlaybackTrace.markCurrent(PlaybackTrace.DOWNLOAD_COMPLETE, "id=" + key + " bytes=" + size);
         Log.i(TAG, "event=DOWNLOAD_COMPLETE id=" + key + " bytes=" + size);
     }
 
     private String readError() {
         try {
-            String error = TunefoldBridge.getLastError(engineHandle);
+            String error = TunefoldBridge.getLastError(engines.handle());
             return error == null ? "" : error;
         } catch (Throwable unavailable) {
             return "";
@@ -353,7 +393,7 @@ final class TrackDownloader implements AutoCloseable {
         closed = true;
         synchronized (jobs) {
             for (Job job : jobs.values()) {
-                TunefoldBridge.cancelDownload(engineHandle, job.id);
+                TunefoldBridge.cancelDownload(engines.handle(), job.id);
             }
             jobs.clear();
         }

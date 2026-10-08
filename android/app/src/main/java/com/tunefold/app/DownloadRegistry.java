@@ -31,9 +31,28 @@ final class DownloadRegistry {
     interface Listener { void onDownloadChanged(TrackKey key, DownloadState state); }
 
     private final Map<TrackKey, DownloadState> states = new LinkedHashMap<>();
+    /**
+     * Title each download was committed under.
+     *
+     * <p>Memory only, and that is the point: the row's label has to be readable on the
+     * main thread several times a second, so it may not come from the sidecar on demand.
+     * The store writes the title once at commit and seeds it back on every scan.
+     */
+    private final Map<TrackKey, String> titles = new LinkedHashMap<>();
     private final StoredProbe probe;
     /** True once a full store enumeration has been seeded. */
     private volatile boolean scanComplete;
+    /**
+     * Bumped whenever the set of downloaded identities changes.
+     *
+     * <p>Exists so a view derived from this registry can tell "a row's state changed"
+     * from "the list gained or lost a track" in O(1). Without it, {@code Descargadas}
+     * was rendered once at bind time — empty, because the store scan had not finished
+     * — and the seed notification only re-bound rows, of which there were none, so the
+     * downloads that were sitting on disk never appeared.
+     */
+    private final java.util.concurrent.atomic.AtomicInteger revision =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     DownloadRegistry(StoredProbe probe) {
         this.probe = probe;
@@ -114,12 +133,47 @@ final class DownloadRegistry {
                 received, total, speed, ""));
     }
 
-    /** Marks the download finished and committed. */
-    DownloadState complete(TrackKey key, long size) {
-        return put(key, DownloadState.downloaded(key, size));
+    /**
+     * Marks the download finished and committed, remembering the title it was
+     * committed under.
+     *
+     * @param title title to remember for the row, or {@code null} when unknown
+     */
+    DownloadState complete(TrackKey key, long size, String title) {
+        rememberTitle(key, title);
+        // Membership, not just state: this identity is now part of the derived view,
+        // and a view that only rebinds rows cannot make a row appear.
+        boolean wasDownloaded = isDownloaded(key);
+        DownloadState next = put(key, DownloadState.downloaded(key, size));
+        if (!wasDownloaded) revision.incrementAndGet();
+        return next;
     }
 
     /** Marks the download failed with a retryable error. */
+    /**
+     * Remembers a title for an identity, replacing any earlier one.
+     *
+     * <p>A blank title is ignored rather than stored: an empty string is what a row
+     * would render as, and remembering one would turn "no title" into "empty title".
+     *
+     * @return {@code true} when the remembered title changed
+     */
+    boolean rememberTitle(TrackKey key, String title) {
+        if (key == null || title == null || title.trim().isEmpty()) return false;
+        String cleaned = title.trim();
+        synchronized (states) {
+            if (cleaned.equals(titles.get(key))) return false;
+            titles.put(key, cleaned);
+        }
+        return true;
+    }
+
+    /** Title remembered for an identity, or {@code null}. Memory only, never disk. */
+    String titleOf(TrackKey key) {
+        if (key == null) return null;
+        synchronized (states) { return titles.get(key); }
+    }
+
     DownloadState fail(TrackKey key, String error) {
         DownloadState next = new DownloadState(key, DownloadState.Phase.FAILED,
                 0, -1, -1, error == null ? "Download failed" : error);
@@ -152,8 +206,14 @@ final class DownloadRegistry {
     DownloadState forget(TrackKey key) {
         if (key == null) return DownloadState.idle(null);
         DownloadState previous;
-        synchronized (states) { previous = states.remove(key); }
+        synchronized (states) {
+            previous = states.remove(key);
+            // The title described a file that no longer exists; keeping it would
+            // leave a label behind for a track `Descargadas` no longer lists.
+            titles.remove(key);
+        }
         DownloadState next = stateOf(key);
+        if (previous != null && previous.isDownloaded()) revision.incrementAndGet();
         if (previous != null) notifyChanged(key, next);
         return next;
     }
@@ -176,9 +236,13 @@ final class DownloadRegistry {
                 }
                 seeded.add(entry.key);
             }
+            // Seeded from the sidecar, so the title survives a restart exactly like
+            // the file does.
+            rememberTitle(entry.key, entry.title());
         }
         // Every stored identity is now known, so later reads answer from memory.
         scanComplete = true;
+        if (!seeded.isEmpty()) revision.incrementAndGet();
         // Rows built before the scan finished showed "Download" for tracks that were
         // already on disk; without this they stayed wrong until the next reload.
         for (TrackKey key : seeded) notifyChanged(key, stateOfKnown(key));
@@ -199,6 +263,14 @@ final class DownloadRegistry {
         }
         return keys;
     }
+
+    /**
+     * Changes whenever an identity becomes downloaded for the first time.
+     *
+     * <p>Cheap by design: a derived view polls this instead of diffing its own rows,
+     * which would be O(n) per download-progress notification.
+     */
+    int revision() { return revision.get(); }
 
     /** Validated size of a stored file, or 0 when it is not stored. */
     long storedSize(TrackKey key) {

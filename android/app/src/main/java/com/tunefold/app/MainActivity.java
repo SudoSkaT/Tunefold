@@ -5,8 +5,8 @@ import android.content.ComponentName;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.res.Configuration;
-import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
@@ -16,33 +16,49 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.inputmethod.EditorInfo;
-import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 
 /**
  * Tunefold Android UI.
  *
- * <p>Navigation over Home, Search, L1K3D and Descargadas, with Now Playing as
- * the primary surface (§24). Deliberately a single screen with a section switch
- * rather than a multi-screen architecture: the app does not yet need it, and one
- * surface keeps playback state visible everywhere.
+ * <p>Navigation over Home, Search, L1K3D and Descargadas, with Now Playing as the
+ * primary surface (§24). Deliberately a single screen with a section switch rather than
+ * a multi-screen architecture: the app does not yet need it, and one surface keeps
+ * playback state visible everywhere.
  *
  * <p>This Activity holds <b>no playback state</b>. It binds to
- * {@link ForegroundPlaybackService}, renders {@link PlaybackSession} snapshots
- * and sends commands. Rotation and Activity recreation therefore rebuild the
- * whole screen from service-owned state and cannot desynchronise (§18).
+ * {@link ForegroundPlaybackService}, renders {@link PlaybackSession} snapshots and
+ * sends commands. Rotation and Activity recreation therefore rebuild the whole screen
+ * from service-owned state and cannot desynchronise (§18).
+ *
+ * <h3>What this class is responsible for</h3>
+ * Composition and commands only. Every dimension comes from {@link DesignTokens},
+ * every glyph from {@link Icon}, and every control from the shared components. The
+ * Activity builds its tree once in {@link #buildInterface} and then only mutates it:
+ * nothing here re-creates a view after construction, and nothing here re-reads a value
+ * it could have cached.
  */
-public final class MainActivity extends Activity {
+public final class MainActivity extends Activity implements TrackList.StateSource {
+
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     /** Stable observer identity, so add/remove pair up across reconnects. */
     private final PlaybackSession.Observer sessionObserver = this::onSessionChanged;
+    /** Reused across every tick, so polling the position allocates nothing. */
+    private final PlaybackPosition position = new PlaybackPosition();
+    /** Row handlers, held once so recycling never re-allocates a listener. */
+    private final TrackRow.Callbacks rowCallbacks = new TrackRow.Callbacks() {
+        @Override public void onPlay(TrackRow row) { playFromRow(row.track()); }
+        @Override public void onToggleLike(TrackRow row) { toggleLike(row.track()); }
+        @Override public void onAdvanceDownload(TrackRow row) {
+            advanceDownload(row.track());
+        }
+    };
 
     private PlaybackController controller;
     private ProviderRegistry providers;
@@ -54,25 +70,34 @@ public final class MainActivity extends Activity {
     private boolean destroyed;
     private boolean landscape;
 
+    private TrackList.RowPool rowPool;
     private NowPlayingView nowPlaying;
     private PlaybackDebugPanel debugPanel;
     private EditText queryInput;
-    private TextView sectionHeader;
+    private IconButton searchAction;
     private LinearLayout sectionContent;
-    private LinearLayout results;
     private TextView statusLine;
+    private final NavigationItem[] navItems = new NavigationItem[Section.values().length];
 
-    /** Which list the results area is showing. */
+    /** Which list the content area is showing. */
     private enum Section { HOME, SEARCH, LIKED, DOWNLOADED }
     private Section section = Section.HOME;
 
-    /** Artwork requests in flight, keyed by identity so a late load is ignored. */
+    /** Identity Home was last rendered for, so it only reloads on a real change. */
+    private String homeTrackKey = "";
+    /**
+     * {@code Descargadas} revision the visible list was built from.
+     *
+     * <p>The list is re-derived, not merely re-bound, when this changes: a newly
+     * downloaded track has no row to rebind. Without it the view stayed permanently
+     * empty after a restart, because it was built before the store scan reported what
+     * was already on disk.
+     */
+    private int downloadsRenderedRevision = -1;
+    private boolean searchInFlight;
+
     /** Request code for the runtime POST_NOTIFICATIONS prompt. */
     private static final int NOTIFICATION_PERMISSION_REQUEST = 4201;
-    private String artworkRequestId = "";
-    /** Identity whose artwork is already decoded into the view. */
-    private String artworkShownKey = "";
-    private boolean searchInFlight;
 
     private final ServiceConnection connection = new ServiceConnection() {
         @Override public void onServiceConnected(ComponentName name, IBinder service) {
@@ -89,7 +114,7 @@ public final class MainActivity extends Activity {
             // which let a reconnect stack duplicate observers.
             session.addObserver(sessionObserver);
             applyOrientation(getResources().getConfiguration());
-            loadSection(Section.HOME, true);
+            loadSection(Section.HOME);
             if (getIntent().getBooleanExtra("runtime_smoke_test", false)) resolveAndPlay();
             applyRuntimeDownloadHook();
         }
@@ -105,6 +130,10 @@ public final class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // Before anything measures: every dimension in the tree comes from a token.
+        DesignTokens.init(this);
+        getWindow().setBackgroundDrawable(
+                new ColorDrawable(DesignTokens.Palette.SURFACE_BASE));
         buildInterface();
         requestNotificationPermissionIfNeeded();
         Intent service = new Intent(this, ForegroundPlaybackService.class);
@@ -115,10 +144,10 @@ public final class MainActivity extends Activity {
     /**
      * Asks for {@code POST_NOTIFICATIONS} on the versions that require it.
      *
-     * <p>Declaring the permission is not enough from Android 13 on: without the
-     * runtime grant the media notification is never shown, so lock-screen and
-     * headset controls would look broken. Asked once per install; the system
-     * remembers a refusal, and playback never depends on the answer.
+     * <p>Declaring the permission is not enough from Android 13 on: without the runtime
+     * grant the media notification is never shown, so lock-screen and headset controls
+     * would look broken. Asked once per install; the system remembers a refusal, and
+     * playback never depends on the answer.
      */
     private void requestNotificationPermissionIfNeeded() {
         if (android.os.Build.VERSION.SDK_INT < 33) return;
@@ -131,78 +160,29 @@ public final class MainActivity extends Activity {
     // ------------------------------------------------------------------ UI
 
     private void buildInterface() {
-        int pad = NowPlayingView.dp(this, 16);
+        rowPool = new TrackList.RowPool(this, rowCallbacks);
+        int gutter = DesignTokens.dp(DesignTokens.CONTENT_PADDING_HORIZONTAL);
+
         // A ScrollView keeps every control reachable when the window is short.
         ScrollView scroller = new ScrollView(this);
         scroller.setFillViewport(true);
         LinearLayout page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
-        page.setBackgroundColor(Color.parseColor("#FAFBFD"));
-        page.setPadding(pad, NowPlayingView.dp(this, 8), pad, pad);
+        page.setBackgroundColor(DesignTokens.Palette.SURFACE_BASE);
+        page.setPadding(gutter, DesignTokens.dp(DesignTokens.CONTENT_PADDING_TOP),
+                gutter, DesignTokens.dp(DesignTokens.CONTENT_PADDING_BOTTOM));
         // Stop the search field from grabbing focus at launch, which raised the
         // keyboard over the Now Playing panel before the user asked for it.
         page.setFocusableInTouchMode(true);
         page.requestFocus();
         scroller.addView(page, new ScrollView.LayoutParams(-1, -2));
 
-        // ---- Brand + diagnostics ----
-        LinearLayout brand = new LinearLayout(this);
-        brand.setOrientation(LinearLayout.HORIZONTAL);
-        brand.setGravity(Gravity.CENTER_VERTICAL);
-        TextView brandName = new TextView(this);
-        brandName.setText("Tunefold");
-        brandName.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
-        brandName.setTextColor(Color.parseColor("#101317"));
-        brand.addView(brandName, new LinearLayout.LayoutParams(0, -2, 1f));
-        Button diagnostics = plainButton("Diagnostics");
-        diagnostics.setOnClickListener(view -> {
-            debugPanel.toggle();
-            renderDiagnostics();
-        });
-        brand.addView(diagnostics, new LinearLayout.LayoutParams(-2, -2));
-        page.addView(brand, new LinearLayout.LayoutParams(-1, -2));
+        page.addView(buildTopBar(), spaced(-1, -2, 0f));
 
-        // ---- Navigation ----
-        LinearLayout nav = new LinearLayout(this);
-        nav.setOrientation(LinearLayout.HORIZONTAL);
-        int navGap = NowPlayingView.dp(this, 6);
-        nav.addView(navButton("Home", () -> loadSection(Section.HOME, true)),
-                navItemParams(navGap, 0));
-        nav.addView(navButton("Search", () -> loadSection(Section.SEARCH, true)),
-                navItemParams(navGap, 0));
-        nav.addView(navButton("L1K3D", () -> loadSection(Section.LIKED, true)),
-                navItemParams(navGap, 0));
-        nav.addView(navButton("Descargadas", () -> loadSection(Section.DOWNLOADED, true)),
-                navItemParams(navGap, 0));
-        LinearLayout.LayoutParams navParams = new LinearLayout.LayoutParams(-1, -2);
-        navParams.topMargin = NowPlayingView.dp(this, 8);
-        page.addView(nav, navParams);
+        LinearLayout nav = buildNavigation();
+        page.addView(nav, spaced(-1, -2, DesignTokens.REGION_GAP));
 
-        // ---- Search field ----
-        queryInput = new EditText(this);
-        queryInput.setSingleLine(true);
-        queryInput.setHint("Search or paste a YouTube URL");
-        queryInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-        queryInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        queryInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
-        queryInput.setBackground(new ColorDrawable(Color.parseColor("#EEF1F5")));
-        queryInput.setOnEditorActionListener((view, actionId, event) -> {
-            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
-                submitQuery();
-                return true;
-            }
-            return false;
-        });
-        LinearLayout.LayoutParams inputParams = new LinearLayout.LayoutParams(-1, -2);
-        inputParams.topMargin = NowPlayingView.dp(this, 10);
-        page.addView(queryInput, inputParams);
-
-        Button search = plainButton("Search");
-        search.setOnClickListener(view -> submitQuery());
-        LinearLayout.LayoutParams searchParams =
-                new LinearLayout.LayoutParams(-1, NowPlayingView.dp(this, 48));
-        searchParams.topMargin = NowPlayingView.dp(this, 8);
-        page.addView(search, searchParams);
+        page.addView(buildSearchRow(), spaced(-1, -2, DesignTokens.REGION_GAP));
 
         // ---- Now Playing (primary surface) ----
         nowPlaying = new NowPlayingView(this, new NowPlayingView.Actions() {
@@ -214,7 +194,7 @@ public final class MainActivity extends Activity {
             @Override public void onLike() {
                 session.toggleLike();
                 // L1K3D is visible in this same view, so refresh immediately.
-                if (section == Section.LIKED) loadSection(Section.LIKED, false);
+                if (section == Section.LIKED) loadSection(Section.LIKED);
             }
 
             @Override public void onDownload() {
@@ -240,67 +220,144 @@ public final class MainActivity extends Activity {
                 session.setAutoplayEnabled(!session.autoplayEnabled());
             }
         });
-        nowPlaying.bindErrorAction(() -> session.retry(), () -> session.skipToNext());
-        nowPlaying.bindDownloadAction(
-                () -> startDownload(),
-                () -> cancelDownload(),
-                () -> retryDownload());
-        LinearLayout.LayoutParams nowPlayingParams = new LinearLayout.LayoutParams(-1, -2);
-        nowPlayingParams.topMargin = NowPlayingView.dp(this, 12);
-        page.addView(nowPlaying.view(), nowPlayingParams);
+        page.addView(nowPlaying.view(), spaced(-1, -2, DesignTokens.REGION_GAP));
 
         debugPanel = new PlaybackDebugPanel(this);
-        LinearLayout.LayoutParams debugParams = new LinearLayout.LayoutParams(-1, -2);
-        debugParams.topMargin = NowPlayingView.dp(this, 8);
-        page.addView(debugPanel.view(), debugParams);
+        page.addView(debugPanel.view(), spaced(-1, -2, DesignTokens.GAP));
 
         // ---- Section content ----
-        sectionHeader = new TextView(this);
-        sectionHeader.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        sectionHeader.setTextColor(Color.parseColor("#5B6472"));
-        page.addView(sectionHeader, new LinearLayout.LayoutParams(-1, -2));
-
         sectionContent = new LinearLayout(this);
         sectionContent.setOrientation(LinearLayout.VERTICAL);
-        page.addView(sectionContent, new LinearLayout.LayoutParams(-1, -2));
+        page.addView(sectionContent, spaced(-1, -2, 0f));
 
         statusLine = new TextView(this);
-        statusLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        statusLine.setTextColor(Color.parseColor("#5B6472"));
-        page.addView(statusLine, new LinearLayout.LayoutParams(-1, -2));
-
-        // Legacy results container kept for the search section.
-        results = new LinearLayout(this);
-        results.setOrientation(LinearLayout.VERTICAL);
+        statusLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_CAPTION_SIZE);
+        statusLine.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        statusLine.setVisibility(View.GONE);
+        page.addView(statusLine, spaced(-1, -2, DesignTokens.GAP));
 
         setContentView(scroller);
         applyOrientation(getResources().getConfiguration());
     }
 
-    private Button navButton(String label, Runnable action) {
-        Button view = plainButton(label);
-        view.setMaxLines(1);
-        view.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        view.setPadding(NowPlayingView.dp(this, 4), 0, NowPlayingView.dp(this, 4), 0);
-        view.setOnClickListener(ignored -> action.run());
-        return view;
+    private View buildTopBar() {
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setMinimumHeight(DesignTokens.dp(DesignTokens.TOP_BAR_HEIGHT));
+
+        TextView brandName = new TextView(this);
+        brandName.setText("Tunefold");
+        brandName.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_DISPLAY_SIZE);
+        brandName.setLetterSpacing(DesignTokens.TYPE_DISPLAY_TRACKING);
+        brandName.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        brandName.setIncludeFontPadding(false);
+        bar.addView(brandName, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        IconButton diagnostics = new IconButton(this, DesignTokens.CONTROL_TARGET,
+                DesignTokens.ICON_SIZE_SMALL);
+        diagnostics.setAction(Icon.DIAGNOSTICS, "Diagnostics");
+        diagnostics.setOnClickListener(view -> {
+            debugPanel.toggle();
+            renderDiagnostics();
+        });
+        bar.addView(diagnostics, new LinearLayout.LayoutParams(
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET),
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET)));
+        return bar;
     }
 
-    /** Equal-width navigation slots with a gap, so labels never resize the row. */
-    private LinearLayout.LayoutParams navItemParams(int gap, int leftMargin) {
-        LinearLayout.LayoutParams params =
-                new LinearLayout.LayoutParams(0, NowPlayingView.dp(this, 40), 1f);
-        params.leftMargin = leftMargin;
+    /**
+     * The four destinations.
+     *
+     * <p>Built once. Switching section only flips each slot's selected state, so the bar
+     * never re-inflates and its width never depends on the current label.
+     */
+    private LinearLayout buildNavigation() {
+        LinearLayout nav = new LinearLayout(this);
+        nav.setOrientation(LinearLayout.HORIZONTAL);
+        int height = DesignTokens.dp(DesignTokens.CONTROL_TARGET_NAVIGATION);
+        int gap = DesignTokens.dp(DesignTokens.GAP_TIGHT);
+        Section[] order = {Section.HOME, Section.SEARCH, Section.LIKED, Section.DOWNLOADED};
+        for (int index = 0; index < order.length; index++) {
+            Section target = order[index];
+            NavigationItem item = new NavigationItem(this, glyphFor(target), labelFor(target));
+            item.setOnClickListener(view -> loadSection(target));
+            navItems[target.ordinal()] = item;
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, height, 1f);
+            if (index > 0) params.leftMargin = gap;
+            nav.addView(item, params);
+        }
+        return nav;
+    }
+
+    private LinearLayout buildSearchRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        queryInput = new EditText(this);
+        queryInput.setSingleLine(true);
+        queryInput.setHint("Search or paste a YouTube URL");
+        queryInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
+        queryInput.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        queryInput.setHintTextColor(DesignTokens.Palette.ON_SURFACE_FAINT);
+        queryInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        queryInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+        queryInput.setBackground(roundDrawable(DesignTokens.Palette.SURFACE_RAISED,
+                DesignTokens.RADIUS_MEDIUM));
+        queryInput.setOnEditorActionListener((view, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                submitQuery();
+                return true;
+            }
+            return false;
+        });
+        int fieldHeight = DesignTokens.dp(DesignTokens.SEARCH_FIELD_HEIGHT);
+        row.addView(queryInput, new LinearLayout.LayoutParams(0, fieldHeight, 1f));
+
+        // The IME action is the usual way to search; this is the discoverable one, and
+        // both reach the same command.
+        searchAction = new IconButton(this);
+        searchAction.setAction(Icon.SEARCH, "Search");
+        searchAction.setOnClickListener(view -> submitQuery());
+        LinearLayout.LayoutParams actionParams =
+                new LinearLayout.LayoutParams(DesignTokens.dp(DesignTokens.CONTROL_TARGET),
+                        DesignTokens.dp(DesignTokens.CONTROL_TARGET));
+        actionParams.leftMargin = DesignTokens.dp(DesignTokens.GAP);
+        row.addView(searchAction, actionParams);
+        return row;
+    }
+
+    private static Icon glyphFor(Section target) {
+        switch (target) {
+            case HOME: return Icon.HOME;
+            case SEARCH: return Icon.SEARCH;
+            case LIKED: return Icon.HEART;
+            default: return Icon.DOWNLOADS;
+        }
+    }
+
+    private static CharSequence labelFor(Section target) {
+        switch (target) {
+            case HOME: return "Home";
+            case SEARCH: return "Search";
+            case LIKED: return "L1K3D";
+            default: return "Descargadas";
+        }
+    }
+
+    private LinearLayout.LayoutParams spaced(int width, int height, float gapDp) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(width, height);
+        if (gapDp > 0f) params.topMargin = DesignTokens.dp(gapDp);
         return params;
     }
 
-    private Button plainButton(String label) {
-        Button view = new Button(this);
-        view.setText(label);
-        view.setAllCaps(false);
-        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        return view;
+    private static GradientDrawable roundDrawable(int color, float radiusDp) {
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(color);
+        shape.setCornerRadius(DesignTokens.dp(radiusDp));
+        return shape;
     }
 
     // ------------------------------------------------------------ behaviour
@@ -311,43 +368,43 @@ public final class MainActivity extends Activity {
         if (query.isEmpty()) return;
         if (query.contains("youtube.com/") || query.contains("youtu.be/")) {
             session.playUrl(query);
-            section = Section.SEARCH;
+            selectSection(Section.SEARCH);
             showStatus("Playing URL");
             return;
         }
-        section = Section.SEARCH;
+        selectSection(Section.SEARCH);
         searchInFlight = true;
-        sectionHeader.setText("Searching…");
-        sectionContent.removeAllViews();
+        showSearchResults(null);
         session.search(query, (tracks, error) -> {
             searchInFlight = false;
             if (error != null) {
                 showStatus(error);
                 return;
             }
-            showSearchResults(tracks);
+            if (section == Section.SEARCH) {
+                showSearchResults(tracks);
+            }
         });
     }
 
     private void resolveAndPlay() {
         String url = getIntent().getStringExtra("runtime_stream_url");
         if (url == null || session == null) return;
-        // Switch the surface as well as the section, otherwise the previously
-        // rendered list stays on screen under a search header.
-        loadSection(Section.SEARCH, false);
+        // Switch the surface as well as the section, otherwise the previously rendered
+        // list stays on screen under a search header.
+        loadSection(Section.SEARCH);
         session.playUrl(url);
     }
 
     /**
      * Deterministic hook so download flows can be exercised without screen taps.
      *
-     * <p>It drives the same public commands the buttons call — no second code
-     * path — and only acts when the extra is present, so normal launches are
-     * unaffected.
+     * <p>It drives the same public commands the controls call — no second code path — and
+     * only acts when the extra is present, so normal launches are unaffected.
      */
     private void applyRuntimeDownloadHook() {
         if (!getIntent().getBooleanExtra("runtime_download", false)) return;
-        section = Section.SEARCH;
+        selectSection(Section.SEARCH);
         String action = getIntent().getStringExtra("runtime_download_action");
         String label = getIntent().getStringExtra("runtime_track_label");
         MediaTrack track = label == null ? null : new MediaTrack(
@@ -356,7 +413,7 @@ public final class MainActivity extends Activity {
             showStatus("runtime_download needs runtime_track_label");
             return;
         }
-        loadSection(Section.SEARCH, false);
+        loadSection(Section.SEARCH);
         if ("start".equals(action)) {
             session.play(track);
             startDownload();
@@ -365,7 +422,7 @@ public final class MainActivity extends Activity {
         } else if ("retry".equals(action)) {
             retryDownload();
         } else if ("like".equals(action)) {
-            library.toggleLiked(track);
+            toggleLike(track);
         } else if ("remove".equals(action)) {
             downloader.remove(track);
         }
@@ -375,10 +432,10 @@ public final class MainActivity extends Activity {
     private void startDownload() {
         MediaTrack track = session == null ? null : session.snapshot().currentTrack;
         if (track == null || downloader == null) return;
-        // §6: the downloader decides whether this is a start, a no-op because
-        // the file exists, or a refusal because one is already running.
+        // §6: the downloader decides whether this is a start, a no-op because the file
+        // exists, or a refusal because one is already running.
         downloader.start(track);
-        if (section == Section.DOWNLOADED) loadSection(Section.DOWNLOADED, false);
+        refreshLists();
     }
 
     private void retryDownload() {
@@ -387,124 +444,196 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * Cancels the in-flight download of the current track (§8). This must reach
-     * the downloader: a button that only repaints would look functional and do
-     * nothing (§26).
+     * Cancels the in-flight download of the current track (§8). This must reach the
+     * downloader: a control that only repainted would look functional and do nothing
+     * (§26).
      */
     private void cancelDownload() {
         MediaTrack track = session == null ? null : session.snapshot().currentTrack;
         if (track != null && downloader != null) downloader.cancel(track);
-        if (section == Section.DOWNLOADED) loadSection(Section.DOWNLOADED, false);
+        refreshLists();
         render();
     }
 
+    /** Plays a track chosen from a row and shows its cover. */
+    private void playFromRow(MediaTrack track) {
+        if (session == null || track == null) return;
+        session.play(track);
+    }
+
+    private void toggleLike(MediaTrack track) {
+        if (library == null || track == null) return;
+        library.toggleLiked(track);
+        if (section == Section.LIKED) loadSection(Section.LIKED);
+        else refreshLists();
+    }
+
+    /**
+     * Advances a row's download by one step.
+     *
+     * <p>The row's own rendered phase decides which step that is, and the control stays
+     * enabled while a download runs so it can act as Cancel: an action the user cannot
+     * reach would make cancellation look broken (§8, §26).
+     */
+    private void advanceDownload(MediaTrack track) {
+        if (downloader == null || track == null) return;
+        DownloadState state = downloader.stateOf(track);
+        if (state.isActive()) downloader.cancel(track);
+        else if (state.isRetryable()) downloader.retry(track);
+        else if (state.isDownloaded()) downloader.remove(track);
+        else downloader.start(track);
+        refreshLists();
+    }
+
+    // ---------------------------------------------------------- list sources
+
+    @Override public boolean isLiked(MediaTrack track) {
+        return library != null && library.isLiked(track);
+    }
+
+    @Override public DownloadState downloadOf(MediaTrack track) {
+        if (downloader == null || track == null) return DownloadState.idle(null);
+        return downloader.stateOf(track);
+    }
+
+    // ------------------------------------------------------------- sections
+
     /** Loads the content of a navigation section. */
-    private void loadSection(Section target, boolean refreshContent) {
-        section = target;
-        sectionTracks.clear();
-        lastDownloadSignature = downloadSignature();
+    private void loadSection(Section target) {
+        selectSection(target);
         if (session == null) return;
         switch (target) {
             case HOME: renderHome(true); break;
-            case SEARCH: showStatus("Search for a track above"); break;
+            case SEARCH: renderSearchPrompt(); break;
             case LIKED: renderLiked(); break;
-            case DOWNLOADED: renderDownloaded(); break;
-            default: break;
+            default: renderDownloaded(); break;
         }
         render();
     }
 
-    /** Identity Home was last rendered for, so it only reloads on a real change. */
-    private String homeTrackKey = "";
+    /** Highlights a destination without touching the content. */
+    private void selectSection(Section target) {
+        section = target;
+        for (Section candidate : Section.values()) {
+            navItems[candidate.ordinal()].setActiveDestination(candidate == target);
+        }
+    }
 
     /**
      * Home: continue listening, L1K3D and recommendations, each independently.
      *
-     * <p>Reloads when the current track changes (or the user asks), never on
-     * every state tick: a recommendation request is a provider round trip and must
-     * not be repeated on each render.
+     * <p>Reloads when the current track changes (or the user asks), never on every state
+     * tick: a recommendation request is a provider round trip and must not be repeated on
+     * each render.
      */
     private void renderHome(boolean force) {
         PlaybackSession.Snapshot snapshot = session.snapshot();
         String currentId = snapshot.currentKey == null ? "" : snapshot.currentKey.toString();
         if (!force && currentId.equals(homeTrackKey)) return;
         homeTrackKey = currentId;
-        sectionHeader.setText("Home");
-        sectionContent.removeAllViews();
+        clearSection();
 
         if (snapshot.currentTrack != null) {
-            sectionContent.addView(sectionLabel("Continue listening"));
-            sectionContent.addView(trackRow(snapshot.currentTrack, true));
+            List<MediaTrack> continuing = new ArrayList<>(1);
+            continuing.add(snapshot.currentTrack);
+            addGroup("Continue listening", SectionHeader.NO_COUNT).submit(continuing);
         }
 
         List<TrackKey> liked = session.likedKeys();
         if (!liked.isEmpty()) {
-            sectionContent.addView(sectionLabel("L1K3D (" + liked.size() + ")"));
+            List<MediaTrack> tracks = new ArrayList<>(liked.size());
             for (TrackKey key : liked) {
                 MediaTrack track = session.describeLiked(key);
-                if (track != null) sectionContent.addView(trackRow(track, false));
+                if (track != null) tracks.add(track);
             }
+            addGroup("L1K3D", liked.size()).submit(tracks);
         }
 
-        sectionContent.addView(sectionLabel("Recommended"));
         if (snapshot.currentTrack == null) {
-            sectionContent.addView(sectionLabel("Play something first to get recommendations"));
+            addMessage("Play something first to get recommendations");
             return;
         }
         // Asynchronous and non-fatal: a failure leaves Home usable (§25).
-        TextView pending = sectionLabel("Loading…");
-        sectionContent.addView(pending);
+        TrackList recommendations = addGroup("Recommended", SectionHeader.NO_COUNT);
+        TextView pending = message("Loading…");
+        recommendations.addView(pending);
         session.recommendationsForHome(snapshot.currentTrack, (candidates, error) -> {
             if (destroyed || section != Section.HOME) return;
-            int mark = sectionContent.indexOfChild(pending);
-            if (mark >= 0) sectionContent.removeViewAt(mark);
-            if (candidates == null || candidates.isEmpty()) {
-                sectionContent.addView(sectionLabel("No recommendations available"));
+            recommendations.removeView(pending);
+            List<MediaTrack> tracks = candidates == null ? new ArrayList<>() : candidates;
+            if (tracks.isEmpty()) {
+                recommendations.addView(message("No recommendations available"));
                 return;
             }
-            for (MediaTrack track : candidates) sectionContent.addView(trackRow(track, false));
+            recommendations.submit(tracks);
         });
     }
 
     /** L1K3D: membership only. Downloads are a separate, derived playlist. */
     private void renderLiked() {
         List<TrackKey> keys = session.likedKeys();
-        sectionHeader.setText("L1K3D (" + keys.size() + ")");
-        sectionContent.removeAllViews();
+        clearSection();
         if (keys.isEmpty()) {
-            sectionContent.addView(sectionLabel("Nothing here yet. Use Like on any track."));
+            addMessage("Nothing here yet. Use Like on any track.");
             return;
         }
+        List<MediaTrack> tracks = new ArrayList<>(keys.size());
+        int unresolved = 0;
         for (TrackKey key : keys) {
             MediaTrack track = session.describeLiked(key);
             if (track != null) {
-                sectionContent.addView(trackRow(track, false));
+                tracks.add(track);
             } else {
-                // Membership is durable, but we may not hold the metadata yet.
-                // Fetch it lazily rather than pretending the track is gone.
-                sectionContent.addView(sectionLabel("Resolving " + key));
+                // Membership is durable, but we may not hold the metadata yet. Showing
+                // the identity beats pretending the track is gone.
+                tracks.add(placeholderFor(key));
+                unresolved++;
             }
+        }
+        addGroup("L1K3D", keys.size()).submit(tracks);
+        if (unresolved > 0) {
+            addMessage(unresolved + (unresolved == 1
+                    ? " track is still resolving its metadata."
+                    : " tracks are still resolving their metadata."));
         }
     }
 
     /**
      * `Descargadas`: a derived view of the LocalMediaStore (§5).
      *
-     * <p>No membership list is stored. A deleted file disappears from here on the
-     * next enumeration, and a downloaded track appears without ever being added.
+     * <p>No membership list is stored. A deleted file disappears from here on the next
+     * enumeration, and a downloaded track appears without ever being added.
      */
     private void renderDownloaded() {
-        sectionHeader.setText("Descargadas");
-        sectionContent.removeAllViews();
         List<TrackKey> keys = session.downloadedKeys();
+        downloadsRenderedRevision = session.downloadsRevision();
+        clearSection();
         if (keys.isEmpty()) {
-            sectionContent.addView(sectionLabel("No downloads yet. Use Download on any track."));
+            addMessage("No downloads yet. Use Download on any track.");
             return;
         }
+        List<MediaTrack> tracks = new ArrayList<>(keys.size());
         for (TrackKey key : keys) {
             MediaTrack track = session.describeLiked(key);
-            sectionContent.addView(trackRow(track != null ? track : placeholderFor(key), false));
+            tracks.add(track != null ? track : placeholderFor(key));
         }
+        addGroup("Descargadas", keys.size()).submit(tracks);
+    }
+
+    private void renderSearchPrompt() {
+        clearSection();
+        addMessage("Search for a track above");
+    }
+
+    private void showSearchResults(List<MediaTrack> tracks) {
+        clearSection();
+        int count = tracks == null ? 0 : tracks.size();
+        if (count == 0) {
+            addMessage(searchInFlight ? "Searching…" : "No results");
+            return;
+        }
+        addGroup(count + (count == 1 ? " result" : " results"),
+                SectionHeader.NO_COUNT).submit(tracks);
     }
 
     private MediaTrack placeholderFor(TrackKey key) {
@@ -512,142 +641,97 @@ public final class MainActivity extends Activity {
                 "", "", "", "artist", -1, "", "", "{}");
     }
 
-    private TextView sectionLabel(String text) {
+    // ------------------------------------------------------- section content
+
+    /**
+     * Empties the content area, returning every list's rows to the shared pool.
+     *
+     * <p>Returning the rows rather than dropping them is what makes a section switch
+     * cost no view inflation: the next section re-points them.
+     */
+    private void clearSection() {
+        for (int i = 0; i < sectionContent.getChildCount(); i++) {
+            View child = sectionContent.getChildAt(i);
+            if (child instanceof TrackList) ((TrackList) child).detachAll();
+        }
+        sectionContent.removeAllViews();
+    }
+
+    private TrackList addGroup(String title, int count) {
+        SectionHeader header = new SectionHeader(this);
+        header.setTitle(title, count);
+        sectionContent.addView(header, spaced(-1, -2, DesignTokens.SECTION_GAP));
+        TrackList list = new TrackList(this, rowPool, this);
+        sectionContent.addView(list, spaced(-1, -2, 0f));
+        list.setActiveTrack(session == null ? null : session.snapshot().currentKey);
+        return list;
+    }
+
+    private void addMessage(CharSequence text) {
+        sectionContent.addView(message(text), spaced(-1, -2, DesignTokens.GAP));
+    }
+
+    private TextView message(CharSequence text) {
         TextView view = new TextView(this);
         view.setText(text);
-        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        view.setTextColor(Color.parseColor("#8A929E"));
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
+        view.setTextColor(DesignTokens.Palette.ON_SURFACE_FAINT);
         return view;
     }
 
     /**
-     * One row per track, showing identity-independent state: liked, downloaded,
-     * and the download action for this specific track (§8).
+     * Re-applies like and download state to every visible list.
+     *
+     * <p>This replaces the previous "rebuild the section when the download signature
+     * changed" behaviour. Building a signature string meant allocating a StringBuilder
+     * and a String over every listed row on every notification, and the rebuild it
+     * triggered threw away and re-inflated the whole section, which moved the scroll
+     * position out from under the user. Rebinding is O(rows), allocation-free, and does
+     * not touch the layout when nothing changed.
      */
-    private View trackRow(MediaTrack track, boolean playing) {
-        // Every list row goes through here, so this is where the section's
-        // identities are recorded for stale-label detection.
-        if (track != null && track.key() != null) sectionTracks.add(track.key());
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-
-        Button main = plainButton((playing ? "▶ " : "") + track.displayText());
-        main.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-        main.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        main.setOnClickListener(view -> {
-            if (session != null) session.play(track);
-            loadArtwork(track);
-        });
-        row.addView(main, new LinearLayout.LayoutParams(0, NowPlayingView.dp(this, 48), 1f));
-
-        DownloadState download = downloader == null
-                ? DownloadState.idle(track.key()) : downloader.stateOf(track);
-        Button downloadButton = plainButton(shortDownloadLabel(download));
-        // Stays enabled while active so it can act as Cancel: an action the user
-        // cannot reach would make cancellation look broken (§8, §26).
-        downloadButton.setEnabled(!download.isDownloaded());
-        downloadButton.setOnClickListener(view -> {
-            if (downloader == null || track == null) return;
-            DownloadState state = downloader.stateOf(track);
-            if (state.isActive()) downloader.cancel(track);
-            else if (state.isRetryable()) downloader.retry(track);
-            else if (state.isDownloaded()) downloader.remove(track);
-            else downloader.start(track);
-            render();
-        });
-        LinearLayout.LayoutParams downloadParams =
-                new LinearLayout.LayoutParams(-2, NowPlayingView.dp(this, 48));
-        downloadParams.leftMargin = NowPlayingView.dp(this, 6);
-        row.addView(downloadButton, downloadParams);
-
-        Button likeButton = plainButton(library != null && library.isLiked(track) ? "Liked" : "Like");
-        likeButton.setOnClickListener(view -> {
-            if (library != null) {
-                library.toggleLiked(track);
-                loadArtwork(track);
-                render();
-                if (section == Section.LIKED) loadSection(Section.LIKED, false);
-            }
-        });
-        LinearLayout.LayoutParams likeParams =
-                new LinearLayout.LayoutParams(-2, NowPlayingView.dp(this, 48));
-        likeParams.leftMargin = NowPlayingView.dp(this, 6);
-        row.addView(likeButton, likeParams);
-        return row;
-    }
-
-    /** Compact download label for a list row (§8). */
-    private String shortDownloadLabel(DownloadState state) {
-        switch (state.phase) {
-            case RESOLVING_SOURCE: return "…";
-            case DOWNLOADING: {
-                int percent = state.progressPercent();
-                return percent >= 0 ? percent + "%" : "…";
-            }
-            case COMPLETED:
-            case ALREADY_DOWNLOADED: return "Downloaded";
-            case FAILED: return "Retry";
-            case CANCELLED: return "Retry";
-            default: return "Download";
+    private void refreshLists() {
+        TrackKey active = session == null ? null : session.snapshot().currentKey;
+        for (int i = 0; i < sectionContent.getChildCount(); i++) {
+            View child = sectionContent.getChildAt(i);
+            if (!(child instanceof TrackList)) continue;
+            TrackList list = (TrackList) child;
+            list.setActiveTrack(active);
+            list.refresh();
         }
     }
 
-    private void showSearchResults(List<MediaTrack> tracks) {
-        sectionHeader.setText(tracks.size() + (tracks.size() == 1 ? " result" : " results"));
-        sectionContent.removeAllViews();
-        if (tracks == null || tracks.isEmpty()) {
-            sectionContent.addView(sectionLabel("No results"));
-            return;
-        }
-        for (MediaTrack track : tracks) sectionContent.addView(trackRow(track, false));
-    }
-
-    /** Identities the current section lists, used to detect stale row labels. */
-    private final List<TrackKey> sectionTracks = new ArrayList<>();
+    // ------------------------------------------------------------- artwork
 
     /**
-     * Download state of everything the section lists.
+     * Decodes the cover for {@code track} into the Now Playing view, once per track.
      *
-     * <p>Rows are built once, so a download that completes (or the store scan that
-     * discovers one) would otherwise leave a row reading "Download" for a track
-     * that is already on disk.
-     */
-    private String downloadSignature() {
-        if (downloader == null) return "";
-        StringBuilder signature = new StringBuilder();
-        for (TrackKey key : sectionTracks) {
-            signature.append(key).append('=')
-                    .append(downloader.stateOf(key).phase).append(';');
-        }
-        return signature.toString();
-    }
-
-    private String lastDownloadSignature = "\u0000none";
-
-    /**
-     * Decodes the artwork for {@code track} into the Now Playing view, once.
-     *
-     * <p>The UI refreshes on a timer, so requesting on every render meant
-     * re-reading and re-decoding the same file twice a second for the whole
-     * session. Guarding by identity keeps the view correct while making the cost
-     * proportional to tracks, not to ticks (§27).
+     * <p>The UI refreshes on a timer, so requesting on every render meant re-reading and
+     * re-decoding the same file twice a second for the whole session. Guarding by
+     * identity keeps the view correct while making the cost proportional to tracks, not
+     * to ticks (§27).
      */
     private void loadArtwork(MediaTrack track) {
         if (providers == null || track == null || track.thumbnail.isEmpty()) return;
-        String expected = track.providerId;
-        if (expected.equals(artworkShownKey)) return;
-        artworkShownKey = expected;
-        artworkRequestId = expected;
+        String identity = identityOf(track);
+        if (identity.isEmpty() || identity.equals(nowPlaying.artwork().shownCoverId())) return;
+        nowPlaying.expectArtwork(identity);
         providers.loadArtwork(track, (bitmap, error) -> {
             if (destroyed || bitmap == null) return;
-            // A late load must never overwrite a newer track's artwork.
-            if (!expected.equals(artworkRequestId)) return;
-            nowPlaying.setArtwork(track, bitmap);
+            // The view refuses any identity it is not waiting for, so a decode that
+            // finishes after a skip cannot repaint the previous cover.
+            nowPlaying.setArtwork(identity, bitmap);
         });
     }
 
-    private void showStatus(String text) { statusLine.setText(text); }
+    private static String identityOf(MediaTrack track) {
+        TrackKey key = track.key();
+        return key == null ? "" : key.toString();
+    }
+
+    private void showStatus(CharSequence text) {
+        statusLine.setText(text);
+        statusLine.setVisibility(text == null || text.length() == 0 ? View.GONE : View.VISIBLE);
+    }
 
     // -------------------------------------------------------------- render
 
@@ -655,36 +739,57 @@ public final class MainActivity extends Activity {
     private void onSessionChanged() {
         if (destroyed || session == null) return;
         render();
-        String signature = downloadSignature();
-        if (!signature.equals(lastDownloadSignature)) {
-            lastDownloadSignature = signature;
-            // Reload only when a listed row's download state really changed, so a
-            // playback tick never disturbs the scroll position.
-            loadSection(section, false);
+        if (section == Section.DOWNLOADED) {
+            // The store scan finishes after this screen binds, and a download commits
+            // after that. Both change which tracks exist, which a rebind cannot express.
+            if (session.downloadsRevision() != downloadsRenderedRevision) {
+                renderDownloaded();
+            } else {
+                refreshLists();
+            }
+        } else {
+            refreshLists();
         }
+        if (section == Section.HOME) renderHome(false);
     }
 
+    /**
+     * Applies one snapshot to every part of the surface.
+     *
+     * <p>Deliberately six narrow calls rather than one {@code nowPlaying.render(...)}:
+     * each one compares against what it last rendered, so a change that touches nothing
+     * visible costs six comparisons instead of a dozen {@code setText} calls and the
+     * layout passes they schedule.
+     */
     private void render() {
         if (destroyed || session == null) return;
         PlaybackSession.Snapshot snapshot = session.snapshot();
-        nowPlaying.render(snapshot);
+        nowPlaying.applyTrack(snapshot);
+        nowPlaying.applyPlaybackState(snapshot);
+        nowPlaying.applyLibraryState(snapshot);
+        nowPlaying.applyDownloadState(snapshot);
+        nowPlaying.applyError(snapshot);
         if (snapshot.currentTrack != null) {
             loadArtwork(snapshot.currentTrack);
-            showStatus("");
+            clearStatus();
         }
-        // Keep Home honest: it used to say "play something first" while a track
-        // was already playing, because it only rendered once at bind time.
-        if (section == Section.HOME) renderHome(false);
         if (debugPanel.isVisible()) renderDiagnostics();
+    }
+
+    private void clearStatus() {
+        if (statusLine.getVisibility() == View.GONE) return;
+        statusLine.setText("");
+        statusLine.setVisibility(View.GONE);
     }
 
     private void renderDiagnostics() {
         if (session == null || !debugPanel.isVisible()) return;
-        StringBuilder text = new StringBuilder();
-        text.append("state=").append(session.snapshot().state).append('\n');
-        text.append("queue=").append(session.snapshot().queue.size())
-                .append(" index=").append(session.snapshot().queueIndex).append('\n');
-        text.append("autoplay=").append(session.autoplayEnabled()).append('\n');
+        StringBuilder text = new StringBuilder(256);
+        PlaybackSession.Snapshot snapshot = session.snapshot();
+        text.append("state=").append(snapshot.state).append('\n');
+        text.append("queue=").append(snapshot.queue.size())
+                .append(" index=").append(snapshot.queueIndex).append('\n');
+        text.append("autoplay=").append(snapshot.autoplayEnabled).append('\n');
         if (downloader != null) {
             text.append("recovery=").append(downloader.recoverySummary()).append('\n');
         }
@@ -692,7 +797,14 @@ public final class MainActivity extends Activity {
         debugPanel.update(text.toString(), session.trace());
     }
 
-    /** Position advances faster than state changes, so it is polled. */
+    /**
+     * Position tick.
+     *
+     * <p>The only periodic work left on the UI thread, and it reads through the cheap
+     * path: no snapshot, no queue copy, no allocation, and the control skips the
+     * {@code setText}/{@code setProgress} calls unless the second or the bar actually
+     * moved.
+     */
     private final Runnable poll = new Runnable() {
         @Override public void run() {
             if (destroyed) return;
@@ -705,13 +817,13 @@ public final class MainActivity extends Activity {
                 }
             }
             if (session != null) {
-                // One snapshot per tick: position and track always come from the
-                // same read, so a tick can never pair one track with another's time.
-                PlaybackSession.Snapshot snapshot = session.snapshot();
-                nowPlaying.setPosition(snapshot.currentKey, snapshot.positionMs,
-                        snapshot.currentTrack == null ? 0 : snapshot.currentTrack.durationMs);
+                // One consistent read per tick: identity and position always come from
+                // the same instant, so a tick can never pair one track with another
+                // track's time.
+                PlaybackPosition now = session.readPosition(position);
+                nowPlaying.setPosition(now.key, now.positionMs, now.durationMs);
             }
-            mainHandler.postDelayed(this, 500);
+            mainHandler.postDelayed(this, DesignTokens.POSITION_INTERVAL_MS);
         }
     };
 
@@ -720,41 +832,54 @@ public final class MainActivity extends Activity {
     /**
      * Re-applies the validation hooks when the Activity is already running.
      *
-     * <p>Needed to reproduce rapid track switches deterministically: delivering a
-     * second intent while the first track is still resolving is the only way to
-     * exercise the supersede path on a real device. Validation-only, and it calls
-     * exactly the same commands a tap would.
+     * <p>Needed to reproduce rapid track switches deterministically: delivering a second
+     * intent while the first track is still resolving is the only way to exercise the
+     * supersede path on a real device. Validation-only, and it calls exactly the same
+     * commands a tap would.
      */
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
         if (destroyed || session == null) return;
-        loadSection(Section.SEARCH, false);
+        loadSection(Section.SEARCH);
         if (intent.getBooleanExtra("runtime_smoke_test", false)) resolveAndPlay();
         applyRuntimeDownloadHook();
     }
 
     @Override public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
+        // The user's font scale can change with the configuration; tokens must follow.
+        DesignTokens.init(this);
         applyOrientation(newConfig);
     }
 
     /**
-     * Adapts to the window: orientation plus an artwork side derived from the
-     * window, so the cover is never tiny on a large screen nor oversized on a
-     * small one, and the controls keep a usable height on a short window.
+     * Adapts to the window: orientation plus an artwork side derived from the window, so
+     * the cover is never tiny on a large screen nor oversized on a small one, and the
+     * controls keep a usable height on a short window.
      */
     private void applyOrientation(Configuration configuration) {
         landscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE;
         if (nowPlaying == null) return;
         nowPlaying.setLandscape(landscape);
         android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
-        int smaller = Math.min(metrics.widthPixels, metrics.heightPixels);
-        int padding = NowPlayingView.dp(this, 32) + NowPlayingView.dp(this, 16);
-        int side = landscape
-                ? Math.min((int) (metrics.heightPixels * 0.72),
-                        (int) (metrics.widthPixels * 0.42))
-                : smaller - padding;
+        int padding = DesignTokens.dp(DesignTokens.CONTENT_PADDING_HORIZONTAL)
+                + DesignTokens.dp(DesignTokens.GAP);
+        int side;
+        if (landscape) {
+            // Beside the details, so the cover competes with a column of controls for
+            // the shorter dimension rather than filling it.
+            side = Math.min((int) (metrics.heightPixels * 0.72f),
+                    (int) (metrics.widthPixels * 0.42f));
+        } else {
+            // Above the details, so the cover is also bounded by the window's height.
+            // Sizing it by width alone made a full-bleed square that pushed every
+            // control below the fold on a tall phone, which is the opposite of what
+            // Now Playing is for.
+            int available = metrics.widthPixels - padding;
+            int heightBudget = (int) (metrics.heightPixels * 0.38f);
+            side = Math.min(available, heightBudget);
+        }
         nowPlaying.setArtworkSidePx(side);
     }
 
@@ -763,9 +888,13 @@ public final class MainActivity extends Activity {
         mainHandler.removeCallbacks(poll);
         if (session != null) session.removeObserver(sessionObserver);
         if (bound) unbindService(connection);
+        // Pooled rows are Views: dropping the pool is what lets the Activity and its
+        // window go, instead of being retained by rows nobody will ever show again.
+        if (rowPool != null) rowPool.clear();
         session = null;
         controller = null;
         providers = null;
+        library = null;
         downloader = null;
         serviceBinder = null;
         super.onDestroy();

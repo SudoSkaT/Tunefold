@@ -76,17 +76,18 @@ final class PlaybackController implements AudioTrackOutput.Listener {
     private void startPlaybackSource(PlayableSource source, PlaybackTrace trace, long requestId,
                                      Runnable onStarted) {
         state = LOADING;
-        startedCallback = onStarted;
+        // Delivered on the main thread. The session that owns this callback is
+        // main-thread only and notifies its observers — which touch views — the moment
+        // it runs. Firing it on the audio worker raised
+        // CalledFromWrongThreadException inside that worker, which the worker then
+        // reported as an audio error, so a perfectly healthy playback surfaced to the
+        // user as "Error".
+        startedCallback = onStarted == null ? null : () -> MainThread.run(onStarted);
         error = "";
         notifyChanged();
         commands.execute(() -> {
             if (operation.get() != requestId) return;
             long handle = engine;
-            if (handle == 0 && !released) {
-                try { handle = TunefoldBridge.createEngine(); }
-                catch (Throwable failure) { fail("JNI initialization failed: " + failure); return; }
-                engine = handle;
-            }
             if (released || handle == 0) { fail("Rust engine is unavailable"); return; }
             output.requestStop();
             output.awaitStopped();
@@ -195,8 +196,8 @@ final class PlaybackController implements AudioTrackOutput.Listener {
             long handle = engine;
             output.requestStop();
             output.awaitStopped();
+            // The engine is stopped, not destroyed: see {@link #engineHandle()}.
             if (handle != 0) TunefoldBridge.stopAudio(handle);
-            destroyEngine(handle);
             state = STOPPED;
             notifyChanged();
         });
@@ -262,14 +263,12 @@ final class PlaybackController implements AudioTrackOutput.Listener {
             output.requestStop();
             output.awaitStopped();
             TunefoldBridge.stopAudio(handle);
-            destroyEngine(handle);
             state = ERROR;
             notifyChanged();
         } else if (nativeState == STOPPED && state != STOPPED) {
             output.requestStop();
             output.awaitStopped();
             TunefoldBridge.stopAudio(handle);
-            destroyEngine(handle);
             state = STOPPED;
             notifyChanged();
         } else {
@@ -289,7 +288,20 @@ final class PlaybackController implements AudioTrackOutput.Listener {
      */
     long attempt() { return operation.get(); }
 
-    /** Native engine handle, or 0 when the engine is not initialized. */
+    /**
+     * Native engine handle, or 0 before the engine exists.
+     *
+     * <p>The handle is stable for the whole life of this controller: the engine is
+     * created once and reused, and freed only by {@link #release()}.
+     *
+     * <p>It used to be destroyed on every stop, error and end-of-track, which had two
+     * consequences that made downloads unusable. A {@code long} handed out earlier
+     * became a dangling pointer, so the next {@code startDownload} dereferenced freed
+     * memory; and because the engine is created on this controller's worker thread,
+     * anything that read the handle during startup could read a cached {@code 0} and
+     * keep it forever. Every JNI caller now resolves the handle at call time, and the
+     * handle itself no longer moves.
+     */
     long engineHandle() { return engine; }
 
     /** Playback position in milliseconds as tracked by the decoder. */

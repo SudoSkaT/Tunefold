@@ -1,36 +1,47 @@
 package com.tunefold.app;
 
 import android.content.Context;
-import android.graphics.Color;
+import android.content.res.ColorStateList;
+import android.graphics.Bitmap;
 import android.graphics.drawable.ColorDrawable;
-import android.graphics.drawable.Drawable;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
-import android.widget.Button;
-import android.widget.FrameLayout;
-import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
 /**
- * Android now-playing surface.
+ * The now-playing surface: artwork, then identity, then state, then progress, then the
+ * transport, then the secondary actions.
  *
- * <p>Reflects the whole observable session at once: track, artist, artwork,
- * state, progress, duration, liked, downloaded and error (§11). Nothing here
- * holds state of its own — it renders whatever {@link PlaybackSession} reports,
- * which is why a recreated Activity looks identical to the one it replaced.
+ * <p>Reflects whatever {@link PlaybackSession} reports and holds no state of its own
+ * beyond the last value each part rendered, which is what lets a recreated Activity
+ * look identical to the one it replaced.
  *
- * <p>Built in code rather than XML so every dimension is expressed in
- * {@code dp}/{@code sp} and the layout re-measures for whatever window it is
- * given, instead of relying on fixed sizes.
+ * <h3>One entry point per kind of change</h3>
+ * This surface used to have a single {@code render(snapshot)} that re-applied
+ * everything: metadata, state, progress, download and error, on every notification. A
+ * position tick therefore re-set six labels and a progress bar, and a state change
+ * re-read the track title. Each of those is a {@code setText} or {@code setProgress},
+ * and each requests layout and then a draw.
  *
- * <p>Technical diagnostics never appear here; they belong to
- * {@link PlaybackDebugPanel}.
+ * <p>So the update is split into {@link #applyTrack}, {@link #applyPlaybackState},
+ * {@link #applyLibraryState}, {@link #applyDownloadState}, {@link #applyError} and
+ * {@link #setPosition}, and every one of them compares against what it last rendered
+ * before it writes. A notification that changes one thing now touches one view, and a
+ * tick that cannot change anything visible costs a handful of comparisons.
+ *
+ * <h3>Built in code, from tokens</h3>
+ * Every dimension and colour comes from {@link DesignTokens}, so nothing here can drift
+ * from the rest of the surface. There are no fixed sizes: the cover is derived from the
+ * window by the Activity and clamped here.
+ *
+ * <p>Technical diagnostics never appear here; they belong to {@link PlaybackDebugPanel}.
  */
 final class NowPlayingView {
+
     /** Callbacks to the Activity. All invoked on the UI thread. */
     interface Actions {
         void onPlayPause();
@@ -46,431 +57,370 @@ final class NowPlayingView {
         void onToggleAutoplay();
     }
 
+    /** What the error action offers; decides its glyph, its description and its effect. */
+    private enum ErrorAction { NONE, RETRY, SKIP }
+
+    private static final CharSequence NOTHING_PLAYING = "Nothing playing";
+
+    private final Actions actions;
     private final LinearLayout root;
-    private final LinearLayout nowPlaying;
-    private final FrameLayout artworkFrame;
+    private final LinearLayout stage;
+    private final ArtworkView artwork;
     private final LinearLayout details;
-    private final ImageView artwork;
     private final TextView title;
     private final TextView subtitle;
     private final TextView stateLabel;
     private final TextView errorLabel;
+    private final IconButton errorAction;
     private final ProgressBar buffering;
-    private final ProgressBar progress;
-    private final TextView elapsed;
-    private final TextView total;
-    private final Button previous;
-    private final Button playPause;
-    private final Button next;
-    private final Button like;
-    private final Button download;
-    private final Button errorAction;
-    private final Button autoplay;
-    /** Phase the download button was last rendered with; drives its click action. */
-    private DownloadState.Phase downloadPhase = DownloadState.Phase.IDLE;
+    private final ProgressControl progress;
+    private final IconButton previous;
+    private final PrimaryPlaybackButton playPause;
+    private final IconButton next;
+    private final IconButton stop;
+    private final SecondaryActionButton autoplay;
+    private final SecondaryActionButton like;
+    private final SecondaryActionButton download;
 
-    private String activeArtworkId = "";
-    /**
-     * Identity the displayed track and elapsed time belong to.
-     *
-     * <p>Progress ticks for any other identity are refused, which is what keeps a
-     * previous track's time from appearing over the current one.
-     */
+    // ---- last rendered values; every apply* method compares before it writes ----
+
     private TrackKey activeTrackKey;
-    private Drawable placeholder;
+    private boolean metadataShown;
+    private PlaybackState renderedState;
+    private boolean renderedWaiting;
+    private boolean renderedPlaying;
+    private boolean renderedAutoplay;
+    private boolean renderedLiked;
+    private DownloadState.Phase renderedDownloadPhase;
+    private int renderedDownloadPercent = Integer.MIN_VALUE;
+    private ErrorAction renderedErrorAction = ErrorAction.NONE;
+    private CharSequence renderedErrorText = "";
     private boolean landscape;
     private int artworkSidePx;
-
-    /** Bounds for the cover, in dp, applied to the window-derived size. */
-    private static final int MIN_ARTWORK_DP = 160;
-    private static final int MAX_ARTWORK_DP = 420;
+    private String artworkSideKey = "";
 
     NowPlayingView(Context context, Actions actions) {
-        int pad = dp(context, 20);
+        DesignTokens.init(context);
+        this.actions = actions;
+        int pad = DesignTokens.dp(DesignTokens.CARD_PADDING);
         root = new LinearLayout(context);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(pad, dp(context, 4), pad, dp(context, 4));
+        root.setPadding(pad, pad, pad, pad);
+        root.setBackground(new ColorDrawable(DesignTokens.Palette.SURFACE_CARD));
+        root.setElevation(DesignTokens.dp(DesignTokens.ELEVATION_CARD));
 
-        // `nowPlaying` holds artwork and details as SIBLINGS from the start, so
-        // an orientation change only re-weights them: no view is ever re-parented
-        // and nothing can end up hidden in the wrong mode.
-        nowPlaying = new LinearLayout(context);
-        nowPlaying.setOrientation(LinearLayout.VERTICAL);
-        root.addView(nowPlaying, new LinearLayout.LayoutParams(-1, -2));
+        // `stage` holds artwork and details as SIBLINGS from the start, so an
+        // orientation change only re-weights them: no view is ever re-parented and
+        // nothing can end up hidden in the wrong mode.
+        stage = new LinearLayout(context);
+        stage.setOrientation(LinearLayout.VERTICAL);
+        root.addView(stage, new LinearLayout.LayoutParams(-1, -2));
 
-        // ---- 1. Artwork ----
-        artworkFrame = new SquareFrameLayout(context);
-        artworkFrame.setBackground(new ColorDrawable(Color.parseColor("#1F2430")));
-        artwork = new ImageView(context);
-        artwork.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        artwork.setContentDescription("Artwork");
-        placeholder = new ColorDrawable(Color.parseColor("#2A3140"));
-        artwork.setImageDrawable(placeholder);
-        artworkFrame.addView(artwork, new FrameLayout.LayoutParams(-1, -1));
-        nowPlaying.addView(artworkFrame, new LinearLayout.LayoutParams(-1, -2));
+        artwork = new ArtworkView(context);
+        stage.addView(artwork, new LinearLayout.LayoutParams(-1, -2));
 
         details = new LinearLayout(context);
         details.setOrientation(LinearLayout.VERTICAL);
-        nowPlaying.addView(details, new LinearLayout.LayoutParams(-1, -2));
+        stage.addView(details, new LinearLayout.LayoutParams(-1, -2));
 
-        // ---- 2. Title / artist ----
-        title = new TextView(context);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
-        title.setTextColor(Color.parseColor("#101317"));
+        title = label(context, DesignTokens.TYPE_TITLE_SIZE, DesignTokens.Palette.ON_SURFACE);
         title.setMaxLines(2);
         title.setEllipsize(TextUtils.TruncateAt.END);
-        title.setText("Nothing playing");
-        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(-1, -2);
-        titleParams.topMargin = dp(context, 16);
-        details.addView(title, titleParams);
+        title.setText(NOTHING_PLAYING);
+        addDetails(title, DesignTokens.BLOCK_GAP);
 
-        subtitle = new TextView(context);
-        subtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-        subtitle.setTextColor(Color.parseColor("#5B6472"));
+        subtitle = label(context, DesignTokens.TYPE_BODY_SIZE,
+                DesignTokens.Palette.ON_SURFACE_MUTED);
         subtitle.setMaxLines(1);
         subtitle.setEllipsize(TextUtils.TruncateAt.END);
-        details.addView(subtitle, new LinearLayout.LayoutParams(-1, -2));
+        addDetails(subtitle, 0f);
 
-        // ---- 3. Playback state ----
-        stateLabel = new TextView(context);
-        stateLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        stateLabel.setTextColor(Color.parseColor("#5B6472"));
-        LinearLayout.LayoutParams stateParams = new LinearLayout.LayoutParams(-1, -2);
-        stateParams.topMargin = dp(context, 10);
-        details.addView(stateLabel, stateParams);
+        stateLabel = label(context, DesignTokens.TYPE_LABEL_SIZE,
+                DesignTokens.Palette.ON_SURFACE_MUTED);
+        stateLabel.setLetterSpacing(DesignTokens.TYPE_LABEL_TRACKING);
+        stateLabel.setAllCaps(true);
+        addDetails(stateLabel, DesignTokens.GAP);
 
-        // Errors get their own line plus an action, never a silent dead end (§19).
-        errorLabel = new TextView(context);
-        errorLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        errorLabel.setTextColor(Color.parseColor("#B3261E"));
+        // A failure gets its own line plus an action, never a silent dead end (§19).
+        errorLabel = label(context, DesignTokens.TYPE_BODY_SIZE, DesignTokens.Palette.ERROR);
         errorLabel.setVisibility(View.GONE);
-        details.addView(errorLabel, new LinearLayout.LayoutParams(-1, -2));
+        addDetails(errorLabel, 0f);
 
-        errorAction = button(context, "Retry", actions::onRetryPlayback);
+        errorAction = new IconButton(context);
         errorAction.setVisibility(View.GONE);
-        LinearLayout.LayoutParams errorActionParams = new LinearLayout.LayoutParams(-2, dp(context, 40));
-        errorActionParams.topMargin = dp(context, 4);
-        details.addView(errorAction, errorActionParams);
+        addDetails(errorAction, DesignTokens.GAP_TIGHT, -2);
 
         buffering = new ProgressBar(context);
         buffering.setIndeterminate(true);
         buffering.setVisibility(View.GONE);
-        LinearLayout.LayoutParams bufferingParams = new LinearLayout.LayoutParams(-1, dp(context, 3));
-        bufferingParams.topMargin = dp(context, 6);
-        details.addView(buffering, bufferingParams);
+        buffering.setIndeterminateTintList(ColorStateList.valueOf(ArtworkTheme.accent()));
+        buffering.setContentDescription("Buffering");
+        addDetails(buffering, DesignTokens.GAP);
 
-        // ---- 4. Progress ----
-        LinearLayout progressRow = new LinearLayout(context);
-        progressRow.setOrientation(LinearLayout.HORIZONTAL);
-        progressRow.setGravity(Gravity.CENTER_VERTICAL);
-        progress = new ProgressBar(context, null,
-                android.R.attr.progressBarStyleHorizontal);
-        progress.setMax(1000);
-        progress.setProgress(0);
-        elapsed = timeLabel(context);
-        total = timeLabel(context);
-        total.setGravity(Gravity.END);
-        int timeWidth = dp(context, 52);
-        progressRow.addView(elapsed, new LinearLayout.LayoutParams(timeWidth, -2));
-        progressRow.addView(progress, new LinearLayout.LayoutParams(0, -2, 1f));
-        progressRow.addView(total, new LinearLayout.LayoutParams(timeWidth, -2));
-        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(-1, -2);
-        progressParams.topMargin = dp(context, 8);
-        details.addView(progressRow, progressParams);
+        progress = new ProgressControl(context);
+        addDetails(progress, DesignTokens.BLOCK_GAP);
 
-        // ---- 5. Transport ----
-        LinearLayout transport = new LinearLayout(context);
-        transport.setOrientation(LinearLayout.HORIZONTAL);
-        transport.setGravity(Gravity.CENTER);
-        int gap = dp(context, 10);
-        previous = button(context, "Previous", actions::onPrevious);
-        playPause = button(context, "Play", actions::onPlayPause);
-        next = button(context, "Next", actions::onNext);
-        transport.addView(previous, new LinearLayout.LayoutParams(0, dp(context, 52), 1f));
-        LinearLayout.LayoutParams playParams = new LinearLayout.LayoutParams(0, dp(context, 52), 1.4f);
-        playParams.leftMargin = gap;
+        // ---- transport: previous, the one control that matters, next ----
+        LinearLayout transport = row(context, Gravity.CENTER);
+        int target = DesignTokens.dp(DesignTokens.CONTROL_TARGET);
+        previous = new IconButton(context);
+        previous.setAction(Icon.PREVIOUS, "Previous track");
+        previous.setOnClickListener(ignored -> actions.onPrevious());
+        transport.addView(previous, new LinearLayout.LayoutParams(target, target));
+
+        playPause = new PrimaryPlaybackButton(context);
+        playPause.setAction(Icon.PLAY, "Start playback");
+        playPause.setOnClickListener(ignored -> actions.onPlayPause());
+        LinearLayout.LayoutParams playParams = new LinearLayout.LayoutParams(
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET_PRIMARY),
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET_PRIMARY));
+        playParams.leftMargin = DesignTokens.dp(DesignTokens.SECTION_GAP);
         transport.addView(playPause, playParams);
-        LinearLayout.LayoutParams nextParams = new LinearLayout.LayoutParams(0, dp(context, 52), 1f);
-        nextParams.leftMargin = gap;
+
+        next = new IconButton(context);
+        next.setAction(Icon.NEXT, "Next track");
+        next.setOnClickListener(ignored -> actions.onNext());
+        LinearLayout.LayoutParams nextParams = new LinearLayout.LayoutParams(target, target);
+        nextParams.leftMargin = DesignTokens.dp(DesignTokens.SECTION_GAP);
         transport.addView(next, nextParams);
-        LinearLayout.LayoutParams transportParams = new LinearLayout.LayoutParams(-1, -2);
-        transportParams.topMargin = dp(context, 12);
-        details.addView(transport, transportParams);
+        addDetails(transport, DesignTokens.SECTION_GAP);
 
-        LinearLayout transportSecondary = new LinearLayout(context);
-        transportSecondary.setOrientation(LinearLayout.HORIZONTAL);
-        transportSecondary.setGravity(Gravity.CENTER);
-        Button stop = button(context, "Stop", actions::onStop);
-        transportSecondary.addView(stop, new LinearLayout.LayoutParams(0, dp(context, 44), 1f));
-        LinearLayout.LayoutParams autoplayRow = new LinearLayout.LayoutParams(0, dp(context, 44), 1f);
-        autoplayRow.leftMargin = gap;
-        autoplay = button(context, "Autoplay: on", actions::onToggleAutoplay);
-        transportSecondary.addView(autoplay, autoplayRow);
-        LinearLayout.LayoutParams secondaryParams = new LinearLayout.LayoutParams(-1, -2);
-        secondaryParams.topMargin = gap;
-        details.addView(transportSecondary, secondaryParams);
+        // ---- secondary transport ----
+        LinearLayout secondary = row(context, Gravity.CENTER);
+        stop = new IconButton(context);
+        stop.setAction(Icon.STOP, "Stop playback");
+        stop.setOnClickListener(ignored -> actions.onStop());
+        secondary.addView(stop, new LinearLayout.LayoutParams(target, target));
 
-        // ---- 6. Secondary actions ----
-        LinearLayout actionsRow = new LinearLayout(context);
-        actionsRow.setOrientation(LinearLayout.HORIZONTAL);
-        like = button(context, "Like", actions::onLike);
-        download = button(context, "Download", actions::onDownload);
-        actionsRow.addView(like, new LinearLayout.LayoutParams(0, dp(context, 48), 1f));
-        LinearLayout.LayoutParams downloadParams = new LinearLayout.LayoutParams(0, dp(context, 48), 1f);
-        downloadParams.leftMargin = gap;
-        actionsRow.addView(download, downloadParams);
-        LinearLayout.LayoutParams actionsRowParams = new LinearLayout.LayoutParams(-1, -2);
-        actionsRowParams.topMargin = gap;
-        details.addView(actionsRow, actionsRowParams);
-    }
+        autoplay = new SecondaryActionButton(context);
+        autoplay.setAction(Icon.AUTOPLAY, "Autoplay");
+        autoplay.setOnClickListener(ignored -> actions.onToggleAutoplay());
+        LinearLayout.LayoutParams autoplayParams = new LinearLayout.LayoutParams(target, target);
+        autoplayParams.leftMargin = DesignTokens.dp(DesignTokens.SECTION_GAP);
+        secondary.addView(autoplay, autoplayParams);
+        addDetails(secondary, DesignTokens.GAP);
 
-    /** Keeps cover art square without ever exceeding the space it was given. */
-    private static final class SquareFrameLayout extends FrameLayout {
-        SquareFrameLayout(Context context) { super(context); }
+        // ---- secondary actions ----
+        LinearLayout actionRow = row(context, Gravity.START);
+        like = new SecondaryActionButton(context);
+        like.setAction(Icon.HEART, "Not liked. Double tap to add to L1K3D.");
+        like.setOnClickListener(ignored -> actions.onLike());
+        actionRow.addView(like, new LinearLayout.LayoutParams(target, target));
 
-        @Override protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-            int side = Math.min(MeasureSpec.getSize(widthMeasureSpec),
-                    MeasureSpec.getSize(heightMeasureSpec));
-            int exact = MeasureSpec.makeMeasureSpec(side, MeasureSpec.EXACTLY);
-            super.onMeasure(exact, exact);
-        }
-    }
-
-    private static TextView timeLabel(Context context) {
-        TextView view = new TextView(context);
-        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        view.setTextColor(Color.parseColor("#5B6472"));
-        view.setText("0:00");
-        return view;
-    }
-
-    private static Button button(Context context, String label, Runnable onClick) {
-        Button view = new Button(context);
-        view.setText(label);
-        view.setAllCaps(false);
-        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        // Transport labels must stay on one line: a wrapped "Previous" makes the
-        // row look broken and shrinks the touch target.
-        view.setMaxLines(1);
-        view.setEllipsize(TextUtils.TruncateAt.END);
-        view.setPadding(dp(context, 4), 0, dp(context, 4), 0);
-        view.setOnClickListener(ignored -> onClick.run());
-        return view;
-    }
-
-    static int dp(Context context, float value) {
-        return Math.round(value * context.getResources().getDisplayMetrics().density);
+        download = new SecondaryActionButton(context);
+        download.setAction(Icon.DOWNLOAD, "Download. Double tap to start.");
+        // Dispatch is on the last rendered phase, never on wording: matching strings
+        // made this control's action depend on its label and silently routed Cancel to
+        // a repaint, which made cancellation look broken (§8, §26).
+        download.setOnClickListener(ignored -> {
+            switch (renderedDownloadPhase) {
+                case RESOLVING_SOURCE:
+                case DOWNLOADING:
+                    actions.onCancelDownload();
+                    break;
+                case FAILED:
+                case CANCELLED:
+                    actions.onRetryDownload();
+                    break;
+                default:
+                    actions.onDownload();
+                    break;
+            }
+        });
+        LinearLayout.LayoutParams downloadParams = new LinearLayout.LayoutParams(target, target);
+        downloadParams.leftMargin = DesignTokens.dp(DesignTokens.GAP);
+        actionRow.addView(download, downloadParams);
+        addDetails(actionRow, 0f);
     }
 
     View view() { return root; }
 
-    void setArtwork(MediaTrack track, android.graphics.Bitmap bitmap) {
-        if (bitmap == null) {
-            artwork.setImageDrawable(placeholder);
-            return;
-        }
-        if (track != null && track.providerId != null
-                && !track.providerId.equals(activeArtworkId)) return;
-        artwork.setImageBitmap(bitmap);
-    }
+    /** The artwork sub-view, for window-derived sizing and cover identity. */
+    ArtworkView artwork() { return artwork; }
+
+    // ---------------------------------------------------------------- artwork
 
     /**
-     * Renders the entire session state (§11).
+     * Declares which cover the view will accept.
      *
-     * <p>One entry point so the screen can never show a half-updated mix of old
-     * and new state.
+     * <p>Separate from {@link #setArtwork} because the cover arrives asynchronously and
+     * must never land on a track it was not requested for.
      */
-    void render(PlaybackSession.Snapshot snapshot) {
+    void expectArtwork(String identity) { artwork.expectCover(identity); }
+
+    /** Shows a decoded cover, for the identity the view is currently waiting for. */
+    void setArtwork(String identity, Bitmap bitmap) { artwork.setCover(identity, bitmap); }
+
+    // ----------------------------------------------------------------- render
+
+    /**
+     * Metadata: title, attribution and cover identity.
+     *
+     * <p>Guarded by track identity, so a notification that changed only the position
+     * never re-read or re-set the title.
+     */
+    void applyTrack(PlaybackSession.Snapshot snapshot) {
         MediaTrack track = snapshot.currentTrack;
-        long positionMs = snapshot.positionMs;
-
-        if (track != null) {
-            activeTrackKey = snapshot.currentKey;
-            activeArtworkId = track.providerId;
-            title.setText(track.title);
-            subtitle.setText(attribution(track));
-            if (track.durationMs > 0) total.setText(formatTime(track.durationMs));
-        } else {
-            activeArtworkId = "";
+        if (track == null) {
+            if (!metadataShown) return;
+            metadataShown = false;
             activeTrackKey = null;
-            title.setText("Nothing playing");
-            subtitle.setText("");
-            total.setText("0:00");
-            artwork.setImageDrawable(placeholder);
+            setText(title, NOTHING_PLAYING);
+            setText(subtitle, "");
+            progress.clear();
+            artwork.expectCover(null);
+            artwork.clearCover();
+            return;
         }
-
-        stateLabel.setText(snapshot.state.label());
-        boolean waiting = snapshot.state == PlaybackState.BUFFERING
-                || snapshot.state == PlaybackState.RESOLVING_METADATA
-                || snapshot.state == PlaybackState.RESOLVING_SOURCE
-                || snapshot.state == PlaybackState.SEARCHING;
-        buffering.setVisibility(waiting ? View.VISIBLE : View.GONE);
-
-        renderError(snapshot);
-        renderTransport(snapshot);
-        // §26: an action must always show the result of its own state, so the
-        // autoplay button states what it will do, not a static label.
-        autoplay.setText(snapshot.autoplayEnabled ? "Autoplay: on" : "Autoplay: off");
-        autoplay.setContentDescription(snapshot.autoplayEnabled
-                ? "Autoplay is on. Tap to turn it off."
-                : "Autoplay is off. Tap to turn it on.");
-        renderLike(snapshot);
-        renderDownload(snapshot);
-
-        long duration = track == null ? 0 : track.durationMs;
-        if (duration > 0) {
-            progress.setProgress((int) Math.min(1000, positionMs * 1000 / duration));
-        } else {
-            progress.setProgress(0);
+        TrackKey key = track.key();
+        // Identity guards the cover, but not the words: the same track can be resolved
+        // again with corrected metadata, and a title that never refreshes after that is
+        // worse than the extra comparison it costs.
+        if (metadataShown && equal(activeTrackKey, key)
+                && TextUtils.equals(track.title, title.getText())
+                && TextUtils.equals(attributionOf(track), subtitle.getText())) {
+            return;
         }
-        elapsed.setText(formatTime(Math.max(0, positionMs)));
+        metadataShown = true;
+        activeTrackKey = key;
+        setText(title, track.title);
+        setText(subtitle, attributionOf(track));
+        artwork.expectCover(key == null ? track.providerId : key.toString());
     }
 
-    private void renderError(PlaybackSession.Snapshot snapshot) {
+    /** Playback state: status line, buffering indicator, transport, autoplay. */
+    void applyPlaybackState(PlaybackSession.Snapshot snapshot) {
+        PlaybackState state = snapshot.state;
+        if (renderedState != state) {
+            renderedState = state;
+            setText(stateLabel, state.label());
+            boolean waiting = isWaiting(state);
+            if (renderedWaiting != waiting) {
+                renderedWaiting = waiting;
+                buffering.setVisibility(waiting ? View.VISIBLE : View.GONE);
+            }
+        }
+        boolean hasTrack = snapshot.currentTrack != null;
+        // §26: an action must state what it will do, so the primary control reads
+        // Pause while audio is coming out. Mirroring the state instead once left a
+        // playing track showing "Play".
+        boolean playing = state == PlaybackState.PLAYING;
+        if (renderedPlaying != playing) {
+            renderedPlaying = playing;
+            playPause.setAction(playing ? Icon.PAUSE : Icon.PLAY,
+                    playing ? "Pause playback" : "Start playback");
+        }
+        playPause.setEnabled(hasTrack);
+        // Next is never disabled by an empty queue: with autoplay on it still acts, and
+        // the session decides between the next item, a recommendation and stopping (§13).
+        next.setEnabled(hasTrack || snapshot.autoplayEnabled);
+        previous.setEnabled(hasTrack);
+        stop.setEnabled(hasTrack);
+        applyAutoplay(snapshot.autoplayEnabled);
+    }
+
+    private void applyAutoplay(boolean enabled) {
+        if (renderedAutoplay == enabled) return;
+        renderedAutoplay = enabled;
+        autoplay.setToggleState(enabled);
+        autoplay.setPhase(enabled ? Icon.AUTOPLAY : Icon.AUTOPLAY_OFF,
+                enabled ? SecondaryActionButton.Phase.IDLE : SecondaryActionButton.Phase.OFF,
+                -1);
+        autoplay.applyDescription(enabled
+                ? "Autoplay is on. Double tap to turn it off."
+                : "Autoplay is off. Double tap to turn it on.");
+    }
+
+    /** Library membership: the like control. */
+    void applyLibraryState(PlaybackSession.Snapshot snapshot) {
+        like.setEnabled(snapshot.currentKey != null);
+        if (renderedLiked == snapshot.liked) return;
+        renderedLiked = snapshot.liked;
+        // §26: the control always shows the result of the last action.
+        like.setToggleState(snapshot.liked);
+        like.setPhase(snapshot.liked ? Icon.HEART_FILLED : Icon.HEART,
+                snapshot.liked ? SecondaryActionButton.Phase.DONE
+                        : SecondaryActionButton.Phase.IDLE,
+                -1);
+        like.applyDescription(snapshot.liked
+                ? "Liked. Double tap to remove from L1K3D."
+                : "Not liked. Double tap to add to L1K3D.");
+    }
+
+    /** Download state: glyph, tint and progress ring. */
+    void applyDownloadState(PlaybackSession.Snapshot snapshot) {
+        DownloadState state = snapshot.download;
+        DownloadState.Phase phase = state == null ? DownloadState.Phase.IDLE : state.phase;
+        int percent = phase == DownloadState.Phase.DOWNLOADING && state != null
+                ? state.progressPercent() : -1;
+        download.setEnabled(snapshot.currentTrack != null);
+        if (renderedDownloadPhase == phase && renderedDownloadPercent == percent) return;
+        renderedDownloadPhase = phase;
+        renderedDownloadPercent = percent;
+        download.setPhase(downloadIcon(phase), downloadPhaseOf(phase), percent);
+        download.applyDescription(downloadDescription(phase, percent));
+    }
+
+    /** Failure: message and the one action that can move it forward. */
+    void applyError(PlaybackSession.Snapshot snapshot) {
         PlaybackError error = snapshot.error;
-        if (error == null || snapshot.state != PlaybackState.ERROR) {
+        boolean failing = error != null && snapshot.state == PlaybackState.ERROR;
+        ErrorAction offer = ErrorAction.NONE;
+        CharSequence message = "";
+        if (failing) {
+            // Recoverable failures offer Retry; an unavailable track offers Next,
+            // because retrying a 404 forever would be dishonest (§19).
+            offer = error.retryable ? ErrorAction.RETRY : ErrorAction.SKIP;
+            message = error.message;
+        }
+        if (offer == renderedErrorAction && TextUtils.equals(message, renderedErrorText)) return;
+        renderedErrorAction = offer;
+        renderedErrorText = message;
+        if (offer == ErrorAction.NONE) {
+            setText(errorLabel, "");
             errorLabel.setVisibility(View.GONE);
             errorAction.setVisibility(View.GONE);
             return;
         }
+        setText(errorLabel, message);
         errorLabel.setVisibility(View.VISIBLE);
-        errorLabel.setText(error.message);
-        // Recoverable failures offer Retry; an unavailable track offers Next,
-        // because retrying a 404 forever would be dishonest (§19).
-        if (error.retryable) {
-            errorAction.setVisibility(View.VISIBLE);
-            errorAction.setText("Retry");
-            errorAction.setOnClickListener(ignored -> { });
-        } else {
-            errorAction.setVisibility(View.VISIBLE);
-            errorAction.setText("Next track");
-            errorAction.setOnClickListener(ignored -> { });
-        }
-    }
-
-    private void renderTransport(PlaybackSession.Snapshot snapshot) {
-        boolean hasTrack = snapshot.currentTrack != null;
-        // §26: the label states the action, so it must read "Pause" while audio
-        // is coming out. Mirroring the state instead left a playing track showing
-        // "Play".
-        boolean playing = snapshot.state == PlaybackState.PLAYING;
-        playPause.setText(playing ? "Pause" : "Play");
-        playPause.setContentDescription(playing
-                ? "Pause playback" : "Start playback");
-        playPause.setEnabled(hasTrack);
-        // Next is never disabled by an empty queue: with autoplay it still acts,
-        // and the session decides between the next item, a recommendation and
-        // stopping (§13).
-        next.setEnabled(hasTrack || snapshot.autoplayEnabled);
-        previous.setEnabled(hasTrack);
-    }
-
-    private void renderLike(PlaybackSession.Snapshot snapshot) {
-        // §26: the label always shows the result of the last action.
-        like.setText(snapshot.liked ? "Liked" : "Like");
-        like.setEnabled(snapshot.currentKey != null);
-    }
-
-    private void renderDownload(PlaybackSession.Snapshot snapshot) {
-        DownloadState state = snapshot.download;
-        boolean hasTrack = snapshot.currentTrack != null;
-        download.setEnabled(hasTrack);
-        downloadPhase = state == null ? DownloadState.Phase.IDLE : state.phase;
-
-        if (state == null || state.phase == DownloadState.Phase.IDLE) {
-            download.setText(snapshot.downloaded ? "Remove download" : "Download");
-            return;
-        }
-        switch (state.phase) {
-            case RESOLVING_SOURCE:
-                download.setText("Resolving source");
-                break;
-            case DOWNLOADING:
-                download.setText(state.label());
-                break;
-            case COMPLETED:
-                download.setText("Remove download");
-                break;
-            case ALREADY_DOWNLOADED:
-                download.setText("Downloaded");
-                download.setEnabled(false);
-                break;
-            case CANCELLED:
-                download.setText("Download");
-                break;
-            case FAILED:
-                download.setText("Retry download");
-                break;
-            default:
-                download.setText("Download");
-        }
+        errorAction.setVisibility(View.VISIBLE);
+        errorAction.setAction(offer == ErrorAction.RETRY ? Icon.RETRY : Icon.NEXT,
+                offer == ErrorAction.RETRY ? "Retry playback" : "Skip to the next track");
     }
 
     /**
-     * Applies a progress tick.
+     * Applies a position tick.
      *
-     * <p>Guarded by identity: a tick computed for a track that is no longer the
-     * active one is dropped, so a late update can never repaint the elapsed time
-     * of the previous song over the new one. This is the last line of defence
-     * behind the session's own generation check.
+     * <p>Guarded by identity inside {@link ProgressControl}: a tick computed for a
+     * track that is no longer the active one is dropped, so a late update can never
+     * repaint the elapsed time of the previous song over the new one. This is the last
+     * line of defence behind the session's own generation check.
      */
     void setPosition(TrackKey key, long positionMs, long durationMs) {
-        if (key == null || !key.equals(activeTrackKey)) return;
-        if (durationMs > 0) {
-            progress.setProgress((int) Math.min(1000, positionMs * 1000 / durationMs));
-            total.setText(formatTime(durationMs));
-        } else {
-            progress.setProgress(0);
-        }
-        elapsed.setText(formatTime(Math.max(0, positionMs)));
+        progress.setPosition(key, positionMs, durationMs);
     }
 
-    /** Sets the error action's behaviour once, from the Activity. */
-    void bindErrorAction(Runnable onRetry, Runnable onNext) {
-        errorAction.setOnClickListener(ignored -> {
-            if (errorAction.getText().toString().startsWith("Retry")) onRetry.run();
-            else onNext.run();
-        });
-    }
+    // -------------------------------------------------------------- geometry
 
     /**
-     * Binds the download button's behaviour once.
+     * Orientation, applied by re-weighting rather than by re-parenting.
      *
-     * <p>Dispatch is on the last rendered {@link DownloadState.Phase}, not on the
-     * label text: matching strings made the button's action depend on wording and
-     * silently routed Cancel to a repaint.
+     * <p>Artwork and details are siblings from construction, so this only changes the
+     * stage's direction and the details' width: no view is added, removed or moved.
      */
-    void bindDownloadAction(Runnable onDownload, Runnable onCancel, Runnable onRetry) {
-        download.setOnClickListener(ignored -> {
-            switch (downloadPhase) {
-                case RESOLVING_SOURCE:
-                case DOWNLOADING:
-                    onCancel.run();
-                    break;
-                case FAILED:
-                case CANCELLED:
-                    onRetry.run();
-                    break;
-                case COMPLETED:
-                    onDownload.run();
-                    break;
-                default:
-                    onDownload.run();
-                    break;
-            }
-        });
-    }
-
     void setLandscape(boolean value) {
         if (landscape == value) return;
         landscape = value;
-        nowPlaying.setOrientation(value ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
-
+        stage.setOrientation(value ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
         LinearLayout.LayoutParams detailsParams =
                 (LinearLayout.LayoutParams) details.getLayoutParams();
         detailsParams.width = value ? 0 : -1;
         detailsParams.height = -2;
         detailsParams.weight = value ? 1f : 0f;
+        detailsParams.rightMargin = 0;
+        detailsParams.leftMargin = value
+                ? DesignTokens.dp(DesignTokens.ARTWORK_GUTTER_LANDSCAPE) : 0;
         details.setLayoutParams(detailsParams);
         setArtworkSidePx(artworkSidePx);
     }
@@ -478,46 +428,131 @@ final class NowPlayingView {
     /**
      * Artwork side in PIXELS, computed by the Activity from the current window.
      *
-     * <p>Derived rather than hard-coded so portrait, landscape, small phones and
-     * large screens all get a sensible cover without the controls ever being
-     * squeezed out of the layout.
+     * <p>Derived rather than hard-coded so portrait, landscape, small phones and large
+     * screens all get a sensible cover without the controls ever being squeezed out of
+     * the layout. The key makes a repeated call with the same value and orientation
+     * free.
      */
     void setArtworkSidePx(int requestedPx) {
-        Context context = root.getContext();
-        int side = Math.max(dp(context, MIN_ARTWORK_DP),
-                Math.min(dp(context, MAX_ARTWORK_DP), requestedPx));
+        int side = Math.max(DesignTokens.dp(DesignTokens.ARTWORK_MIN),
+                Math.min(DesignTokens.dp(DesignTokens.ARTWORK_MAX), requestedPx));
+        String key = side + "/" + landscape;
+        if (key.equals(artworkSideKey)) return;
+        artworkSideKey = key;
         artworkSidePx = side;
-        LinearLayout.LayoutParams params =
-                (LinearLayout.LayoutParams) artworkFrame.getLayoutParams();
+        LinearLayout.LayoutParams params = (LinearLayout.LayoutParams) artwork.getLayoutParams();
         params.width = side;
         params.height = side;
-        params.rightMargin = landscape ? dp(context, 16) : 0;
-        params.bottomMargin = landscape ? 0 : dp(context, 8);
-        artworkFrame.setLayoutParams(params);
+        params.rightMargin = landscape
+                ? DesignTokens.dp(DesignTokens.ARTWORK_GUTTER_LANDSCAPE) : 0;
+        params.bottomMargin = landscape ? 0
+                : DesignTokens.dp(DesignTokens.ARTWORK_GUTTER_PORTRAIT);
+        artwork.setLayoutParams(params);
     }
 
-    private static String attribution(MediaTrack track) {
-        String value = track.artist.isEmpty() ? track.channel : track.artist;
-        return value.isEmpty() ? "" : value;
+    // -------------------------------------------------------------- plumbing
+
+    private TextView label(Context context, float sizeSp, int color) {
+        TextView view = new TextView(context);
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp);
+        view.setTextColor(color);
+        view.setIncludeFontPadding(false);
+        return view;
     }
 
-    static String formatTime(long ms) {
-        long total = Math.max(0, ms) / 1000;
-        long hours = total / 3600;
-        long minutes = (total % 3600) / 60;
-        long seconds = total % 60;
-        if (hours > 0) {
-            return String.format(java.util.Locale.ROOT, "%d:%02d:%02d", hours, minutes, seconds);
+    private LinearLayout row(Context context, int gravity) {
+        LinearLayout view = new LinearLayout(context);
+        view.setOrientation(LinearLayout.HORIZONTAL);
+        view.setGravity(gravity);
+        return view;
+    }
+
+    private void addDetails(View view, float gapDp) {
+        addDetails(view, gapDp, -1);
+    }
+
+    /**
+     * Adds a child to the details column.
+     *
+     * <p>The width is a parameter because a control must not be stretched by a
+     * MATCH_PARENT default: a 48dp icon button given the full width became a 360dp
+     * target whose glyph floated in the middle of it.
+     */
+    private void addDetails(View view, float gapDp, int width) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(width, -2);
+        if (gapDp > 0f) params.topMargin = DesignTokens.dp(gapDp);
+        details.addView(view, params);
+    }
+
+    /**
+     * Writes a label only when it would actually change.
+     *
+     * <p>{@code setText} on a TextView re-measures and re-lays-out; skipping it is the
+     * difference between a notification that costs a comparison and one that costs a
+     * layout pass.
+     */
+    private static void setText(TextView view, CharSequence value) {
+        if (TextUtils.equals(view.getText(), value)) return;
+        view.setText(value);
+    }
+
+    private static boolean equal(TrackKey left, TrackKey right) {
+        return left == null ? right == null : left.equals(right);
+    }
+
+    private static boolean isWaiting(PlaybackState state) {
+        return state == PlaybackState.BUFFERING
+                || state == PlaybackState.RESOLVING_METADATA
+                || state == PlaybackState.RESOLVING_SOURCE
+                || state == PlaybackState.SEARCHING;
+    }
+
+    private static CharSequence attributionOf(MediaTrack track) {
+        String who = track.artist.isEmpty() ? track.channel : track.artist;
+        return who;
+    }
+
+    private static Icon downloadIcon(DownloadState.Phase phase) {
+        switch (phase) {
+            case COMPLETED:
+            case ALREADY_DOWNLOADED: return Icon.DOWNLOADED;
+            case FAILED:
+            case CANCELLED: return Icon.RETRY;
+            default: return Icon.DOWNLOAD;
         }
-        return String.format(java.util.Locale.ROOT, "%d:%02d", minutes, seconds);
     }
 
-    static String formatBytes(long bytes) {
-        if (bytes <= 0) return "0 B";
-        double megabytes = bytes / (1024.0 * 1024.0);
-        if (megabytes >= 1.0) {
-            return String.format(java.util.Locale.ROOT, "%.1f MB", megabytes);
+    private static SecondaryActionButton.Phase downloadPhaseOf(DownloadState.Phase phase) {
+        switch (phase) {
+            case RESOLVING_SOURCE: return SecondaryActionButton.Phase.PENDING;
+            case DOWNLOADING: return SecondaryActionButton.Phase.RUNNING;
+            case COMPLETED:
+            case ALREADY_DOWNLOADED: return SecondaryActionButton.Phase.DONE;
+            case FAILED:
+            case CANCELLED: return SecondaryActionButton.Phase.FAILED;
+            default: return SecondaryActionButton.Phase.IDLE;
         }
-        return String.format(java.util.Locale.ROOT, "%.0f KB", bytes / 1024.0);
+    }
+
+    /**
+     * What the download action currently offers.
+     *
+     * <p>The glyph is {@link Icon#DOWNLOADED} once a file exists, and the action then
+     * removes it: an icon-only control has to keep saying what its tap will do, or
+     * cancelling and removing become indistinguishable (§8, §26).
+     */
+    private static CharSequence downloadDescription(DownloadState.Phase phase, int percent) {
+        switch (phase) {
+            case RESOLVING_SOURCE: return "Preparing download. Double tap to cancel.";
+            case DOWNLOADING:
+                return percent >= 0
+                        ? "Downloading " + percent + " percent. Double tap to cancel."
+                        : "Downloading. Double tap to cancel.";
+            case COMPLETED:
+            case ALREADY_DOWNLOADED: return "Downloaded. Double tap to remove the download.";
+            case FAILED:
+            case CANCELLED: return "Download failed. Double tap to try again.";
+            default: return "Download. Double tap to start.";
+        }
     }
 }

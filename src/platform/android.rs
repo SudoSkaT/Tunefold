@@ -331,7 +331,6 @@ pub unsafe extern "C" fn tunefold_oboe_stop(engine: *mut AndroidEngine) {
     let engine = &*engine;
     engine.playing.store(false, Ordering::Release);
     engine.cancel.store(true, Ordering::Release);
-    engine.ring.clear();
     engine.decoder_finished.store(true, Ordering::Release);
     if engine.state.load(Ordering::Acquire) != STATE_ERROR {
         engine.state.store(STATE_STOPPED, Ordering::Release);
@@ -341,6 +340,14 @@ pub unsafe extern "C" fn tunefold_oboe_stop(engine: *mut AndroidEngine) {
             let _ = h.join();
         }
     }
+    // Cleared AFTER the join, not before. `PcmRing` is single-producer /
+    // single-consumer, and its producer is the decoder thread this join retires;
+    // resetting head and tail while that thread can still be inside `push` let it
+    // overwrite samples the consumer had not read yet and let the consumer read
+    // samples that were never written. Both are memory-safe because every index is
+    // masked, but both are audible: a burst of stale or silent PCM on every stop and
+    // every track change.
+    engine.ring.clear();
     // Stopping is not finishing: clear any pending EOF so autoplay cannot fire
     // for a track the user deliberately ended. Cleared AFTER the join, because
     // the decoder being stopped may still publish its own final state.

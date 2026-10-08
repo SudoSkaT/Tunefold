@@ -37,7 +37,16 @@ final class PlaybackSession {
         final boolean liked;
         final boolean downloaded;
         final DownloadState download;
-        final List<MediaTrack> queue;
+        /**
+         * The queue itself, not a copy of it.
+         *
+         * <p>A {@code List} copy of the queue was made on every snapshot, and a
+         * snapshot is taken several times a second, so a queue of any size was copied
+         * continuously for data nothing but the diagnostics panel ever read. Handing
+         * out the live queue and reading its size or index instead makes a snapshot
+         * allocation-free apart from the snapshot itself.
+         */
+        final PlaybackQueue queue;
         final int queueIndex;
         final boolean autoplayEnabled;
         final boolean canGoNext;
@@ -45,15 +54,15 @@ final class PlaybackSession {
         /**
          * Position of {@link #currentTrack}, in milliseconds.
          *
-         * <p>Carried inside the snapshot on purpose: reading the position
-         * separately and pairing it with a track from another call is what let a
-         * new track be shown with the previous track's elapsed time.
+         * <p>Carried inside the snapshot on purpose: reading the position separately
+         * and pairing it with a track from another call is what let a new track be shown
+         * with the previous track's elapsed time.
          */
         final long positionMs;
 
         Snapshot(PlaybackState state, MediaTrack currentTrack, TrackKey currentKey,
                  PlaybackError error, boolean liked, boolean downloaded,
-                 DownloadState download, List<MediaTrack> queue, int queueIndex,
+                 DownloadState download, PlaybackQueue queue, int queueIndex,
                  boolean autoplayEnabled, boolean canGoNext, boolean canGoPrevious,
                  long positionMs) {
             this.positionMs = positionMs;
@@ -138,17 +147,43 @@ final class PlaybackSession {
         DownloadState download = downloader == null || key == null
                 ? DownloadState.idle(key)
                 : downloader.stateOf(key);
+        // One engine read per snapshot: the previous code asked twice, once to decide
+        // whether Previous can act and once to report, and the two could disagree if
+        // the position advanced between them.
+        long position = positionMs();
         boolean canNext;
         boolean canPrevious;
         synchronized (queue.lock()) {
             canNext = queue.peekNext() != null;
             canPrevious = queue.peekPrevious(0, PREVIOUS_RESTART_MS) != null
-                    || (positionMs() > PREVIOUS_RESTART_MS && track != null);
+                    || (position > PREVIOUS_RESTART_MS && track != null);
         }
         return new Snapshot(state, track, key, error,
                 library.isLiked(key), download.isDownloaded(), download,
-                queue.snapshot(), queue.currentIndex(), queue.isAutoplayEnabled(),
-                canNext, canPrevious, positionMs());
+                queue, queue.currentIndex(), queue.isAutoplayEnabled(),
+                canNext, canPrevious, position);
+    }
+
+    /**
+     * Fills {@code out} with the active track's identity, position and duration.
+     *
+     * <p>The cheap read, for the position poll. {@link #snapshot()} is the complete
+     * answer and is correct, but it is more than a 500&nbsp;ms tick needs: the tick
+     * only ever draws a time and a scrubber, and taking a full snapshot there made
+     * every tick build a queue copy and a download state for data no one on that code
+     * path could see.
+     *
+     * <p>One consistent read: identity, position and duration all come from the same
+     * instant, so a tick can never pair one track with another track's time.
+     *
+     * @param out a caller-owned holder, reused across ticks
+     * @return {@code out}
+     */
+    PlaybackPosition readPosition(PlaybackPosition out) {
+        MediaTrack track = queue.current();
+        out.set(track == null ? null : track.key(), positionMs(),
+                track == null ? 0L : track.durationMs);
+        return out;
     }
 
     // -------------------------------------------------------------- commands
@@ -342,6 +377,7 @@ final class PlaybackSession {
 
     boolean isLiked(MediaTrack track) { return library.isLiked(track); }
 
+
     void setAutoplayEnabled(boolean enabled) {
         queue.setAutoplayEnabled(enabled);
         notifyChanged();
@@ -377,11 +413,31 @@ final class PlaybackSession {
         return downloader.registry().storedKeys();
     }
 
+    /**
+     * Changes whenever {@code Descargadas} gains or loses a track.
+     *
+     * <p>Exists so the view can distinguish "a row's progress moved" from "the list is
+     * a different list". That distinction was missing, and it is why the view stayed
+     * empty after a restart: it was rendered once, before the store scan had finished,
+     * and the scan's own notification only re-bound rows — of which there were none. The
+     * files were on disk the whole time.
+     *
+     * <p>Cheap on purpose: it is read on every session notification, including one per
+     * download-progress tick.
+     */
+    int downloadsRevision() {
+        return downloader == null ? 0 : downloader.registry().revision();
+    }
+
     private String trackTitle(TrackKey key) {
         MediaTrack track = findKnown(key);
         if (track != null) return track.title;
-        // After a restart the live track is gone but the like may carry a label,
-        // which beats showing the user a bare provider id.
+        // After a restart the live track is gone, so the title has to come from
+        // something that outlives it: the download's own sidecar first, because it is
+        // the fresher of the two, then the like's label. Either beats showing the user
+        // a bare provider id.
+        String downloaded = downloader == null ? null : downloader.registry().titleOf(key);
+        if (downloaded != null && !downloaded.isEmpty()) return downloaded;
         String remembered = library.labelFor(key);
         return remembered == null || remembered.isEmpty()
                 ? key.providerTrackId() : remembered;
@@ -663,7 +719,12 @@ final class PlaybackSession {
     }
 
     private void notifyChanged() {
-        for (Observer observer : new ArrayList<>(observers)) {
+        // Iterated directly, not over a defensive copy. The observer set and this
+        // method are both main-thread only — that is the invariant the whole session
+        // already relies on — and copying the set on every notification allocated a
+        // list several times a second purely to protect against a mutation that cannot
+        // happen. An observer must not add or remove observers while being notified.
+        for (Observer observer : observers) {
             observer.onSessionChanged();
         }
     }

@@ -208,4 +208,73 @@ public class LibraryTest {
         assertFalse("a played track is not automatically liked",
                 reader.isLiked(track("b")));
     }
+
+    // ------------------------------------------------------- durability
+
+    /**
+     * A like must be on disk by the time the call returns.
+     *
+     * <p>This is the regression guard for a real loss of data: membership used to be
+     * written on a background executor, so liking a track and immediately swiping the
+     * app away discarded the write. {@code awaitWritesForTest()} would have hidden the
+     * bug — it drains the queue — so the assertion deliberately does not call it.
+     */
+    @Test public void aLikeIsOnDiskBeforeTheCallReturns() {
+        Library library = new Library(directory);
+        assertTrue(library.toggleLiked(track("durable")));
+
+        String onDisk = readLibraryFile();
+        assertTrue("like was not durable: " + onDisk, onDisk.contains("l|YouTube|durable"));
+    }
+
+    @Test public void setLikedIsAlsoDurable() {
+        Library library = new Library(directory);
+        assertTrue(library.setLiked(track("durable-set"), true));
+        assertTrue(readLibraryFile().contains("l|YouTube|durable-set"));
+    }
+
+    @Test public void unlikingIsAlsoDurable() {
+        Library library = new Library(directory);
+        library.setLiked(track("gone"), true);
+        assertFalse(library.setLiked(track("gone"), false));
+        assertFalse(readLibraryFile().contains("l|YouTube|gone|"));
+    }
+
+    /** Recents are bookkeeping, not user data: losing the last few costs nothing. */
+    @Test public void recentsStillPersistWithoutBlocking() {
+        Library library = new Library(directory);
+        library.markPlayed(TrackKey.of("YouTube", "recent-1"));
+        library.awaitWritesForTest();
+        assertTrue(readLibraryFile().contains("r|YouTube|recent-1"));
+    }
+
+    /** A crash mid-write must never leave a truncated document behind. */
+    @Test public void noPartialDocumentIsLeftBehind() throws Exception {
+        Library library = new Library(directory);
+        library.toggleLiked(track("a"));
+        File[] leftovers = directory.listFiles(file -> file.getName().endsWith(".part"));
+        assertEquals("a temporary file survived the write",
+                0, leftovers == null ? 0 : leftovers.length);
+    }
+
+    /** The remembered label is what L1K3D renders after a restart. */
+    @Test public void rememberedLabelSurvivesAReload() {
+        Library writer = new Library(directory);
+        writer.toggleLiked(TestTracks.of("YouTube", "labelled", "Nice Title", 1L));
+
+        Library reader = new Library(directory);
+        reader.load();
+        assertEquals("Nice Title", reader.labelFor(TrackKey.of("YouTube", "labelled")));
+    }
+
+    private String readLibraryFile() {
+        File file = new File(directory, "library.json");
+        if (!file.isFile()) return "";
+        try {
+            return new String(java.nio.file.Files.readAllBytes(file.toPath()),
+                    StandardCharsets.UTF_8);
+        } catch (Exception unreadable) {
+            throw new AssertionError("library file unreadable", unreadable);
+        }
+    }
 }

@@ -27,8 +27,11 @@ interface LocalMediaStore {
      * {@code .part} and renamed them. This only runs the store's own validation
      * and writes the identity/size sidecar that {@link #get} trusts, so the
      * existing limits and eviction budget stay authoritative.
+     *
+     * @param title title to remember alongside the file, or {@code null} when
+     *              unknown. See {@link Entry#title()} for why it lives here.
      */
-    boolean register(String provider, String id, File path);
+    boolean register(String provider, String id, File path, String title);
 
     boolean remove(String provider, String id);
 
@@ -53,16 +56,31 @@ interface LocalMediaStore {
         public final TrackKey key;
         /** Validated size in bytes. */
         public final long size;
+        /** Title remembered at download time, or {@code null} when unknown. */
+        private final String title;
         private final File audio;
 
-        Entry(TrackKey key, long size, File audio) {
+        Entry(TrackKey key, long size, File audio, String title) {
             this.key = key;
             this.size = size;
             this.audio = audio;
+            this.title = title;
         }
 
         /** The audio file. Guaranteed to exist: the entry was validated. */
         public File audio() { return audio; }
+
+        /**
+         * Title the file was downloaded under, or {@code null} when unknown.
+         *
+         * <p>The sidecar is the only place a download's own title can live, and it has
+         * to be this one: the file outlives the session that fetched it, so after a
+         * restart the identity is all that is left and {@code Descargadas} rendered the
+         * bare provider id. Keeping it here rather than in the library also means
+         * deleting the file deletes the title with it — a remembered label would
+         * outlive the thing it describes.
+         */
+        public String title() { return title; }
 
         @Override public String toString() { return key + " (" + size + " bytes)"; }
     }

@@ -19,6 +19,10 @@ pub struct PcmRing {
     tail: AtomicU64,
 }
 
+// SAFETY: exactly one producer (the decoder thread) and exactly one consumer (the
+// Android audio output thread) touch `buffer`, never concurrently with each other,
+// and every index is masked to the allocation. The single-producer invariant is the
+// caller's responsibility; see `PcmRing::clear` for where it is easiest to break.
 unsafe impl Sync for PcmRing {}
 unsafe impl Send for PcmRing {}
 
@@ -88,6 +92,17 @@ impl PcmRing {
         (self.mask + 1) - head.wrapping_sub(tail) as usize
     }
 
+    /// Resets the ring to empty.
+    ///
+    /// The two counters are not reset atomically with respect to each other, so this
+    /// is only correct while the producer is **quiescent**. Calling it from a third
+    /// thread while the decoder may still be inside `push` lets that producer overwrite
+    /// samples the consumer has not read yet, and lets the consumer read samples that
+    /// were never written — an audible burst of stale or silent PCM on every stop and
+    /// track change. Memory-safe either way, because every index is masked; it is
+    /// wrong, not dangerous.
+    ///
+    /// Callers must join or stop the decoder thread first.
     pub fn clear(&self) {
         self.head.store(0, Ordering::Release);
         self.tail.store(0, Ordering::Release);

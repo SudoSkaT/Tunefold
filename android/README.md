@@ -50,8 +50,10 @@ a YouTube URL or a search query. Direct HTTP(S) audio
 URLs remain supported for decoder smoke tests. The screen reports buffering,
 playing, pause, stop, provider metadata, decoder/output errors, and the analysis
 waveform peak after analysis publishes a snapshot.
-**Pause / Resume** and **Stop** exercise the JNI controls. For scripted device
-validation, launch with `--ez runtime_smoke_test true --es runtime_stream_url
+The transport controls (previous, play/pause, next, stop) exercise the JNI
+controls; they are icon-only, so their meaning is carried by `contentDescription`
+and by the long-press tooltip. For scripted device validation, launch with
+`--ez runtime_smoke_test true --es runtime_stream_url
 https://samplelib.com/wav/sample-15s.wav`. Closing the Activity stops and
 releases only its binding; the started foreground service keeps playback alive.
 The service posts a minimal Tunefold playback notification and releases its
@@ -76,8 +78,8 @@ verify playback on a device/emulator with a functioning audio backend.
 The screen is organised around real playback states, in this order: artwork,
 title/artist, playback state, progress, transport controls, secondary actions,
 then search results. Technical diagnostics are **not** part of the normal
-surface: the `Diagnostics` button toggles `PlaybackDebugPanel`, which shows the
-decoder counters and the ordered playback timeline.
+surface: the pulse icon in the top bar toggles `PlaybackDebugPanel`, which shows
+the decoder counters and the ordered playback timeline.
 
 Layout is responsive: the cover is sized from the current window (never a fixed
 dimension), portrait stacks it above the details, landscape puts it beside them,
@@ -87,6 +89,49 @@ dimensions are expressed in `dp`/`sp` and interactive controls are at least
 
 States surfaced by the UI: Idle, Searching, Resolving metadata, Resolving
 source, Buffering, Playing, Paused, Downloading, Downloaded, Error.
+
+### UI layer
+
+Every dimension, colour, glyph and component in the surface comes from one place.
+
+| Concern | Owner |
+| --- | --- |
+| Dimensions, type scale, motion, colour roles | `DesignTokens` |
+| Glyph geometry | `Icon`, parsed once by `IconPath` |
+| Glyph rendering | `IconDrawable` |
+| Accent colour, and who repaints when it moves | `ArtworkTheme` |
+| Controls | `IconButton`, `PrimaryPlaybackButton`, `SecondaryActionButton`, `NavigationItem`, `SectionHeader`, `ArtworkView`, `ProgressControl`, `TrackRow`, `TrackList` |
+
+`DesignTokens` holds raw `dp`/`sp` constants with no Android types, so the scale
+itself is asserted in `DesignTokensTest` — including the 48dp accessibility floor,
+which is a build failure rather than a review comment.
+
+**Iconography.** Actions are icons, not labels. Two sub-families with one rule
+each: transport glyphs (`PLAY`, `PAUSE`, `PREVIOUS`, `NEXT`, `STOP`) are filled
+solids because they are the loudest thing on screen and must read at 20dp; every
+other glyph is a stroked outline at exactly 2 grid units with round caps and
+joins, so a mixed-weight set cannot happen. A glyph is authored on a 24-unit grid
+in a restricted command dialect (`M`/`L`/`C`/`Q`/`Z`), parsed by `IconPath` into
+plain arrays — which is what lets `IconFamilyTest` reject an empty or out-of-grid
+outline as a failing build instead of a dead button found on a device. There are
+no Unicode glyphs and no per-icon drawable resources.
+
+Accessibility is structural rather than reviewed: `setAction(icon, description)`
+sets both in one call, the touch target comes from a token and cannot be set
+below 48dp, and a row exposes one description node naming the track and what both
+of its actions will do.
+
+**Rendering.** `NowPlayingView` has one entry point per kind of change —
+`applyTrack`, `applyPlaybackState`, `applyLibraryState`, `applyDownloadState`,
+`applyError`, `setPosition` — and each compares against what it last rendered
+before it writes. A position tick reads through `PlaybackSession.readPosition`
+into a reused `PlaybackPosition` (no snapshot, no queue copy, no allocation), and
+`ProgressControl` only calls `setText` when the displayed second changed and
+`setProgress` when the bar moved at least one pixel.
+
+**Lists.** `TrackList` rebinds a shared `RowPool` of `TrackRow`s instead of
+inflating a row per track per render. The pool is owned by the screen, not the
+process: a static pool would keep a whole Activity reachable through a parked row.
 
 ## Playback timing and cache
 

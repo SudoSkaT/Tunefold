@@ -70,7 +70,11 @@ public final class ForegroundPlaybackService extends Service {
         if (downloader != null || providers == null) return;
         LocalMediaStore store = providers.localMediaStore();
         if (store == null) return;
-        downloader = new TrackDownloader(providers, store, controller.engineHandle());
+        // The engine is supplied as a source, not as a value: it is created on the
+        // controller's worker thread, so reading the handle here could capture a
+        // startup-zero that no later refresh would ever replace.
+        downloader = new TrackDownloader(providers, store, controller::engineHandle);
+        downloader.cleanAbandonedPartsAsync();
         session.attachDownloader(downloader);
     }
 
@@ -118,12 +122,25 @@ public final class ForegroundPlaybackService extends Service {
             if (notification != null) {
                 // The session owns the position, so the lock screen cannot drift
                 // away from what the app shows or inherit the previous track's time.
+                // This is the cheap read: a full snapshot here copied the whole queue
+                // every 500ms for the whole life of playback, to read one long.
                 notification.updatePosition(
-                        session == null ? 0L : session.snapshot().positionMs, 1f);
+                        session == null ? 0L : session.readPosition(position).positionMs, 1f);
             }
-            handler.postDelayed(this, 500);
+            handler.postDelayed(this, POSITION_INTERVAL_MS);
         }
     };
+
+    /**
+     * Reused holder for the poll's position read.
+     *
+     * <p>Allocated once per service rather than once per tick: this runs twice a
+     * second from the moment playback starts until it stops.
+     */
+    private final PlaybackPosition position = new PlaybackPosition();
+
+    /** Kept in step with {@link DesignTokens#POSITION_INTERVAL_MS}. */
+    private static final long POSITION_INTERVAL_MS = 500L;
 
     /**
      * The engine changed state; feed it into the session so the product state,

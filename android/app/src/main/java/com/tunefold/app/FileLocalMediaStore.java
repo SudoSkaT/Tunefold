@@ -86,7 +86,8 @@ final class FileLocalMediaStore implements LocalMediaStore {
                     remove(provider, id);
                     continue;
                 }
-                found.add(new Entry(key, actual, audio));
+                String title = entry.optString("title", "").trim();
+                found.add(new Entry(key, actual, audio, title.isEmpty() ? null : title));
             } catch (Exception corrupt) {
                 sidecar.delete();
             }
@@ -120,6 +121,9 @@ final class FileLocalMediaStore implements LocalMediaStore {
             entry.put("provider", provider);
             entry.put("id", id);
             entry.put("size", size);
+            // Remembered so `Descargadas` can show a real title after a restart; a
+            // blank title is left out entirely rather than stored as an empty string.
+            if (title != null && !title.trim().isEmpty()) entry.put("title", title.trim());
             entry.put("updated_at_ms", System.currentTimeMillis());
             try (FileOutputStream output = new FileOutputStream(metadataPart)) {
                 output.write(entry.toString().getBytes(StandardCharsets.UTF_8));
@@ -141,7 +145,8 @@ final class FileLocalMediaStore implements LocalMediaStore {
         }
     }
 
-    @Override public synchronized boolean register(String provider, String id, File path) {
+    @Override
+    public synchronized boolean register(String provider, String id, File path, String title) {
         if (provider == null || provider.isEmpty() || id == null || id.isEmpty()) return false;
         if (path == null || !path.isFile()) return false;
         File target = audioFile(provider, id);

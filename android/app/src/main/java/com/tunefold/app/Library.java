@@ -85,7 +85,8 @@ final class Library {
             }
         }
         if (changed) {
-            persistAsync();
+            // Durable: this is an explicit user action and must survive the process.
+            persistNow();
             notifyChanged();
         }
         return value;
@@ -108,7 +109,11 @@ final class Library {
                 labels.remove(key);
             }
         }
-        persistAsync();
+        // Durable, unlike {@link #markPlayed}: a like is a decision the user made, and
+        // an asynchronous write loses it whenever the process dies before the writer
+        // thread runs — which is exactly what happens when the user likes a track and
+        // immediately swipes the app away.
+        persistNow();
         notifyChanged();
         return nowLiked;
     }
@@ -235,16 +240,29 @@ final class Library {
     private void persist() { writeAtomically(serialize()); }
 
     /**
-     * Persists off the UI thread.
+     * Persists off the UI thread, for high-frequency bookkeeping.
      *
-     * <p>Library writes are triggered by taps, so doing the I/O inline would put
-     * a filesystem write on the UI thread. Writes are serialized through a
-     * single executor to keep file order deterministic.
+     * <p>Used by {@link #markPlayed}, which fires on every track change. Losing the
+     * last few recents costs the user nothing, so this stays asynchronous and
+     * coalescing rather than blocking a track change for a disk write.
      */
     private void persistAsync() {
         final String text = serialize();
         WRITES.execute(() -> writeAtomically(text));
     }
+
+    /**
+     * Persists before returning, for user decisions.
+     *
+     * <p>The document is one short line per track, so the write is a few hundred bytes
+     * plus an {@code fsync} — cheap enough to sit behind a tap, and the only way a
+     * like is guaranteed to still be there after the process dies.
+     *
+     * <p>Runs on the caller's thread on purpose: callers are the main thread, and the
+     * whole library is far too small for the latency to be worth the risk of losing
+     * the write.
+     */
+    private void persistNow() { persist(); }
 
     /**
      * Test hook: blocks until every queued write has reached the disk.
