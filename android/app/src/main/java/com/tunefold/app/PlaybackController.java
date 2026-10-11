@@ -235,6 +235,52 @@ final class PlaybackController implements AudioTrackOutput.Listener {
     /** Trace of the play in progress, reused when Previous restarts it. */
     private volatile PlaybackTrace currentTrace;
 
+    /**
+     * Whether the pipeline can start playback at a position the user chose.
+     *
+     * <p>False today, and deliberately: the engine counts frames it has decoded, so
+     * its position is real but a jump cannot be performed. {@code seekAudio} only
+     * clears the PCM ring and writes the requested number into that counter, which
+     * is not a seek — it moves the <em>display</em> to a place the audio never went,
+     * and from then on every reported position is offset by exactly the amount the
+     * user dragged. That is the {@code engine position != session position} bug in
+     * its other direction, so the waveform is not offered as a scrubber while this
+     * is false.
+     *
+     * <p>The capability is read by the UI to decide whether the waveform accepts a
+     * drag, which is why it is a question rather than a silent limitation.
+     */
+    boolean supportsSeek() { return false; }
+
+    /**
+     * Whether {@link #seekTo} would actually carry out {@code positionMs} right now.
+     *
+     * <p>The session asks this <em>before</em> it opens a new playback generation,
+     * because opening one and then failing to seek would leave the current track
+     * with an expired clock: its position frozen at zero and its end-of-track
+     * refused. Refusing first costs nothing and cannot strand anything.
+     */
+    boolean canSeek(long positionMs) {
+        return supportsSeek() && currentSource != null && positionMs > 0L;
+    }
+
+    /**
+     * Starts playback at {@code positionMs}.
+     *
+     * <p>Must only be called after {@link #canSeek} said yes: everything it needs
+     * is checked there, and a refusal at this point would be a caller bug rather
+     * than a condition to handle.
+     *
+     * @return {@code true} when a new attempt was started for {@code positionMs}
+     */
+    boolean seekTo(long positionMs) {
+        if (!canSeek(positionMs)) return false;
+        long attempt = operation.incrementAndGet();
+        startedCallback = null;
+        startPlaybackSource(currentSource, currentTrace, attempt, null);
+        return true;
+    }
+
     void refresh() {
         commands.execute(this::refreshOnCommands);
     }

@@ -121,9 +121,6 @@ final class FileLocalMediaStore implements LocalMediaStore {
             entry.put("provider", provider);
             entry.put("id", id);
             entry.put("size", size);
-            // Remembered so `Descargadas` can show a real title after a restart; a
-            // blank title is left out entirely rather than stored as an empty string.
-            if (title != null && !title.trim().isEmpty()) entry.put("title", title.trim());
             entry.put("updated_at_ms", System.currentTimeMillis());
             try (FileOutputStream output = new FileOutputStream(metadataPart)) {
                 output.write(entry.toString().getBytes(StandardCharsets.UTF_8));
@@ -166,6 +163,9 @@ final class FileLocalMediaStore implements LocalMediaStore {
             entry.put("provider", provider);
             entry.put("id", id);
             entry.put("size", size);
+            // Remembered so `Descargadas` can show a real title after a restart; a
+            // blank title is left out entirely rather than stored as an empty string.
+            if (title != null && !title.trim().isEmpty()) entry.put("title", title.trim());
             entry.put("updated_at_ms", System.currentTimeMillis());
             try (FileOutputStream output = new FileOutputStream(metadataPart)) {
                 output.write(entry.toString().getBytes(StandardCharsets.UTF_8));

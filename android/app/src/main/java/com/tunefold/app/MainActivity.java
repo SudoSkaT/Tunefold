@@ -6,20 +6,16 @@ import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.res.Configuration;
 import android.graphics.drawable.ColorDrawable;
-import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.text.InputType;
-import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
-import android.view.inputmethod.EditorInfo;
-import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.PopupMenu;
 import android.widget.ScrollView;
-import android.widget.TextView;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -27,24 +23,29 @@ import java.util.List;
 /**
  * Tunefold Android UI.
  *
- * <p>Navigation over Home, Search, L1K3D and Descargadas, with Now Playing as the
- * primary surface (§24). Deliberately a single screen with a section switch rather than
- * a multi-screen architecture: the app does not yet need it, and one surface keeps
- * playback state visible everywhere.
+ * <p><b>One screen, four destinations, one player.</b> Home, Search, L1K3D and
+ * Descargadas are four {@link SectionSurface}s behind a bottom navigation bar; the
+ * player is a view that can cover them. Navigating is a visibility change, so no
+ * navigation ever recreates the Activity, and nothing the user did in a destination is
+ * lost by leaving it.
  *
- * <p>This Activity holds <b>no playback state</b>. It binds to
+ * <p><b>This Activity holds no playback state.</b> It binds to
  * {@link ForegroundPlaybackService}, renders {@link PlaybackSession} snapshots and
- * sends commands. Rotation and Activity recreation therefore rebuild the whole screen
- * from service-owned state and cannot desynchronise (§18).
+ * sends commands. The strip at the bottom is a second view onto the same snapshot —
+ * there is no second playback model anywhere in the UI, which is the only way two
+ * surfaces can be trusted to agree.
  *
  * <h3>What this class is responsible for</h3>
  * Composition and commands only. Every dimension comes from {@link DesignTokens},
  * every glyph from {@link Icon}, and every control from the shared components. The
- * Activity builds its tree once in {@link #buildInterface} and then only mutates it:
- * nothing here re-creates a view after construction, and nothing here re-reads a value
- * it could have cached.
+ * Activity builds its tree once in {@link #buildInterface} and then only mutates it.
+ *
+ * <h3>Playback is the centre</h3>
+ * When the player is open, the navigation is not on screen at all: the thing the user
+ * came for gets the whole display, and one back gesture returns them exactly where
+ * they were.
  */
-public final class MainActivity extends Activity implements TrackList.StateSource {
+public final class MainActivity extends Activity implements SearchSurface.SearchHost {
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     /** Stable observer identity, so add/remove pair up across reconnects. */
@@ -59,7 +60,6 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
             advanceDownload(row.track());
         }
     };
-
     private PlaybackController controller;
     private ProviderRegistry providers;
     private PlaybackSession session;
@@ -68,36 +68,45 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
     private ForegroundPlaybackService.LocalBinder serviceBinder;
     private boolean bound;
     private boolean destroyed;
-    private boolean landscape;
+    /** The window the interface was last adapted to; {@code null} before the first. */
+    private LayoutRules.Profile window;
+
+    // ---- the tree ----
+    private FrameLayout root;
+    private ScrollHost scroller;
+    private LinearLayout content;
+    private MiniPlayer mini;
+    private LinearLayout bottomBar;
+    private LinearLayout navBar;
+    private FrameLayout player;
+    private PlaybackDebugPanel debugPanel;
+    private LiveAudioBars bars;
 
     private TrackList.RowPool rowPool;
-    private NowPlayingView nowPlaying;
-    private PlaybackDebugPanel debugPanel;
-    private EditText queryInput;
-    private IconButton searchAction;
-    private LinearLayout sectionContent;
-    private TextView statusLine;
+    private HomeSurface homeSurface;
+    private SearchSurface searchSurface;
+    private LibrarySurface likedSurface;
+    private LibrarySurface downloadsSurface;
+    private final SectionSurface[] surfaces = new SectionSurface[Section.values().length];
     private final NavigationItem[] navItems = new NavigationItem[Section.values().length];
 
-    /** Which list the content area is showing. */
+    private NowPlayingView nowPlaying;
+
+    /** Which destination the content area is showing. */
     private enum Section { HOME, SEARCH, LIKED, DOWNLOADED }
     private Section section = Section.HOME;
+    /** Where Search returns to; {@code null} means "wherever you were". */
+    private Section returnFromSearch = Section.HOME;
+    /** Whether the player is covering the navigation. */
+    private boolean playerOpen;
 
-    /** Identity Home was last rendered for, so it only reloads on a real change. */
-    private String homeTrackKey = "";
-    /**
-     * {@code Descargadas} revision the visible list was built from.
-     *
-     * <p>The list is re-derived, not merely re-bound, when this changes: a newly
-     * downloaded track has no row to rebind. Without it the view stayed permanently
-     * empty after a restart, because it was built before the store scan reported what
-     * was already on disk.
-     */
     private int downloadsRenderedRevision = -1;
-    private boolean searchInFlight;
 
     /** Request code for the runtime POST_NOTIFICATIONS prompt. */
     private static final int NOTIFICATION_PERMISSION_REQUEST = 4201;
+
+    /** Visible to the surfaces, which need the session and the screen's own pieces. */
+    PlaybackSession sessionForSurfaces() { return session; }
 
     private final ServiceConnection connection = new ServiceConnection() {
         @Override public void onServiceConnected(ComponentName name, IBinder service) {
@@ -109,12 +118,17 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
             session = binder.session();
             library = binder.library();
             downloader = binder.downloader();
+            // One live-audio source per binding, owned by the screen: it holds a
+            // single reusable buffer, so a second one would only mean a second
+            // copy of the same bars.
+            bars = new LiveAudioBars(controller);
             // A stable field, so adding is idempotent and removing actually
             // matches: a method reference created twice is a different object,
             // which let a reconnect stack duplicate observers.
             session.addObserver(sessionObserver);
-            applyOrientation(getResources().getConfiguration());
-            loadSection(Section.HOME);
+            applyWindow(true);
+            showSection(Section.HOME, true);
+            render();
             if (getIntent().getBooleanExtra("runtime_smoke_test", false)) resolveAndPlay();
             applyRuntimeDownloadHook();
         }
@@ -125,6 +139,10 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
             providers = null;
             downloader = null;
             serviceBinder = null;
+            // The source reads the engine of a controller the service owned: with
+            // the service gone, that handle must not be touched again.
+            bars = null;
+            if (nowPlaying != null) nowPlaying.attachSound(null);
         }
     };
 
@@ -161,40 +179,97 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
 
     private void buildInterface() {
         rowPool = new TrackList.RowPool(this, rowCallbacks);
-        int gutter = DesignTokens.dp(DesignTokens.CONTENT_PADDING_HORIZONTAL);
+        rowPool.setArtworkLoader(this::loadRowArtwork);
+        rowPool.setOverflowHost(this);
 
-        // A ScrollView keeps every control reachable when the window is short.
-        ScrollView scroller = new ScrollView(this);
-        scroller.setFillViewport(true);
-        LinearLayout page = new LinearLayout(this);
-        page.setOrientation(LinearLayout.VERTICAL);
-        page.setBackgroundColor(DesignTokens.Palette.SURFACE_BASE);
-        page.setPadding(gutter, DesignTokens.dp(DesignTokens.CONTENT_PADDING_TOP),
+        root = new FrameLayout(this);
+        root.setBackgroundColor(DesignTokens.Palette.SURFACE_BASE);
+
+        scroller = new ScrollHost(this);
+        int gutter = DesignTokens.dp(DesignTokens.CONTENT_PADDING_HORIZONTAL);
+        content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(gutter, DesignTokens.dp(DesignTokens.CONTENT_PADDING_TOP),
                 gutter, DesignTokens.dp(DesignTokens.CONTENT_PADDING_BOTTOM));
         // Stop the search field from grabbing focus at launch, which raised the
-        // keyboard over the Now Playing panel before the user asked for it.
-        page.setFocusableInTouchMode(true);
-        page.requestFocus();
-        scroller.addView(page, new ScrollView.LayoutParams(-1, -2));
+        // keyboard over the player before the user asked for it.
+        content.setFocusableInTouchMode(true);
+        content.requestFocus();
+        scroller.addView(content);
+        FrameLayout.LayoutParams scrollerParams = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
+        root.addView(scroller, scrollerParams);
 
-        page.addView(buildTopBar(), spaced(-1, -2, 0f));
+        buildSurfaces();
+        buildPlayer();
+        buildBottomBar();
+        setContentView(root);
+        applySystemBars();
+        applyWindow(true);
+    }
 
-        LinearLayout nav = buildNavigation();
-        page.addView(nav, spaced(-1, -2, DesignTokens.REGION_GAP));
+    /**
+     * The diagnostics toggle, parked at the top of Home.
+     *
+     * <p>A development tool is a thing that must be reachable and a thing that must
+     * not be in the way: one 48dp target at the top of the discovery screen, which
+     * opens a panel that is hidden by default and costs nothing until it is asked
+     * for. It was in the top bar until the bottom navigation replaced it.
+     */
+    private LinearLayout.LayoutParams diagnosticsParams() {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET),
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET));
+        params.gravity = Gravity.END;
+        return params;
+    }
 
-        page.addView(buildSearchRow(), spaced(-1, -2, DesignTokens.REGION_GAP));
+    /** The four destinations, built once and kept. */
+    private void buildSurfaces() {
+        debugPanel = new PlaybackDebugPanel(this);
+        content.addView(debugPanel.view(), spaced(DesignTokens.SPACE_2));
 
-        // ---- Now Playing (primary surface) ----
+        IconButton diagnostics = new IconButton(this, DesignTokens.CONTROL_TARGET,
+                DesignTokens.ICON_SIZE_SMALL);
+        diagnostics.setAction(Icon.DIAGNOSTICS, "Diagnostics");
+        diagnostics.setOnClickListener(view -> {
+            debugPanel.toggle();
+            renderDiagnostics();
+        });
+        content.addView(diagnostics, diagnosticsParams());
+
+        homeSurface = new HomeSurface(this, this);
+        searchSurface = new SearchSurface(this, this);
+        likedSurface = new LibrarySurface(this, this, "L1K3D");
+        downloadsSurface = new LibrarySurface(this, this, "Descargadas");
+        surfaces[Section.HOME.ordinal()] = homeSurface;
+        surfaces[Section.SEARCH.ordinal()] = searchSurface;
+        surfaces[Section.LIKED.ordinal()] = likedSurface;
+        surfaces[Section.DOWNLOADED.ordinal()] = downloadsSurface;
+        for (SectionSurface surface : surfaces) {
+            content.addView(surface, spaced(0f));
+        }
+    }
+
+    /**
+     * The player, which covers the navigation when it is open.
+     *
+     * <p>A view in this Activity and not a second Activity on purpose: an Activity
+     * switch would tear down the window, rebuild the strip, re-decode the cover and
+     * hand the service a new binding, all to show a view that was already built.
+     */
+    private void buildPlayer() {
+        player = new FrameLayout(this);
+        player.setBackgroundColor(DesignTokens.Palette.SURFACE_BASE);
+        player.setVisibility(View.GONE);
+
         nowPlaying = new NowPlayingView(this, new NowPlayingView.Actions() {
             @Override public void onPlayPause() { session.togglePause(); }
             @Override public void onNext() { session.next(); }
             @Override public void onPrevious() { session.previous(); }
-            @Override public void onStop() { session.stop(); }
-
             @Override public void onLike() {
                 session.toggleLike();
-                // L1K3D is visible in this same view, so refresh immediately.
-                if (section == Section.LIKED) loadSection(Section.LIKED);
+                refreshLists();
             }
 
             @Override public void onDownload() {
@@ -220,113 +295,117 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
                 session.setAutoplayEnabled(!session.autoplayEnabled());
             }
         });
-        page.addView(nowPlaying.view(), spaced(-1, -2, DesignTokens.REGION_GAP));
 
-        debugPanel = new PlaybackDebugPanel(this);
-        page.addView(debugPanel.view(), spaced(-1, -2, DesignTokens.GAP));
+        ScrollView playerScroller = new ScrollView(this);
+        playerScroller.setFillViewport(true);
+        playerScroller.setBackgroundColor(DesignTokens.Palette.SURFACE_BASE);
+        playerScroller.addView(nowPlaying.view(), new ScrollView.LayoutParams(-1, -2));
+        FrameLayout.LayoutParams scrollerParams = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
+        player.addView(playerScroller, scrollerParams);
 
-        // ---- Section content ----
-        sectionContent = new LinearLayout(this);
-        sectionContent.setOrientation(LinearLayout.VERTICAL);
-        page.addView(sectionContent, spaced(-1, -2, 0f));
-
-        statusLine = new TextView(this);
-        statusLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_CAPTION_SIZE);
-        statusLine.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
-        statusLine.setVisibility(View.GONE);
-        page.addView(statusLine, spaced(-1, -2, DesignTokens.GAP));
-
-        setContentView(scroller);
-        applyOrientation(getResources().getConfiguration());
-    }
-
-    private View buildTopBar() {
-        LinearLayout bar = new LinearLayout(this);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setMinimumHeight(DesignTokens.dp(DesignTokens.TOP_BAR_HEIGHT));
-
-        TextView brandName = new TextView(this);
-        brandName.setText("Tunefold");
-        brandName.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_DISPLAY_SIZE);
-        brandName.setLetterSpacing(DesignTokens.TYPE_DISPLAY_TRACKING);
-        brandName.setTextColor(DesignTokens.Palette.ON_SURFACE);
-        brandName.setIncludeFontPadding(false);
-        bar.addView(brandName, new LinearLayout.LayoutParams(0, -2, 1f));
-
-        IconButton diagnostics = new IconButton(this, DesignTokens.CONTROL_TARGET,
-                DesignTokens.ICON_SIZE_SMALL);
-        diagnostics.setAction(Icon.DIAGNOSTICS, "Diagnostics");
-        diagnostics.setOnClickListener(view -> {
-            debugPanel.toggle();
-            renderDiagnostics();
-        });
-        bar.addView(diagnostics, new LinearLayout.LayoutParams(
+        // One control, top left, that means exactly what the system gesture means.
+        IconButton close = new IconButton(this);
+        close.setAction(Icon.BACK, "Close player");
+        close.setOnClickListener(view -> closePlayer());
+        FrameLayout.LayoutParams closeParams = new FrameLayout.LayoutParams(
                 DesignTokens.dp(DesignTokens.CONTROL_TARGET),
-                DesignTokens.dp(DesignTokens.CONTROL_TARGET)));
-        return bar;
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET));
+        closeParams.leftMargin = DesignTokens.dp(DesignTokens.CONTENT_PADDING_HORIZONTAL);
+        closeParams.topMargin = DesignTokens.dp(DesignTokens.CONTENT_PADDING_TOP);
+        player.addView(close, closeParams);
+
+        root.addView(player, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
     }
 
     /**
-     * The four destinations.
+     * The bottom of the screen: the strip and the destinations.
      *
-     * <p>Built once. Switching section only flips each slot's selected state, so the bar
-     * never re-inflates and its width never depends on the current label.
+     * <p>Two views in one column because they are one thing: what is playing and where
+     * you can go are both "the bottom of the screen", and the strip is anchored to the
+     * destinations so they cannot drift apart when one of them hides.
+     */
+    private void buildBottomBar() {
+        bottomBar = new LinearLayout(this);
+        bottomBar.setOrientation(LinearLayout.VERTICAL);
+        bottomBar.setBackgroundColor(DesignTokens.BOTTOM_NAV_SURFACE);
+
+        mini = new MiniPlayer(this, new MiniPlayer.Actions() {
+            @Override public void onPlayPause() {
+                if (session != null) session.togglePause();
+            }
+
+            @Override public void onExpand() { openPlayer(); }
+        });
+        bottomBar.addView(mini, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                DesignTokens.dp(DesignTokens.MINI_PLAYER_HEIGHT)));
+
+        navBar = buildNavigation();
+        bottomBar.addView(navBar, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                DesignTokens.dp(DesignTokens.BOTTOM_NAV_HEIGHT)));
+
+        LinearLayout.LayoutParams bottomParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        bottomParams.gravity = Gravity.BOTTOM;
+        root.addView(bottomBar, new FrameLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
+    }
+
+    /**
+     * The four destinations, at the bottom, as glyphs with captions.
+     *
+     * <p>Built once. Switching destination only flips each slot's selected state, so
+     * the bar never re-inflates and its width never depends on the current label.
      */
     private LinearLayout buildNavigation() {
         LinearLayout nav = new LinearLayout(this);
         nav.setOrientation(LinearLayout.HORIZONTAL);
         int height = DesignTokens.dp(DesignTokens.CONTROL_TARGET_NAVIGATION);
-        int gap = DesignTokens.dp(DesignTokens.GAP_TIGHT);
         Section[] order = {Section.HOME, Section.SEARCH, Section.LIKED, Section.DOWNLOADED};
         for (int index = 0; index < order.length; index++) {
             Section target = order[index];
             NavigationItem item = new NavigationItem(this, glyphFor(target), labelFor(target));
-            item.setOnClickListener(view -> loadSection(target));
+            item.setOnClickListener(view -> showSection(target, true));
             navItems[target.ordinal()] = item;
             LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, height, 1f);
-            if (index > 0) params.leftMargin = gap;
+            if (index > 0) params.leftMargin = DesignTokens.dp(DesignTokens.SPACE_1);
             nav.addView(item, params);
         }
         return nav;
     }
 
-    private LinearLayout buildSearchRow() {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-
-        queryInput = new EditText(this);
-        queryInput.setSingleLine(true);
-        queryInput.setHint("Search or paste a YouTube URL");
-        queryInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
-        queryInput.setTextColor(DesignTokens.Palette.ON_SURFACE);
-        queryInput.setHintTextColor(DesignTokens.Palette.ON_SURFACE_FAINT);
-        queryInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        queryInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
-        queryInput.setBackground(roundDrawable(DesignTokens.Palette.SURFACE_RAISED,
-                DesignTokens.RADIUS_MEDIUM));
-        queryInput.setOnEditorActionListener((view, actionId, event) -> {
-            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
-                submitQuery();
-                return true;
-            }
-            return false;
+    /**
+     * The system's own bars are the window's, not ours: we pad and never draw them.
+     *
+     * <p>Insets are remembered rather than applied twice: the window the layout rules
+     * measure is the window <em>after</em> them, and a phone in landscape is 2388 px
+     * shorter than the display once the navigation bar and the cutout have taken their
+     * share. Handing them to {@link #applyWindow} is what keeps a phone on its side
+     * from being laid out as if it were standing up.
+     *
+     * <p>One listener, installed once, for the life of the screen: a second one would
+     * be a second set of writes on every inset change, and the two would fight.
+     */
+    @SuppressWarnings("deprecation")
+    private void applySystemBars() {
+        root.setOnApplyWindowInsetsListener((view, system) -> {
+            int left = system.getSystemWindowInsetLeft();
+            int top = system.getSystemWindowInsetTop();
+            int right = system.getSystemWindowInsetRight();
+            int bottom = system.getSystemWindowInsetBottom();
+            boolean moved = insets.left != left || insets.top != top
+                    || insets.right != right || insets.bottom != bottom;
+            insets.set(left, top, right, bottom);
+            bottomBar.setPadding(0, 0, 0, bottom);
+            if (moved) applyWindow(true);
+            return system;
         });
-        int fieldHeight = DesignTokens.dp(DesignTokens.SEARCH_FIELD_HEIGHT);
-        row.addView(queryInput, new LinearLayout.LayoutParams(0, fieldHeight, 1f));
-
-        // The IME action is the usual way to search; this is the discoverable one, and
-        // both reach the same command.
-        searchAction = new IconButton(this);
-        searchAction.setAction(Icon.SEARCH, "Search");
-        searchAction.setOnClickListener(view -> submitQuery());
-        LinearLayout.LayoutParams actionParams =
-                new LinearLayout.LayoutParams(DesignTokens.dp(DesignTokens.CONTROL_TARGET),
-                        DesignTokens.dp(DesignTokens.CONTROL_TARGET));
-        actionParams.leftMargin = DesignTokens.dp(DesignTokens.GAP);
-        row.addView(searchAction, actionParams);
-        return row;
     }
 
     private static Icon glyphFor(Section target) {
@@ -347,53 +426,136 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
         }
     }
 
-    private LinearLayout.LayoutParams spaced(int width, int height, float gapDp) {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(width, height);
+    private LinearLayout.LayoutParams spaced(float gapDp) {
+        LinearLayout.LayoutParams params =
+                new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT);
         if (gapDp > 0f) params.topMargin = DesignTokens.dp(gapDp);
         return params;
     }
 
-    private static GradientDrawable roundDrawable(int color, float radiusDp) {
-        GradientDrawable shape = new GradientDrawable();
+    private LinearLayout.LayoutParams spaced(int gapDp) { return spaced((float) gapDp); }
+
+    /** The app's rounded background, so a surface cannot invent another one. */
+    static android.graphics.drawable.Drawable roundDrawable(int color, float radiusDp) {
+        android.graphics.drawable.GradientDrawable shape =
+                new android.graphics.drawable.GradientDrawable();
         shape.setColor(color);
         shape.setCornerRadius(DesignTokens.dp(radiusDp));
         return shape;
     }
 
-    // ------------------------------------------------------------ behaviour
+    // ------------------------------------------------------------ navigation
 
-    private void submitQuery() {
+    /**
+     * Shows one destination.
+     *
+     * <p>The switch is a visibility change on views that already exist, so it costs no
+     * inflation, no Activity recreation and no state loss: a destination keeps whatever
+     * the user did to it until they ask for something else.
+     */
+    private void showSection(Section target, boolean userInitiated) {
+        if (section != Section.SEARCH && target == Section.SEARCH && userInitiated) {
+            returnFromSearch = section;
+        }
+        section = target;
+        for (Section candidate : Section.values()) {
+            boolean active = candidate == target;
+            navItems[candidate.ordinal()].setActiveDestination(active);
+            surfaces[candidate.ordinal()].setVisibility(active ? View.VISIBLE : View.GONE);
+        }
+        scroller.scrollToTop();
         if (session == null) return;
-        String query = queryInput.getText().toString().trim();
-        if (query.isEmpty()) return;
-        if (query.contains("youtube.com/") || query.contains("youtu.be/")) {
+        refreshSection();
+        surfaces[target.ordinal()].onShow();
+    }
+
+    /** Fills the visible destination from the session, once. */
+    private void refreshSection() {
+        switch (section) {
+            // Home re-derives in its own onShow(): one place, one decision, and the
+            // "arriving" semantics are the surface's rather than the screen's.
+            case SEARCH:
+                searchSurface.showPrompt();
+                break;
+            case LIKED:
+                renderLiked();
+                break;
+            case DOWNLOADED:
+                renderDownloaded();
+                break;
+            default:
+                break;
+        }
+    }
+
+    @Override public void onSearchBack() {
+        showSection(returnFromSearch, false);
+    }
+
+    @Override public void onSubmit(String query, SearchSurface.Intent intent) {
+        if (session == null) return;
+        if (intent == SearchSurface.Intent.URL) {
             session.playUrl(query);
-            selectSection(Section.SEARCH);
-            showStatus("Playing URL");
             return;
         }
-        selectSection(Section.SEARCH);
-        searchInFlight = true;
-        showSearchResults(null);
+        searchSurface.showSearching();
         session.search(query, (tracks, error) -> {
-            searchInFlight = false;
+            if (destroyed || section != Section.SEARCH) return;
             if (error != null) {
-                showStatus(error);
+                searchSurface.showError(error);
                 return;
             }
-            if (section == Section.SEARCH) {
-                showSearchResults(tracks);
-            }
+            searchSurface.showResults(tracks == null ? new ArrayList<>() : tracks);
         });
     }
+
+    @Override public void onSearchIdle() { }
+
+    // --------------------------------------------------------------- the player
+
+    /** Opens the full player, hiding the navigation behind it. */
+    private void openPlayer() {
+        if (playerOpen) return;
+        playerOpen = true;
+        player.setVisibility(View.VISIBLE);
+        scroller.setVisibility(View.GONE);
+        bottomBar.setVisibility(View.GONE);
+        // The bars only run while somebody can see them.
+        nowPlaying.attachSound(bars);
+        render();
+    }
+
+    /** Closes the player and gives the screen back exactly as it was. */
+    private void closePlayer() {
+        if (!playerOpen) return;
+        playerOpen = false;
+        player.setVisibility(View.GONE);
+        scroller.setVisibility(View.VISIBLE);
+        bottomBar.setVisibility(View.VISIBLE);
+        nowPlaying.attachSound(null);
+    }
+
+    /** One back gesture means one thing: leave the player, then leave Search. */
+    @Override public void onBackPressed() {
+        if (playerOpen) {
+            closePlayer();
+            return;
+        }
+        if (section != Section.SEARCH) {
+            super.onBackPressed();
+            return;
+        }
+        showSection(returnFromSearch, false);
+    }
+
+    // ------------------------------------------------------------ behaviour
 
     private void resolveAndPlay() {
         String url = getIntent().getStringExtra("runtime_stream_url");
         if (url == null || session == null) return;
-        // Switch the surface as well as the section, otherwise the previously rendered
-        // list stays on screen under a search header.
-        loadSection(Section.SEARCH);
         session.playUrl(url);
+        openPlayer();
     }
 
     /**
@@ -404,16 +566,14 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
      */
     private void applyRuntimeDownloadHook() {
         if (!getIntent().getBooleanExtra("runtime_download", false)) return;
-        selectSection(Section.SEARCH);
         String action = getIntent().getStringExtra("runtime_download_action");
         String label = getIntent().getStringExtra("runtime_track_label");
         MediaTrack track = label == null ? null : new MediaTrack(
                 "YouTube", label, label, "", "", "", "artist", -1, "", "", "{}");
         if (track == null) {
-            showStatus("runtime_download needs runtime_track_label");
             return;
         }
-        loadSection(Section.SEARCH);
+        showSection(Section.SEARCH, false);
         if ("start".equals(action)) {
             session.play(track);
             startDownload();
@@ -464,7 +624,7 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
     private void toggleLike(MediaTrack track) {
         if (library == null || track == null) return;
         library.toggleLiked(track);
-        if (section == Section.LIKED) loadSection(Section.LIKED);
+        if (section == Section.LIKED) renderLiked();
         else refreshLists();
     }
 
@@ -485,7 +645,11 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
         refreshLists();
     }
 
-    // ---------------------------------------------------------- list sources
+    // ------------------------------------------------------------ row actions
+
+    @Override public TrackList.RowPool rowPool() { return rowPool; }
+
+    @Override public ScrollHost scrollHost() { return scroller; }
 
     @Override public boolean isLiked(MediaTrack track) {
         return library != null && library.isLiked(track);
@@ -496,106 +660,65 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
         return downloader.stateOf(track);
     }
 
-    // ------------------------------------------------------------- sections
-
-    /** Loads the content of a navigation section. */
-    private void loadSection(Section target) {
-        selectSection(target);
-        if (session == null) return;
-        switch (target) {
-            case HOME: renderHome(true); break;
-            case SEARCH: renderSearchPrompt(); break;
-            case LIKED: renderLiked(); break;
-            default: renderDownloaded(); break;
-        }
-        render();
-    }
-
-    /** Highlights a destination without touching the content. */
-    private void selectSection(Section target) {
-        section = target;
-        for (Section candidate : Section.values()) {
-            navItems[candidate.ordinal()].setActiveDestination(candidate == target);
-        }
-    }
-
     /**
-     * Home: continue listening, L1K3D and recommendations, each independently.
+     * A row's contextual actions, from its button or its long press.
      *
-     * <p>Reloads when the current track changes (or the user asks), never on every state
-     * tick: a recommendation request is a provider round trip and must not be repeated on
-     * each render.
+     * <p>Built per row because the actions depend on the row: a liked track offers to
+     * unlike it, a downloaded one offers to remove it, and a running download offers to
+     * cancel it. A menu that offered the same three items regardless would be lying
+     * about two of them.
      */
-    private void renderHome(boolean force) {
-        PlaybackSession.Snapshot snapshot = session.snapshot();
-        String currentId = snapshot.currentKey == null ? "" : snapshot.currentKey.toString();
-        if (!force && currentId.equals(homeTrackKey)) return;
-        homeTrackKey = currentId;
-        clearSection();
-
-        if (snapshot.currentTrack != null) {
-            List<MediaTrack> continuing = new ArrayList<>(1);
-            continuing.add(snapshot.currentTrack);
-            addGroup("Continue listening", SectionHeader.NO_COUNT).submit(continuing);
+    @Override public void onOverflow(TrackRow row, View anchor) {
+        MediaTrack track = row.track();
+        if (track == null) return;
+        PopupMenu menu = new PopupMenu(this, anchor);
+        boolean liked = row.isLiked();
+        menu.getMenu().add(0, 1, 0, liked ? "Remove from L1K3D" : "Add to L1K3D");
+        DownloadState.Phase phase = row.downloadPhase();
+        switch (phase) {
+            case RESOLVING_SOURCE:
+            case DOWNLOADING:
+                menu.getMenu().add(0, 2, 1, "Cancel download");
+                break;
+            case COMPLETED:
+            case ALREADY_DOWNLOADED:
+                menu.getMenu().add(0, 3, 1, "Remove download");
+                break;
+            case FAILED:
+            case CANCELLED:
+                menu.getMenu().add(0, 4, 1, "Retry download");
+                break;
+            default:
+                menu.getMenu().add(0, 5, 1, "Download");
+                break;
         }
-
-        List<TrackKey> liked = session.likedKeys();
-        if (!liked.isEmpty()) {
-            List<MediaTrack> tracks = new ArrayList<>(liked.size());
-            for (TrackKey key : liked) {
-                MediaTrack track = session.describeLiked(key);
-                if (track != null) tracks.add(track);
+        menu.setOnMenuItemClickListener(item -> {
+            switch (item.getItemId()) {
+                case 1: toggleLike(track); break;
+                case 2: advanceDownload(track); break;
+                default: advanceDownload(track); break;
             }
-            addGroup("L1K3D", liked.size()).submit(tracks);
-        }
-
-        if (snapshot.currentTrack == null) {
-            addMessage("Play something first to get recommendations");
-            return;
-        }
-        // Asynchronous and non-fatal: a failure leaves Home usable (§25).
-        TrackList recommendations = addGroup("Recommended", SectionHeader.NO_COUNT);
-        TextView pending = message("Loading…");
-        recommendations.addView(pending);
-        session.recommendationsForHome(snapshot.currentTrack, (candidates, error) -> {
-            if (destroyed || section != Section.HOME) return;
-            recommendations.removeView(pending);
-            List<MediaTrack> tracks = candidates == null ? new ArrayList<>() : candidates;
-            if (tracks.isEmpty()) {
-                recommendations.addView(message("No recommendations available"));
-                return;
-            }
-            recommendations.submit(tracks);
+            return true;
         });
+        menu.show();
     }
+
+    // ---------------------------------------------------------- list sources
 
     /** L1K3D: membership only. Downloads are a separate, derived playlist. */
     private void renderLiked() {
         List<TrackKey> keys = session.likedKeys();
-        clearSection();
-        if (keys.isEmpty()) {
-            addMessage("Nothing here yet. Use Like on any track.");
-            return;
-        }
-        List<MediaTrack> tracks = new ArrayList<>(keys.size());
-        int unresolved = 0;
-        for (TrackKey key : keys) {
+        List<MediaTrack> tracks = new ArrayList<>(Math.min(keys.size(), 64));
+        int limit = LibrarySurface.limit(keys.size());
+        for (int index = 0; index < limit; index++) {
+            TrackKey key = keys.get(index);
             MediaTrack track = session.describeLiked(key);
-            if (track != null) {
-                tracks.add(track);
-            } else {
-                // Membership is durable, but we may not hold the metadata yet. Showing
-                // the identity beats pretending the track is gone.
-                tracks.add(placeholderFor(key));
-                unresolved++;
-            }
+            // Membership is durable, but we may not hold the metadata yet. Showing the
+            // identity beats pretending the track is gone.
+            tracks.add(track != null ? track : placeholderFor(key));
         }
-        addGroup("L1K3D", keys.size()).submit(tracks);
-        if (unresolved > 0) {
-            addMessage(unresolved + (unresolved == 1
-                    ? " track is still resolving its metadata."
-                    : " tracks are still resolving their metadata."));
-        }
+        likedSurface.submit(tracks, false,
+                keys.isEmpty() ? "Nothing here yet. Use Like on any track." : null, null);
     }
 
     /**
@@ -607,33 +730,15 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
     private void renderDownloaded() {
         List<TrackKey> keys = session.downloadedKeys();
         downloadsRenderedRevision = session.downloadsRevision();
-        clearSection();
-        if (keys.isEmpty()) {
-            addMessage("No downloads yet. Use Download on any track.");
-            return;
-        }
-        List<MediaTrack> tracks = new ArrayList<>(keys.size());
-        for (TrackKey key : keys) {
+        List<MediaTrack> tracks = new ArrayList<>(Math.min(keys.size(), 64));
+        int limit = LibrarySurface.limit(keys.size());
+        for (int index = 0; index < limit; index++) {
+            TrackKey key = keys.get(index);
             MediaTrack track = session.describeLiked(key);
             tracks.add(track != null ? track : placeholderFor(key));
         }
-        addGroup("Descargadas", keys.size()).submit(tracks);
-    }
-
-    private void renderSearchPrompt() {
-        clearSection();
-        addMessage("Search for a track above");
-    }
-
-    private void showSearchResults(List<MediaTrack> tracks) {
-        clearSection();
-        int count = tracks == null ? 0 : tracks.size();
-        if (count == 0) {
-            addMessage(searchInFlight ? "Searching…" : "No results");
-            return;
-        }
-        addGroup(count + (count == 1 ? " result" : " results"),
-                SectionHeader.NO_COUNT).submit(tracks);
+        downloadsSurface.submit(tracks, false,
+                keys.isEmpty() ? "No downloads yet. Use Download on any track." : null, null);
     }
 
     private MediaTrack placeholderFor(TrackKey key) {
@@ -641,96 +746,88 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
                 "", "", "", "artist", -1, "", "", "{}");
     }
 
-    // ------------------------------------------------------- section content
-
     /**
-     * Empties the content area, returning every list's rows to the shared pool.
+     * Re-applies like and download state to whatever rows are on screen.
      *
-     * <p>Returning the rows rather than dropping them is what makes a section switch
-     * cost no view inflation: the next section re-points them.
-     */
-    private void clearSection() {
-        for (int i = 0; i < sectionContent.getChildCount(); i++) {
-            View child = sectionContent.getChildAt(i);
-            if (child instanceof TrackList) ((TrackList) child).detachAll();
-        }
-        sectionContent.removeAllViews();
-    }
-
-    private TrackList addGroup(String title, int count) {
-        SectionHeader header = new SectionHeader(this);
-        header.setTitle(title, count);
-        sectionContent.addView(header, spaced(-1, -2, DesignTokens.SECTION_GAP));
-        TrackList list = new TrackList(this, rowPool, this);
-        sectionContent.addView(list, spaced(-1, -2, 0f));
-        list.setActiveTrack(session == null ? null : session.snapshot().currentKey);
-        return list;
-    }
-
-    private void addMessage(CharSequence text) {
-        sectionContent.addView(message(text), spaced(-1, -2, DesignTokens.GAP));
-    }
-
-    private TextView message(CharSequence text) {
-        TextView view = new TextView(this);
-        view.setText(text);
-        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
-        view.setTextColor(DesignTokens.Palette.ON_SURFACE_FAINT);
-        return view;
-    }
-
-    /**
-     * Re-applies like and download state to every visible list.
-     *
-     * <p>This replaces the previous "rebuild the section when the download signature
-     * changed" behaviour. Building a signature string meant allocating a StringBuilder
-     * and a String over every listed row on every notification, and the rebuild it
-     * triggered threw away and re-inflated the whole section, which moved the scroll
-     * position out from under the user. Rebinding is O(rows), allocation-free, and does
-     * not touch the layout when nothing changed.
+     * <p>Rebinding is O(window) and allocation-free, and it does not touch the layout
+     * when nothing changed — which is what a list of fifty rows used to do several
+     * times a second, rebuilding the section and moving the scroll position out from
+     * under the user.
      */
     private void refreshLists() {
         TrackKey active = session == null ? null : session.snapshot().currentKey;
-        for (int i = 0; i < sectionContent.getChildCount(); i++) {
-            View child = sectionContent.getChildAt(i);
-            if (!(child instanceof TrackList)) continue;
-            TrackList list = (TrackList) child;
-            list.setActiveTrack(active);
-            list.refresh();
+        for (SectionSurface surface : surfaces) {
+            if (surface == null) continue;
+            surface.setActiveKey(active);
+            surface.refresh();
         }
     }
 
     // ------------------------------------------------------------- artwork
 
     /**
-     * Decodes the cover for {@code track} into the Now Playing view, once per track.
+     * The one path covers take, at whatever size they will be drawn.
      *
-     * <p>The UI refreshes on a timer, so requesting on every render meant re-reading and
-     * re-decoding the same file twice a second for the whole session. Guarding by
-     * identity keeps the view correct while making the cost proportional to tracks, not
-     * to ticks (§27).
+     * <p>Rows ask through here when they are bound, which means a row that was never
+     * built never asks: the windowing and the artwork loading are the same decision
+     * seen from two sides.
      */
-    private void loadArtwork(MediaTrack track) {
+    private void loadRowArtwork(MediaTrack track, String identity, int sidePx) {
         if (providers == null || track == null || track.thumbnail.isEmpty()) return;
-        String identity = identityOf(track);
-        if (identity.isEmpty() || identity.equals(nowPlaying.artwork().shownCoverId())) return;
-        nowPlaying.expectArtwork(identity);
-        providers.loadArtwork(track, (bitmap, error) -> {
+        providers.loadArtwork(track, sidePx, (bitmap, error) -> {
             if (destroyed || bitmap == null) return;
-            // The view refuses any identity it is not waiting for, so a decode that
-            // finishes after a skip cannot repaint the previous cover.
-            nowPlaying.setArtwork(identity, bitmap);
+            // The row refuses any identity it is not waiting for, so a decode that
+            // finishes after a fast scroll cannot paint the wrong cover on a row that
+            // has already been rebound to something else.
+            lists.clear();
+            collectLists(content, lists);
+            for (int i = 0; i < lists.size(); i++) {
+                lists.get(i).onArtwork(identity, bitmap);
+            }
         });
     }
+
+    /** Reused, so a decode answering does not allocate while it paints. */
+    private final ArrayList<TrackList> lists = new ArrayList<>(8);
+
+    /** Every list under {@code root}, in one pass over the tree. */
+    private static void collectLists(View root, List<TrackList> into) {
+        if (root instanceof TrackList) into.add((TrackList) root);
+        if (!(root instanceof android.view.ViewGroup)) return;
+        android.view.ViewGroup group = (android.view.ViewGroup) root;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            collectLists(group.getChildAt(i), into);
+        }
+    }
+
+    /**
+     * The cover of whatever is playing, decoded once for the size the player shows.
+     *
+     * <p>The strip and the player share the bitmap: a cover is the largest object in
+     * the app, and decoding it twice for two views of one thing is how a screen that
+     * looks simple ends up costing megabytes.
+     */
+    private void loadPlayerArtwork(MediaTrack track) {
+        if (providers == null || track == null || track.thumbnail.isEmpty()) return;
+        String identity = identityOf(track);
+        if (identity.isEmpty()) return;
+        if (identity.equals(playerCoverIdentity)) return;
+        playerCoverIdentity = identity;
+        nowPlaying.expectArtwork(identity);
+        mini.expectArtwork(identity);
+        providers.loadArtwork(track, nowPlaying.artworkSidePx(), (bitmap, error) -> {
+            if (destroyed || bitmap == null) return;
+            nowPlaying.setArtwork(identity, bitmap);
+            mini.setArtwork(bitmap);
+        });
+    }
+
+    /** Identity of the cover currently on screen, so it is decoded once per track. */
+    private String playerCoverIdentity = "";
 
     private static String identityOf(MediaTrack track) {
         TrackKey key = track.key();
         return key == null ? "" : key.toString();
-    }
-
-    private void showStatus(CharSequence text) {
-        statusLine.setText(text);
-        statusLine.setVisibility(text == null || text.length() == 0 ? View.GONE : View.VISIBLE);
     }
 
     // -------------------------------------------------------------- render
@@ -739,56 +836,72 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
     private void onSessionChanged() {
         if (destroyed || session == null) return;
         render();
-        if (section == Section.DOWNLOADED) {
-            // The store scan finishes after this screen binds, and a download commits
-            // after that. Both change which tracks exist, which a rebind cannot express.
-            if (session.downloadsRevision() != downloadsRenderedRevision) {
-                renderDownloaded();
-            } else {
-                refreshLists();
-            }
+        if (section == Section.DOWNLOADED
+                && session.downloadsRevision() != downloadsRenderedRevision) {
+            // A newly downloaded track has no row to rebind; the store scan that
+            // finishes after binding does the same.
+            renderDownloaded();
         } else {
             refreshLists();
         }
-        if (section == Section.HOME) renderHome(false);
+        if (section == Section.LIKED) renderLiked();
+        if (section == Section.HOME) homeSurface.onSessionChanged();
     }
 
     /**
      * Applies one snapshot to every part of the surface.
      *
-     * <p>Deliberately six narrow calls rather than one {@code nowPlaying.render(...)}:
-     * each one compares against what it last rendered, so a change that touches nothing
-     * visible costs six comparisons instead of a dozen {@code setText} calls and the
-     * layout passes they schedule.
+     * <p>Deliberately narrow calls rather than one render: each one compares against
+     * what it last rendered, so a change that touches nothing visible costs a handful
+     * of comparisons instead of a dozen {@code setText} calls and the layout passes
+     * they schedule.
      */
     private void render() {
         if (destroyed || session == null) return;
         PlaybackSession.Snapshot snapshot = session.snapshot();
-        nowPlaying.applyTrack(snapshot);
-        nowPlaying.applyPlaybackState(snapshot);
-        nowPlaying.applyLibraryState(snapshot);
-        nowPlaying.applyDownloadState(snapshot);
-        nowPlaying.applyError(snapshot);
-        if (snapshot.currentTrack != null) {
-            loadArtwork(snapshot.currentTrack);
-            clearStatus();
+        mini.apply(snapshot);
+        if (playerOpen) {
+            nowPlaying.applyTrack(snapshot);
+            nowPlaying.applyPlaybackState(snapshot);
+            nowPlaying.applyLibraryState(snapshot);
+            nowPlaying.applyDownloadState(snapshot);
+            nowPlaying.applyError(snapshot);
         }
+        // One cover for both surfaces, decoded once at the size the player shows: the
+        // strip is 40dp of it and the cache already holds it, so the strip costs
+        // nothing of its own and the player opens with the picture already there.
+        if (snapshot.currentTrack != null) loadPlayerArtwork(snapshot.currentTrack);
         if (debugPanel.isVisible()) renderDiagnostics();
-    }
-
-    private void clearStatus() {
-        if (statusLine.getVisibility() == View.GONE) return;
-        statusLine.setText("");
-        statusLine.setVisibility(View.GONE);
     }
 
     private void renderDiagnostics() {
         if (session == null || !debugPanel.isVisible()) return;
         StringBuilder text = new StringBuilder(256);
         PlaybackSession.Snapshot snapshot = session.snapshot();
+        // First, because it is the one line a reviewer of this surface came for, and
+        // the panel caps its height: anything appended below the decoder trace can be
+        // scrolled out of sight.
+        text.append(nowPlaying.progressStats()).append('\n');
         text.append("state=").append(snapshot.state).append('\n');
         text.append("queue=").append(snapshot.queue.size())
                 .append(" index=").append(snapshot.queueIndex).append('\n');
+        lists.clear();
+        collectLists(content, lists);
+        StringBuilder window = new StringBuilder(64);
+        for (int i = 0; i < lists.size(); i++) {
+            if (i > 0) window.append(' ');
+            int[] range = lists.get(i).currentWindow();
+            window.append(range[0]).append('+').append(range[1])
+                    .append('/').append(lists.get(i).trackCount());
+        }
+        text.append("lists=").append(window)
+                .append(" built=").append(rowPool.builtCount())
+                .append(" pooled=").append(rowPool.pooledCount()).append('\n');
+        text.append("accent=").append(String.format(java.util.Locale.ROOT, "#%08X",
+                        ArtworkTheme.accent()))
+                .append(" bars=").append(String.format(java.util.Locale.ROOT, "#%08X/#%08X",
+                        ArtworkTheme.barsPrimary(), ArtworkTheme.barsSecondary()))
+                .append('\n');
         text.append("autoplay=").append(snapshot.autoplayEnabled).append('\n');
         if (downloader != null) {
             text.append("recovery=").append(downloader.recoverySummary()).append('\n');
@@ -816,12 +929,18 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
                     if (session != null) session.attachDownloader(ready);
                 }
             }
-            if (session != null) {
+            if (session != null && playerOpen) {
                 // One consistent read per tick: identity and position always come from
                 // the same instant, so a tick can never pair one track with another
                 // track's time.
                 PlaybackPosition now = session.readPosition(position);
                 nowPlaying.setPosition(now.key, now.positionMs, now.durationMs);
+                // The only thing the tick animates: the working indicator, and only
+                // while something is actually being waited for.
+                nowPlaying.tick();
+                // The bars move at the pace of the sound, not at the pace of the
+                // clock: 20 Hz against the same consistent read the position uses.
+                nowPlaying.refreshSound();
             }
             mainHandler.postDelayed(this, DesignTokens.POSITION_INTERVAL_MS);
         }
@@ -841,52 +960,134 @@ public final class MainActivity extends Activity implements TrackList.StateSourc
         super.onNewIntent(intent);
         setIntent(intent);
         if (destroyed || session == null) return;
-        loadSection(Section.SEARCH);
         if (intent.getBooleanExtra("runtime_smoke_test", false)) resolveAndPlay();
         applyRuntimeDownloadHook();
     }
+
+    /**
+     * Adapts the whole interface to the window it is in.
+     *
+     * <p><b>Once per change.</b> The numbers come from {@link LayoutRules}, which is
+     * pure arithmetic, so the window is read here, once, and handed to the surfaces
+     * that care. Nothing downstream recomputes a dimension: the cover's side is
+     * decided in one place and every listener reads the result, which is what stops a
+     * rotation from being three layout passes over a card holding the largest bitmap
+     * in the app.
+     *
+     * <p><b>Insets are part of the window.</b> The content box is what is left of
+     * the display after the status bar, the navigation bar and any cutout, and the
+     * rules are applied to that box rather than to the panel — otherwise a phone in
+     * landscape is measured as taller than the screen it is on.
+     *
+     * @param force re-read the display even if the layout rules did not change
+     */
+    private void applyWindow(boolean force) {
+        if (nowPlaying == null) return;
+        android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+        int widthPx = Math.max(1, metrics.widthPixels - insets.left - insets.right);
+        int heightPx = Math.max(1, metrics.heightPixels - insets.top - insets.bottom);
+        // The screen's smaller side, in dp: what decides whether this is a phone or a
+        // tablet, in every orientation.
+        int smallestPx = Math.min(metrics.widthPixels, metrics.heightPixels);
+        float density = Math.max(0.01f, metrics.density);
+        LayoutRules.Profile profile = LayoutRules.of(Math.round(widthPx / density),
+                Math.round(heightPx / density), Math.round(smallestPx / density),
+                widthPx > heightPx);
+        if (!force && LayoutRules.sameLayout(profile, window)) return;
+        window = profile;
+        android.util.Log.i("Tunefold", "window " + metrics.widthPixels + "x" + metrics.heightPixels
+                + " d=" + density + " ins=" + insets.left + "," + insets.top + ","
+                + insets.right + "," + insets.bottom + " -> " + profile.key()
+                + " max=" + profile.contentMaxDp() + " gutter=" + profile.gutterDp()
+                + " dpW=" + DesignTokens.dp(profile.gutterDp()));
+
+        // One column of content, centred, with a maximum width: a tablet should not
+        // turn a card into a letterbox, and a phone should not pay for a limit it
+        // will never reach.
+        applyContentWidth(profile);
+
+        int gutter = DesignTokens.dp(profile.gutterDp());
+        int inner = Math.max(0, widthPx - gutter * 2 - DesignTokens.dp(DesignTokens.CARD_PADDING) * 2);
+        // Height is only known once the player is on screen and measured; until then
+        // the width rule alone decides, which is the safer of the two errors.
+        int innerHeight = player != null && player.getHeight() > 0
+                ? Math.max(0, player.getHeight() - DesignTokens.dp(DesignTokens.CARD_PADDING) * 2)
+                : 0;
+        nowPlaying.setWindow(profile, Math.round(inner / density), Math.round(innerHeight / density));
+    }
+
+    /**
+     * Caps and centres the content column.
+     *
+     * <p>{@code 0} for a phone, which has no width to spare and keeps its gutter as
+     * padding. On anything larger the column stops at {@link LayoutRules#CONTENT_MAX_DP}
+     * and the leftover becomes margin around it, which is the difference between a
+     * composition that breathes and one stretched across the window. Both the width
+     * and the padding are written only when they change: this runs on every insets
+     * change, and a {@code setLayoutParams} here is a measure of the whole content.
+     */
+    private void applyContentWidth(LayoutRules.Profile profile) {
+        int max = profile.contentMaxDp();
+        int gutter = DesignTokens.dp(profile.gutterDp());
+        FrameLayout.LayoutParams params =
+                (FrameLayout.LayoutParams) content.getLayoutParams();
+        if (max <= 0) {
+            if (params.width != FrameLayout.LayoutParams.MATCH_PARENT
+                    || params.gravity != Gravity.NO_GRAVITY) {
+                params.width = FrameLayout.LayoutParams.MATCH_PARENT;
+                params.gravity = Gravity.NO_GRAVITY;
+                content.setLayoutParams(params);
+            }
+            setContentPadding(gutter);
+            return;
+        }
+        int limited = DesignTokens.dp(max);
+        if (params.width != limited || params.gravity != Gravity.CENTER_HORIZONTAL) {
+            params.width = limited;
+            params.gravity = Gravity.CENTER_HORIZONTAL;
+            content.setLayoutParams(params);
+        }
+        setContentPadding(0);
+    }
+
+    /**
+     * The page padding: the gutter on the sides, the status bar inset on top.
+     *
+     * <p>Written only when a number moved, because the inset listener calls this on
+     * every inset change and padding is a measure of the whole content.
+     *
+     * @param horizontalDp side padding, already converted; {@code 0} when the column
+     *                     carries its own width instead
+     */
+    private void setContentPadding(int horizontalDp) {
+        int left = DesignTokens.dp(horizontalDp);
+        int right = left;
+        int top = DesignTokens.dp(DesignTokens.CONTENT_PADDING_TOP) + insets.top;
+        int bottom = DesignTokens.dp(DesignTokens.CONTENT_PADDING_BOTTOM);
+        if (content.getPaddingLeft() == left && content.getPaddingTop() == top
+                && content.getPaddingRight() == right && content.getPaddingBottom() == bottom) {
+            return;
+        }
+        content.setPadding(left, top, right, bottom);
+    }
+
+    /** Insets the system has handed us, in pixels; zero until it does. */
+    private final android.graphics.Rect insets = new android.graphics.Rect();
 
     @Override public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
         // The user's font scale can change with the configuration; tokens must follow.
         DesignTokens.init(this);
-        applyOrientation(newConfig);
-    }
-
-    /**
-     * Adapts to the window: orientation plus an artwork side derived from the window, so
-     * the cover is never tiny on a large screen nor oversized on a small one, and the
-     * controls keep a usable height on a short window.
-     */
-    private void applyOrientation(Configuration configuration) {
-        landscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE;
-        if (nowPlaying == null) return;
-        nowPlaying.setLandscape(landscape);
-        android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
-        int padding = DesignTokens.dp(DesignTokens.CONTENT_PADDING_HORIZONTAL)
-                + DesignTokens.dp(DesignTokens.GAP);
-        int side;
-        if (landscape) {
-            // Beside the details, so the cover competes with a column of controls for
-            // the shorter dimension rather than filling it.
-            side = Math.min((int) (metrics.heightPixels * 0.72f),
-                    (int) (metrics.widthPixels * 0.42f));
-        } else {
-            // Above the details, so the cover is also bounded by the window's height.
-            // Sizing it by width alone made a full-bleed square that pushed every
-            // control below the fold on a tall phone, which is the opposite of what
-            // Now Playing is for.
-            int available = metrics.widthPixels - padding;
-            int heightBudget = (int) (metrics.heightPixels * 0.38f);
-            side = Math.min(available, heightBudget);
-        }
-        nowPlaying.setArtworkSidePx(side);
+        // Forced: a configuration change can change the insets without changing any
+        // dimension the rules look at, and the column has to follow the bar.
+        applyWindow(true);
     }
 
     @Override protected void onDestroy() {
         destroyed = true;
         mainHandler.removeCallbacks(poll);
         if (session != null) session.removeObserver(sessionObserver);
+        if (nowPlaying != null) nowPlaying.attachSound(null);
         if (bound) unbindService(connection);
         // Pooled rows are Views: dropping the pool is what lets the Activity and its
         // window go, instead of being retained by rows nobody will ever show again.

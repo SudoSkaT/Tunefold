@@ -60,4 +60,26 @@ public class TrackKeyTest {
         assertEquals("value", map.get(TrackKey.of("YouTube", "x")));
         assertFalse(map.containsKey(TrackKey.of("YouTube", "y")));
     }
+
+    /**
+     * The comparison every identity-guarded cache has to use.
+     *
+     * <p>{@code MediaTrack.key()} returns a fresh instance per call, so a tick hands
+     * the surface an equal but distinct key. Reference comparison here made every
+     * cache throw itself away on every tick; this test is the reminder.
+     */
+    @Test public void sameIdentitySurvivesAFreshInstance() {
+        TrackKey first = TrackKey.of("YouTube", "abc");
+        TrackKey second = TrackKey.of("YouTube", "abc");
+        org.junit.Assert.assertNotSame("key() builds a new instance every call", first, second);
+        org.junit.Assert.assertTrue("and they are the same track", TrackKey.same(first, second));
+    }
+
+    @Test public void sameIdentityIsNullSafe() {
+        assertTrue(TrackKey.same(null, null));
+        assertFalse(TrackKey.same(null, TrackKey.of("YouTube", "abc")));
+        assertFalse(TrackKey.same(TrackKey.of("YouTube", "abc"), null));
+        assertFalse(TrackKey.same(TrackKey.of("YouTube", "abc"), TrackKey.of("YouTube", "abd")));
+        assertFalse(TrackKey.same(TrackKey.of("YouTube", "abc"), TrackKey.of("Other", "abc")));
+    }
 }

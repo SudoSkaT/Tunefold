@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use jni::objects::{JByteBuffer, JClass, JObject, JString};
+use jni::objects::{JByteBuffer, JClass, JFloatArray, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong, jobject, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
@@ -200,6 +200,14 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
 
     engine.cancel.store(false, Ordering::Release);
     engine.ring.clear();
+    // La envolvente de PISTA se vacía AQUÍ, en el mismo instante en que el motor
+    // acepta la fuente nueva, y no cuando el análisis detecta el hueco posterior:
+    // entre ambas cosas hay cientos de milisegundos (resolución de metadatos y de
+    // fuente) en los que un lector podría pedir columnas y recibir, bajo la
+    // identidad de la pista nueva, la forma de la anterior.
+    if let Some(analysis) = engine.analysis.as_ref() {
+        analysis.begin_new_source();
+    }
     // The position clock is per playback, not per engine: it is only otherwise
     // reset by seek, which Android never performs. Without this the new track
     // inherits the elapsed time of the previous one.
@@ -348,6 +356,11 @@ pub unsafe extern "C" fn tunefold_oboe_stop(engine: *mut AndroidEngine) {
     // masked, but both are audible: a burst of stale or silent PCM on every stop and
     // every track change.
     engine.ring.clear();
+    // Silence is not a waveform: a stopped engine must leave no measured shape
+    // behind for a reader to draw as if it were still playing.
+    if let Some(analysis) = engine.analysis.as_ref() {
+        analysis.begin_new_source();
+    }
     // Stopping is not finishing: clear any pending EOF so autoplay cannot fire
     // for a track the user deliberately ended. Cleared AFTER the join, because
     // the decoder being stopped may still publish its own final state.
@@ -935,6 +948,47 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_readPcm(
         )
         .min(jint::MAX as usize) as jint
     }
+}
+
+/// Copia la ÚLTIMA envolvente medida en `out` y devuelve su generación.
+///
+/// El lector (las barras de Now Playing) compara el número devuelto con el que
+/// ya tenía: si no ha cambiado, no hay audio nuevo y no hay nada que repintar.
+/// Así la superficie puede preguntar veinte veces por segundo y no hacer trabajo
+/// en las llamadas que no.audio.
+///
+/// `CopyBack` no es opcional: los buffers de Java son de sólo lectura desde el
+/// hilo de Rust, y con `NoCopyBack` las escrituras se quedan en la copia local
+/// y Java lee ceros.
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_readLiveWaveform(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    buffer: JFloatArray,
+    bars: jint,
+) -> jlong {
+    let bars = bars.max(0) as usize;
+    if handle == 0 || bars == 0 {
+        return 0;
+    }
+    let length = match env.get_array_length(&buffer) {
+        Ok(length) => length as usize,
+        Err(_) => return 0,
+    };
+    let mut values = vec![0.0f32; length];
+    let generation = match unsafe { &*(handle as *const AndroidEngine) }
+        .analysis
+        .as_ref()
+    {
+        Some(runtime) => runtime.read_live_waveform(&mut values, bars),
+        None => 0,
+    };
+    if length == 0 {
+        return generation as jlong;
+    }
+    let _ = env.set_float_array_region(&buffer, 0, &values);
+    generation as jlong
 }
 
 #[no_mangle]

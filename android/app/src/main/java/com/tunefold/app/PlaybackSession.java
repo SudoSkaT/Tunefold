@@ -363,6 +363,54 @@ final class PlaybackSession {
     /** Next, then Previous: the escape hatch offered next to a failed track. */
     void skipToNext() { next(); }
 
+    /**
+     * Seeks the active track to {@code positionMs}, when the pipeline can.
+     *
+     * <p>The request comes from the waveform, which is the one control that can
+     * express a position precisely. Two rules make it safe:
+     *
+     * <ul>
+     *   <li>it is refused, silently and without touching the position, unless the
+     *       engine reports that it can seek — a scrubber that moves and snaps back
+     *       is worse than a progress display;</li>
+     *   <li>the accepted path opens a new {@link PlaybackClock} generation, exactly
+     *       like a track change, so the old attempt's callbacks and its clock are
+     *       refused afterwards. A seek that did not do this would let the previous
+     *       decoder report the position of the new one.</li>
+     * </ul>
+     *
+     * @return {@code true} when a seek was attempted on a pipeline that can do it
+     */
+    boolean seekTo(long positionMs) {
+        MediaTrack track = queue.current();
+        if (track == null || positionMs < 0L) return false;
+        long duration = track.durationMs;
+        if (duration > 0L && positionMs >= duration) {
+            positionMs = Math.max(0L, duration - 1_000L);
+        }
+        // Asked BEFORE the generation opens: a new generation whose attempt never
+        // starts would freeze this track's position and refuse its end-of-track.
+        if (!controller.canSeek(positionMs)) {
+            PlaybackTrace.markCurrent(PlaybackTrace.SEEK_REFUSED, "ms=" + positionMs);
+            return false;
+        }
+        // The generation is what makes the old attempt's callbacks and its clock
+        // stale: after this line, nothing belonging to the previous decoder can be
+        // reported as the new one's position.
+        clock.beginTrack();
+        clock.detachEngine();
+        boolean started = controller.seekTo(positionMs);
+        if (started) {
+            PlaybackTrace.markCurrent(PlaybackTrace.SEEK_APPLIED, "ms=" + positionMs);
+            clock.expectEofFrom(controller.attempt());
+            notifyChanged();
+        }
+        return started;
+    }
+
+    /** Whether the waveform may be used as a scrubber at all. */
+    boolean supportsSeek() { return controller != null && controller.supportsSeek(); }
+
     // ----------------------------------------------------------------- like
 
     boolean toggleLike() {
@@ -428,6 +476,15 @@ final class PlaybackSession {
     int downloadsRevision() {
         return downloader == null ? 0 : downloader.registry().revision();
     }
+
+    /**
+     * How many times L1K3D has changed, for the same reason {@link #downloadsRevision()}
+     * exists: a screen that re-derives its libraries on every notification needs to
+     * know whether the answer would be different this time.
+     *
+     * <p>Read on every notification too, and it is a field load.
+     */
+    int libraryRevision() { return library == null ? 0 : library.revision(); }
 
     private String trackTitle(TrackKey key) {
         MediaTrack track = findKnown(key);

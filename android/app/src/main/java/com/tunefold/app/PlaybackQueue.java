@@ -44,6 +44,19 @@ final class PlaybackQueue {
 
     boolean isEmpty() { synchronized (mutex) { return items.isEmpty(); } }
 
+    /**
+     * The track at {@code index}, or {@code null} when there is none.
+     *
+     * <p>An accessor rather than {@link #snapshot()} because "what is coming next" is
+     * asked by Home on every render, and copying the queue to read its first few
+     * entries is the kind of allocation this class was changed to stop making.
+     */
+    MediaTrack at(int index) {
+        synchronized (mutex) {
+            return index < 0 || index >= items.size() ? null : items.get(index);
+        }
+    }
+
     int size() { synchronized (mutex) { return items.size(); } }
 
     int currentIndex() { synchronized (mutex) { return currentIndex; } }

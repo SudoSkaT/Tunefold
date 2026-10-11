@@ -20,10 +20,14 @@ final class PlaybackDebugPanel {
     /** Traces are capped so a long session cannot grow the panel without bound. */
     private static final int MAX_LINES = 80;
 
+    /** Panel refresh cadence, in ms. */
+    private static final long REFRESH_INTERVAL_MS = 1_000L;
+
     private final LinearLayout root;
     private final TextView body;
     private boolean visible;
     private CharSequence rendered = "";
+    private long lastRefreshMillis;
 
     PlaybackDebugPanel(Context context) {
         DesignTokens.init(context);
@@ -60,6 +64,8 @@ final class PlaybackDebugPanel {
     void toggle() {
         visible = !visible;
         root.setVisibility(visible ? View.VISIBLE : View.GONE);
+        // Shown at once, not on the next tick: the panel is opened to read a moment.
+        lastRefreshMillis = 0L;
     }
 
     /**
@@ -68,7 +74,19 @@ final class PlaybackDebugPanel {
      * <p>Written only when it changed: this is refreshed from the playback poll, and a
      * {@code setText} on a selectable TextView re-lays-out and resets the selection.
      */
+    /**
+     * At most once a second.
+     *
+     * <p>The panel's text includes live counters, so it changes on every render; at
+     * the session's own cadence that was a full re-measure and re-layout of a long
+     * monospace TextView twice a second — and it kept the window permanently
+     * non-idle, which is precisely when idle-based frame measurement wants to run.
+     * One refresh a second loses nothing a developer can use.
+     */
     void update(String diagnostics, PlaybackTrace trace) {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - lastRefreshMillis < REFRESH_INTERVAL_MS) return;
+        lastRefreshMillis = now;
         StringBuilder text = new StringBuilder(256);
         if (diagnostics != null && !diagnostics.isEmpty()) text.append(diagnostics);
         if (trace != null) {

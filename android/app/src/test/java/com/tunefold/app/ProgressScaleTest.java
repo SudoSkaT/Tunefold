@@ -1,91 +1,78 @@
 package com.tunefold.app;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
 /**
- * Guards the redraw gate on the position tick.
+ * The progress arithmetic of the waveform and its labels.
  *
- * <p>This is the arithmetic that decides whether a 500&nbsp;ms tick touches the view
- * hierarchy at all. If it regressed, playback would keep working and the screen would
- * quietly stop updating, so the monotonicity and clamping cases matter more than they
- * look.
+ * <p>The invariants that matter are that an unknown total is never rendered as
+ * progress, and that a position just past the end cannot draw outside the surface.
  */
 public class ProgressScaleTest {
 
-    @Test public void unknownDurationNeverFakesProgress() {
-        assertEquals(ProgressScale.NO_PROGRESS, ProgressScale.permille(10_000L, -1L));
-        assertEquals(ProgressScale.NO_PROGRESS, ProgressScale.permille(10_000L, 0L));
+    @Test public void fractionOfAKnownTrackIsBounded() {
+        assertEquals(0f, ProgressScale.fraction(0L, 200_000L), 0f);
+        assertEquals(0.5f, ProgressScale.fraction(100_000L, 200_000L), 1e-6f);
+        assertEquals(1f, ProgressScale.fraction(200_000L, 200_000L), 0f);
     }
 
-    @Test public void progressIsPermilleOfTheDuration() {
-        assertEquals(ProgressScale.AT_START, ProgressScale.permille(0L, 10_000L));
-        assertEquals(250, ProgressScale.permille(2_500L, 10_000L));
-        assertEquals(500, ProgressScale.permille(5_000L, 10_000L));
+    /**
+     * An unknown duration is not a position of zero.
+     *
+     * <p>Reporting zero would draw a playhead at the start of a track whose length
+     * nobody knows, which reads as "not started" rather than "unknown" (§7).
+     */
+    @Test public void anUnknownDurationIsNotTheStart() {
+        assertEquals(ProgressScale.UNKNOWN, ProgressScale.fraction(30_000L, 0L), 0f);
+        assertEquals(ProgressScale.UNKNOWN, ProgressScale.fraction(30_000L, -1L), 0f);
+        assertTrue(ProgressScale.fraction(30_000L, -1L) < 0f);
     }
 
-    @Test public void progressIsClampedToTheDuration() {
-        assertEquals(ProgressScale.AT_END, ProgressScale.permille(30_000L, 10_000L));
-        assertEquals(ProgressScale.AT_START, ProgressScale.permille(-5_000L, 10_000L));
+    /** The last frame before an end-of-track must stay inside the surface. */
+    @Test public void aPositionPastTheEndClampsToTheEnd() {
+        assertEquals(1f, ProgressScale.fraction(200_500L, 200_000L), 0f);
+        assertEquals(0f, ProgressScale.fraction(-50L, 200_000L), 0f);
     }
 
-    @Test public void progressNeverSitsOnEitherExtreme() {
-        assertTrue(ProgressScale.permille(0L, 10_000L) > ProgressScale.NO_PROGRESS);
-        assertTrue(ProgressScale.permille(10_000L, 10_000L) < ProgressScale.PERMILLE);
+    @Test public void aShortTrackStillDivides() {
+        // A one-second track is the case where an integer scale loses its only
+        // pixel: the fraction, not a permille, is what the playhead is drawn from.
+        assertEquals(0.25f, ProgressScale.fraction(250L, 1_000L), 1e-6f);
+        assertEquals(0.999f, ProgressScale.fraction(999L, 1_000L), 1e-6f);
     }
 
-    @Test public void progressIsMonotonic() {
-        int previous = -1;
-        for (long ms = 0L; ms <= 20_000L; ms += 37L) {
-            int value = ProgressScale.permille(ms, 20_000L);
-            assertTrue("progress went backwards at " + ms, value >= previous);
-            previous = value;
-        }
-    }
-
-    @Test public void pixelStepTracksTheDisplayedWidth() {
-        assertEquals(1, ProgressScale.pixelStep(ProgressScale.PERMILLE));
-        assertEquals(2, ProgressScale.pixelStep(500));
-        assertEquals(10, ProgressScale.pixelStep(100));
-        assertEquals(ProgressScale.PERMILLE, ProgressScale.pixelStep(0));
-    }
-
-    /** A zero step would redraw on every tick; an absent bar must not divide by zero. */
-    @Test public void pixelStepIsNeverZero() {
-        assertEquals(1, ProgressScale.pixelStep(10_000));
-        assertEquals(ProgressScale.PERMILLE, ProgressScale.pixelStep(0));
-        assertEquals(ProgressScale.PERMILLE, ProgressScale.pixelStep(-5));
-    }
-
-    /** An unchanged bar must not be re-set: that is the whole point of the gate. */
-    @Test public void unchangedBarIsNeverAdvanced() {
-        assertFalse(ProgressScale.shouldAdvanceBar(500, 500, 1));
-    }
-
-    @Test public void subPixelMovementIsSkipped() {
-        assertFalse(ProgressScale.shouldAdvanceBar(500, 501, 5));
-        assertTrue(ProgressScale.shouldAdvanceBar(500, 505, 5));
-    }
-
-    /** Reaching the end always paints, however fine the step. */
-    @Test public void reachingTheEndAlwaysAdvances() {
-        assertTrue(ProgressScale.shouldAdvanceBar(ProgressScale.AT_END - 1,
-                ProgressScale.AT_END, 1000));
-    }
-
-    @Test public void goingBackwardsAlwaysAdvances() {
-        assertTrue(ProgressScale.shouldAdvanceBar(600, 100, 5));
-    }
-
-    @Test public void displayedSecondOnlyMovesOncePerSecond() {
+    @Test public void displayedSecondChangesOncePerSecond() {
         assertEquals(0L, ProgressScale.displayedSecond(0L));
         assertEquals(0L, ProgressScale.displayedSecond(999L));
         assertEquals(1L, ProgressScale.displayedSecond(1_000L));
         assertEquals(1L, ProgressScale.displayedSecond(1_999L));
-        assertEquals(60L, ProgressScale.displayedSecond(60_000L));
-        assertEquals(0L, ProgressScale.displayedSecond(-500L));
+        assertEquals(2L, ProgressScale.displayedSecond(2_000L));
+    }
+
+    /**
+     * The gate the label relies on: two ticks in the same second are the same tick.
+     *
+     * <p>Four of every five ticks of a position refresh land inside one second, and
+     * each of them must cost a comparison instead of a layout.
+     */
+    @Test public void onlyOneTickPerSecondChangesTheLabel() {
+        int changes = 0;
+        int ticks = 0;
+        for (long ms = 0L; ms <= 6_000L; ms += DesignTokens.POSITION_INTERVAL_MS) {
+            ticks++;
+            long before = ms - DesignTokens.POSITION_INTERVAL_MS;
+            if (ProgressScale.displayedSecond(ms) != ProgressScale.displayedSecond(before)) {
+                changes++;
+            }
+        }
+        assertEquals("thirty-one ticks, six label changes", 6, changes);
+        assertTrue("the gate has to be worth having: " + ticks + " ticks", ticks > 24);
+    }
+
+    @Test public void negativePositionsReadAsZero() {
+        assertEquals(0L, ProgressScale.displayedSecond(-1_000L));
     }
 }

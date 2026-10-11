@@ -62,6 +62,10 @@ final class PlaybackTrace {
     /** The queue moved back to the previous item. */
     static final String QUEUE_PREVIOUS = "QUEUE_PREVIOUS";
     static final String STALE_EOF = "STALE_EOF";
+    /** A seek was requested and the pipeline carried it out. */
+    static final String SEEK_APPLIED = "SEEK_APPLIED";
+    /** A seek was requested on a pipeline that cannot seek; nothing was moved. */
+    static final String SEEK_REFUSED = "SEEK_REFUSED";
     /** A track finished and autoplay took over. */
     static final String AUTOPLAY_TRIGGER = "AUTOPLAY_TRIGGER";
 

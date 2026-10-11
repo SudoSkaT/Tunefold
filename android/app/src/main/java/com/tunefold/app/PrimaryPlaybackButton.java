@@ -26,7 +26,9 @@ import android.view.ViewOutlineProvider;
 final class PrimaryPlaybackButton extends IconButton {
 
     private final Paint disc = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint working = new Paint(Paint.ANTI_ALIAS_FLAG);
     private boolean pressed;
+    private boolean busy;
 
     PrimaryPlaybackButton(Context context) {
         super(context, DesignTokens.CONTROL_TARGET_PRIMARY, DesignTokens.ICON_SIZE_LARGE);
@@ -40,6 +42,27 @@ final class PrimaryPlaybackButton extends IconButton {
             }
         });
         setClipToOutline(true);
+        // El aro de trabajo se dibuja por fuera del disco, con el trazo fino: dice
+        // "este control está ocupado" sin tapar el glifo ni parecer otro control.
+        working.setStyle(Paint.Style.STROKE);
+        working.setStrokeCap(Paint.Cap.ROUND);
+        working.setStrokeWidth(DesignTokens.dp(DesignTokens.PROGRESS_LINE_THICKNESS) * 2f);
+        working.setColor(DesignTokens.scaleAlpha(ArtworkTheme.onAccent(),
+                DesignTokens.ALPHA_MUTED_SHAPE));
+    }
+
+    /**
+     * Whether this control is waiting on something instead of being ready.
+     *
+     * <p>Un aro, sin giro: el estado se dibuja al ritmo del tick que ya existe, y
+     * un spinner con su propio bucle sería trabajo de fondo para decir algo que el
+     * estado ya dice con palabras. El aro es la misma forma que usa el punto de
+     * estado, así que las dos señales se leen como una sola.
+     */
+    void setBusy(boolean value) {
+        if (busy == value) return;
+        busy = value;
+        invalidate();
     }
 
     @Override public void setPressed(boolean value) {
@@ -60,13 +83,19 @@ final class PrimaryPlaybackButton extends IconButton {
 
     @Override public void onAccentChanged(int accent) {
         if (!pressed) disc.setColor(accent);
+        working.setColor(DesignTokens.scaleAlpha(DesignTokens.Palette.ON_ACCENT,
+                DesignTokens.ALPHA_MUTED_SHAPE));
         super.onAccentChanged(accent);
     }
 
     @Override protected void onDraw(Canvas canvas) {
+        float radius = Math.min(getWidth(), getHeight()) / 2f;
         if (isEnabled()) {
+            canvas.drawCircle(getWidth() / 2f, getHeight() / 2f, radius, disc);
+        }
+        if (busy && isEnabled()) {
             canvas.drawCircle(getWidth() / 2f, getHeight() / 2f,
-                    Math.min(getWidth(), getHeight()) / 2f, disc);
+                    radius - working.getStrokeWidth() / 2f, working);
         }
         super.onDraw(canvas);
     }

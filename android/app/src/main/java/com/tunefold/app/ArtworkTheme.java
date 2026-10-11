@@ -3,77 +3,115 @@ package com.tunefold.app;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
- * The accent colour, and who has to repaint when it changes.
+ * El color que viene de la portada, y quién tiene que repintarse cuando cambia.
  *
- * <p>Exists so the accent is a <i>value</i> rather than a constant baked into every
- * control. Today it is the fixed brand mint from {@link DesignTokens.Palette#ACCENT};
- * the intent of the identity (ARTWORK &rarr; COLOUR &rarr; WAVEFORM &rarr; PLAYBACK) is
- * that it will instead be derived from the current cover, so this class is the one
- * place that has to learn how to do that. Nothing else in the UI hard-codes an
- * accent, so a derived colour lands everywhere at once and cannot miss a control.
+ * <p>Existe para que el acento sea un <i>valor</i> y no una constante grabada en
+ * cada control. La identidad del producto es ARTWORK → COLOUR → WAVEFORM →
+ * PLAYBACK, y este es el punto donde el color deja de decidirlo la marca y lo
+ * decide la portada. Nada en la UI fija un acento, así que un color derivado llega
+ * a todos los sitios a la vez y no puede dejarse ninguno atrás.
  *
- * <h3>Cost model</h3>
- * Registration happens once, at control construction. Repaints are explicit and
- * targeted: a listener is told the new accent and invalidates itself, which is a
- * handful of views once per track change, not a rebind of the whole tree. The
- * listener list is copy-on-write because the interesting thread (artwork decoding)
- * is not the thread that registers.
+ * <p>Son dos colores porque la visualización es estéreo: el canal izquierdo y el
+ * derecho llevan tonos distintos de la misma portada, y un control lleva el tono
+ * principal elevado para que el contenido oscuro se lea encima. Los dos vienen de
+ * la misma extracción ({@link ArtworkPalette}).
+ *
+ * <h3>Modelo de coste</h3>
+ * El registro ocurre una vez, al construir cada control. Los repintados son
+ * explícitos y dirigidos: un oyente recibe el color nuevo y se invalida, que son
+ * unas cuantas vistas por cambio de pista, no un rebind del árbol entero. La
+ * lista es copy-on-write porque el hilo interesante (el que decodifica la
+ * portada) no es el que registra.
  */
 final class ArtworkTheme {
 
-    /** A view that paints with the accent and must repaint when it moves. */
+    /** Una vista que se pinta con el acento y debe repintarse cuando se mueve. */
     interface AccentListener {
-        /** The accent changed to {@code accent}; repaint now, do not rebuild. */
+        /** El acento cambió a {@code accent}; repintar ahora, no reconstruir. */
         void onAccentChanged(int accent);
+
+        /**
+         * Los dos tonos de la portada han cambiado.
+         *
+         * <p>Por defecto no hace nada: a un botón de 48&nbsp;dp sólo le importa
+         * el acento, y obligar a todos los controles a conocer la paleta de las
+         * barras sería repartir un detalle de la visualización por toda la app.
+         */
+        default void onPaletteChanged(int barsPrimary, int barsSecondary) { }
     }
 
-    private static final CopyOnWriteArrayList<AccentListener> LISTENERS = new CopyOnWriteArrayList<>();
+    private static final CopyOnWriteArrayList<AccentListener> LISTENERS =
+            new CopyOnWriteArrayList<>();
     private static volatile int accent = DesignTokens.Palette.ACCENT;
+    private static volatile int barsPrimary = DesignTokens.Palette.ACCENT;
+    private static volatile int barsSecondary = DesignTokens.Palette.ACCENT;
 
     private ArtworkTheme() { }
 
-    /** The accent every accent-aware control paints with. */
+    /** El acento con el que se pintan los controles. */
     static int accent() { return accent; }
 
-    /** The colour content drawn on top of {@link #accent()}. */
+    /** El contenido que se dibuja sobre {@link #accent()}. */
     static int onAccent() { return DesignTokens.Palette.ON_ACCENT; }
 
+    /** Tono del canal izquierdo de las barras, derivado de la portada. */
+    static int barsPrimary() { return barsPrimary; }
+
+    /** Tono del canal derecho de las barras, derivado de la portada. */
+    static int barsSecondary() { return barsSecondary; }
+
     /**
-     * Registers {@code listener} and immediately syncs it to the current accent.
+     * Registra {@code listener} y lo pone al día con el color actual.
      *
-     * <p>Called from control constructors, so a control can never start out tinted
-     * from a different accent than the rest of the screen.
+     * <p>Se llama desde los constructores, así que un control no puede empezar
+     * teñido con un color distinto del resto de la pantalla.
      */
     static void register(AccentListener listener) {
         if (listener == null) return;
         LISTENERS.addIfAbsent(listener);
         listener.onAccentChanged(accent);
+        listener.onPaletteChanged(barsPrimary, barsSecondary);
     }
 
-    /** Unregisters {@code listener}; always paired with {@link #register}. */
+    /** Da de baja {@code listener}; siempre emparejado con {@link #register}. */
     static void unregister(AccentListener listener) {
         if (listener == null) return;
         LISTENERS.remove(listener);
     }
 
-    /** How many listeners are attached; for the leak guard in the component tests. */
+    /** Cuántos oyentes hay; para la guarda de fugas de las pruebas de componente. */
     static int listenerCount() { return LISTENERS.size(); }
 
     /**
-     * Moves the accent and notifies every listener.
+     * Publica una paleta derivada de la portada y avisa a todos.
      *
-     * <p>A no-op when the accent is unchanged, so a derived colour that happens to
-     * match the default costs nothing.
+     * <p>El acento de los controles es el tono principal <em>elevado</em>: el disco
+     * del botón lleva contenido casi negro encima y ese contenido tiene que leerse
+     * con cualquier portada. Las barras usan los tonos sin tocar, porque sólo
+     * muestran datos sobre una tarjeta oscura.
+     *
+     * <p>Sin cambios no hay coste: una portada monocroma o muy apagada devuelve la
+     * marca y no se repinta nada.
      */
-    static void setAccent(int value) {
-        int previous = accent;
-        if (previous == value) return;
-        accent = value;
+    static void setPalette(ArtworkPalette.Palette palette) {
+        if (palette == null) return;
+        int control = palette.derived
+                ? ArtworkPalette.lift(palette.primary) : DesignTokens.Palette.ACCENT;
+        int primary = palette.derived ? palette.primary : DesignTokens.Palette.ACCENT;
+        int secondary = palette.derived ? palette.secondary : DesignTokens.Palette.ACCENT;
+        if (control == accent && primary == barsPrimary && secondary == barsSecondary) return;
+        boolean accentMoved = control != accent;
+        accent = control;
+        barsPrimary = primary;
+        barsSecondary = secondary;
         for (AccentListener listener : LISTENERS) {
-            listener.onAccentChanged(value);
+            if (accentMoved) listener.onAccentChanged(control);
+            listener.onPaletteChanged(primary, secondary);
         }
     }
 
-    /** Restores the brand accent; the seam's reset used by recreation and tests. */
-    static void reset() { setAccent(DesignTokens.Palette.ACCENT); }
+    /** Vuelve al color de marca; lo usa el recreo de la actividad y las pruebas. */
+    static void reset() {
+        setPalette(ArtworkPalette.Palette.brand(DesignTokens.Palette.ACCENT));
+    }
 }

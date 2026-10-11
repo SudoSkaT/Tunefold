@@ -41,4 +41,7 @@ pub use ring::SpScRing;
 pub use smoother::FeatureSmoother;
 #[cfg(feature = "rodio")]
 pub use tap::TapSource;
-pub use waveform::{StereoWaveform, WaveformBus, WaveformEnvelope, WAVEFORM_BUCKETS};
+pub use waveform::{
+    read_live_envelope, StereoWaveform, WaveformBus, WaveformEnvelope, LIVE_BAR_VALUES,
+    WAVEFORM_BUCKETS,
+};

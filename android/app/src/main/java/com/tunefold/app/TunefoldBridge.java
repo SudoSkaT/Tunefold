@@ -30,6 +30,16 @@ final class TunefoldBridge {
     static native String getLastError(long handle);
     static native void reportAudioError(long handle, String error);
     static native void getVisualState(long handle, float[] features, float[] bars);
+    /**
+     * Copies {@code columns} columns of the stereo track envelope into {@code out}.
+     *
+     * <p>Fills {@code out} with 4 floats per bar (left min/max, right min/max) of
+     * the last measured window and returns the bus generation. The caller
+     * compares the number against the one it already had: unchanged means no new
+     * audio and nothing to repaint, which is what lets the surface keep
+     * answering at 20 Hz while genuinely resting.
+     */
+    static native long readLiveWaveform(long handle, float[] out, int bars);
     static native String getRuntimeDiagnostics(long handle);
     static native String drainPlaybackTrace(long handle);
 

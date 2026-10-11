@@ -49,6 +49,8 @@ final class Library {
     private final LinkedHashSet<TrackKey> recent = new LinkedHashSet<>();
     private volatile Observer observer;
     private volatile boolean loaded;
+    /** Bumped by every change to membership or labels; see {@link #revision()}. */
+    private volatile int revision;
 
     Library(File directory) {
         this.file = new File(directory, FILE_NAME);
@@ -133,6 +135,17 @@ final class Library {
         synchronized (lock) { return new ArrayList<>(liked); }
     }
 
+    /**
+     * How many times L1K3D has changed.
+     *
+     * <p>A number, not an event, because the question a screen asks is "is what I am
+     * showing still true?" and not "did something happen?": a revision lets a screen
+     * that re-renders on a timer skip the work that would rebuild the same list twice
+     * a second. It is the same trick {@link PlaybackSession#downloadsRevision()} plays
+     * for downloads.
+     */
+    int revision() { return revision; }
+
     // -------------------------------------------------------------- recents
 
     /** Records that a track was played, most recent first. */
@@ -187,6 +200,7 @@ final class Library {
 
     /** Reads the library from disk. Safe to call more than once. */
     void load() {
+        boolean changed = false;
         synchronized (lock) {
             if (loaded) return;
             loaded = true;
@@ -197,7 +211,12 @@ final class Library {
                 // than crash. The next write repairs the file.
                 android.util.Log.w("Tunefold", "library unreadable: " + unreadable);
             }
+            changed = !liked.isEmpty() || !labels.isEmpty();
         }
+        // Membership arrived from disk after the screen had already drawn an empty
+        // L1K3D; without this the revision would still read "never changed" and the
+        // first render of the real library would be skipped.
+        if (changed) revision++;
     }
 
     /**
@@ -325,6 +344,7 @@ final class Library {
     }
 
     private void notifyChanged() {
+        revision++;
         Observer current = observer;
         if (current == null) return;
         MAIN.post(current::onLibraryChanged);
@@ -342,6 +362,7 @@ final class Library {
             recent.addAll(recentKeys);
             loaded = true;
         }
+        revision++;
     }
 
     /** The persisted representation; the single writer and parser agree on it. */

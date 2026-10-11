@@ -212,6 +212,107 @@ public class DesignTokensTest {
 
     // ------------------------------------------------------------- colour math
 
+    /**
+     * The cover is the loudest thing on the surface, so its share of the width is
+     * a range, not a value: too small and Now Playing reads as a list row with a
+     * picture, too large and the controls it exists to serve leave the window.
+     */
+    @Test public void theCoverTakesTheDominantShareOfTheWidth() {
+        float ratio = DesignTokens.ARTWORK_PORTRAIT_WIDTH_RATIO;
+        assertTrue("portrait cover ratio " + ratio + " is under the 78% floor", ratio >= 0.78f);
+        assertTrue("portrait cover ratio " + ratio + " is over the 88% ceiling",
+                ratio <= 0.88f);
+    }
+
+    /** The height guard that keeps the controls reachable on a very tall phone. */
+    @Test public void thePortraitHeightGuardLeavesRoomBelowTheCover() {
+        assertTrue(DesignTokens.ARTWORK_PORTRAIT_HEIGHT_RATIO > 0.30f);
+        assertTrue(DesignTokens.ARTWORK_PORTRAIT_HEIGHT_RATIO < 0.55f);
+        assertTrue("landscape must yield more width than portrait",
+                DesignTokens.ARTWORK_LANDSCAPE_WIDTH_RATIO
+                        < DesignTokens.ARTWORK_PORTRAIT_WIDTH_RATIO);
+        assertTrue(DesignTokens.ARTWORK_LANDSCAPE_HEIGHT_RATIO < 1f);
+    }
+
+    /**
+     * A bar field too short cannot show bars, and one too tall pushes the
+     * transport off a short window.
+     */
+    @Test public void theSoundBarsAreAUsableBand() {
+        assertTrue("the lanes need room", DesignTokens.SOUNDBARS_HEIGHT >= 40f);
+        assertTrue("and not the whole card", DesignTokens.SOUNDBARS_HEIGHT <= 96f);
+        assertTrue("the gap must leave both lanes visible",
+                DesignTokens.SOUNDBARS_LANE_GAP > 0f);
+        assertTrue("a bar thinner than its gap is a line",
+                DesignTokens.SOUNDBARS_BAR_GAP > 0f);
+        assertTrue("bars must be drawn, not hinted",
+                DesignTokens.SOUNDBARS_BAR_PITCH > DesignTokens.SOUNDBARS_BAR_GAP);
+    }
+
+    /**
+     * The progress line sits under the bars, so it has to stay a line.
+     *
+     * <p>A thick one competes with the bars for attention; a hairline that the
+     * same alpha washes out makes the position unreadable on a bright cover.
+     */
+    @Test public void theProgressLineStaysALine() {
+        assertTrue("below a hairline the position disappears",
+                DesignTokens.PROGRESS_LINE_THICKNESS > 0f);
+        assertTrue("a bar thick progress line is a second bar field",
+                DesignTokens.PROGRESS_LINE_THICKNESS < DesignTokens.SOUNDBARS_BAR_PITCH);
+        assertTrue("the head has to be visible at line thickness",
+                DesignTokens.SOUNDBARS_HEAD_SIZE >= DesignTokens.PROGRESS_LINE_THICKNESS);
+    }
+
+    /**
+     * The still part of a shape is context, not content.
+     *
+     * <p>Quieter than this and the unplayed line stops being part of the
+     * composition; louder than this and it reads as a value the user should read.
+     */
+    @Test public void theMutedShapeIsNeitherAbsentNorLoud() {
+        float muted = DesignTokens.ALPHA_MUTED_SHAPE;
+        assertTrue("the still shape must stay visible", muted >= 0.30f);
+        assertTrue("and must not compete with what is playing", muted <= 0.60f);
+    }
+
+    /**
+     * The UI tick is a budget, not a preference.
+     *
+     * <p>Faster than this and the labels and the state indicator all repaint
+     * several times a second for changes nobody can see; slower and the playhead
+     * stutters. The visual tick is a separate budget: the bars have to answer to
+     * the sound, but only the bars pay for it.
+     */
+    @Test public void theTicksAreInsideTheUsableBand() {
+        assertTrue("a 60 Hz tick is a frame callback in disguise",
+                DesignTokens.POSITION_INTERVAL_MS >= 150L);
+        assertTrue("a tick slower than a third of a second cannot animate",
+                DesignTokens.POSITION_INTERVAL_MS <= 333L);
+        assertTrue("the visual tick must be able to keep up with the sound",
+                DesignTokens.VISUAL_INTERVAL_MS <= DesignTokens.POSITION_INTERVAL_MS);
+        assertTrue("but not be a frame callback in disguise",
+                DesignTokens.VISUAL_INTERVAL_MS >= 16L);
+        assertTrue(DesignTokens.STATE_SEGMENT_INTERVAL_MS >= 300L);
+    }
+
+    /** A cover decoded above this wastes the largest bitmap in the app. */
+    @Test public void theArtworkDecodeCapIsAMemoryDecision() {
+        assertTrue(DesignTokens.ARTWORK_DECODE_MAX_PX >= 256);
+        assertTrue("a 1024 px cover would be a 4 MB bitmap for one picture",
+                DesignTokens.ARTWORK_DECODE_MAX_PX <= 768);
+        assertTrue("the palette sample must be small enough to be free",
+                DesignTokens.ARTWORK_PALETTE_SAMPLE_PX <= 64);
+        assertTrue(DesignTokens.ARTWORK_PALETTE_SAMPLE_PX >= 8);
+    }
+
+    /** The state indicator has to be visible without becoming an icon. */
+    @Test public void theStateDotIsVisibleButNotLoud() {
+        assertTrue(DesignTokens.STATE_DOT_SIZE >= DesignTokens.SPACE_5);
+        assertTrue("below the body size it reads as a smudge",
+                DesignTokens.STATE_DOT_SIZE <= DesignTokens.TYPE_DISPLAY_SIZE);
+    }
+
     private static double luminance(int color) {
         double r = channel((color >> 16) & 0xFF);
         double g = channel((color >> 8) & 0xFF);

@@ -17,9 +17,10 @@ use tunefold::analysis::{
     features::AudioFeatures,
     fft::SpectrumAnalyzer,
     onset::{FluxAnalyzer, OnsetDetector},
+    read_live_envelope,
     ring::SpScRing,
     smoother::FeatureSmoother,
-    AnalysisConfig, AnalysisRuntime, StereoWaveform, StreamMeta,
+    AnalysisConfig, AnalysisRuntime, StereoWaveform, StreamMeta, LIVE_BAR_VALUES,
 };
 use tunefold::domain::source::Source;
 use tunefold::domain::track::Track;
@@ -167,6 +168,9 @@ fn main() {
         .unwrap();
     });
 
+    println!("\n== Barras reactivas (Android Now Playing) ==");
+    measure_live_bars();
+
     println!("\n== Ring SPSC (throughput) ==");
     let ring = SpScRing::new(1 << 17);
     let chunk = vec![0.5f32; 1024];
@@ -192,6 +196,35 @@ fn main() {
 
     println!("\n== Hilo de análisis end-to-end (features/s sostenidas) ==");
     measure_engine_thread();
+}
+
+/// El coste de la lectura en vivo que alimenta las barras de Now Playing.
+///
+/// El presupuesto es el tick visual (20 Hz ⇒ 50 ms) y lo que importa no es sólo
+/// el coste: es que la lectura devuelva la generación, de modo que una superficie
+/// en reposo no repinte nada aunque se llame a esta función veinte veces por
+/// segundo.
+fn measure_live_bars() {
+    let budget = Duration::from_millis(50);
+    let stereo = Arc::new(StereoWaveform::from_windows(&[0.5; 2048], &[0.4; 2048]));
+    let mut generation = 0u64;
+    for bars in [32usize, 64, 96] {
+        let mut out = vec![0.0f32; LIVE_BAR_VALUES * bars];
+        bench(&format!("leer {bars} barras en vivo"), budget, || {
+            generation += 1;
+            black_box(read_live_envelope(
+                black_box(Some(Arc::clone(&stereo))),
+                black_box(generation),
+                black_box(&mut out),
+                bars,
+            ));
+        });
+    }
+    println!(
+        "barras por lectura: {} floats ({} barras x 4), tamaño fijo del búfer",
+        LIVE_BAR_VALUES * 96,
+        96
+    );
 }
 
 fn measure_engine_thread() {

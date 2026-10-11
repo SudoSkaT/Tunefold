@@ -12,7 +12,7 @@
 //! - timestamps = tiempo de STREAM analizado (`hops × hop_time`).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ use super::fft::SpectrumAnalyzer;
 use super::onset::{FluxAnalyzer, OnsetDetector};
 use super::ring::SpScRing;
 use super::smoother::{FeatureSmoother, SMOOTHED_CHANNELS};
-use super::waveform::{StereoWaveform, WaveformBus};
+use super::waveform::{read_live_envelope, StereoWaveform, WaveformBus};
 
 /// Configuración del pipeline DSP.
 #[derive(Debug, Clone, Copy)]
@@ -61,6 +61,8 @@ pub struct StreamMeta {
 pub struct PcmTap {
     ring: Arc<SpScRing>,
     meta: Arc<Mutex<Option<StreamMeta>>>,
+    /// Fuente actual. Lo incrementa quien arranca una fuente nueva.
+    epoch: Arc<AtomicU64>,
 }
 
 impl PcmTap {
@@ -68,6 +70,19 @@ impl PcmTap {
     /// empezar a alimentar; el motor resetea su estado si el formato cambia).
     pub fn announce(&self, meta: StreamMeta) {
         *self.meta.lock().unwrap() = Some(meta);
+    }
+
+    /// Declara que empieza OTRA fuente, aunque el formato sea idéntico.
+    ///
+    /// El reloj del análisis (`hops × hop`) solo se reinicia por un hueco o por un
+    /// cambio de formato. Dos pistas consecutivas del mismo proveedor llegan con el
+    /// mismo `StreamMeta`, así que ninguna de las dos cosas ocurre y el tiempo de
+    /// stream sigue sumando desde el final de la pista anterior: la forma de onda de
+    /// la pista nueva se escribe a partir del segundo 200 en vez del 0, y en pantalla
+    /// la pista aparece sin forma y congelada. Este discriminador es lo que hace que
+    /// «empieza una fuente» sea una señal de primera clase y no una inferencia.
+    pub fn begin_source(&self) {
+        self.epoch.fetch_add(1, Ordering::Release);
     }
 
     /// Empuja muestras interleaveadas (nunca bloquea).
@@ -109,11 +124,16 @@ impl AnalysisRuntime {
         let self_bus = FeatureBus::new();
         let self_waveform = WaveformBus::new();
         let meta: Arc<Mutex<Option<StreamMeta>>> = Arc::new(Mutex::new(None));
+        let epoch: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
 
+        let tap = PcmTap {
+            ring: Arc::clone(&ring),
+            meta: Arc::clone(&meta),
+            epoch: Arc::clone(&epoch),
+        };
         let join = {
-            let ring = Arc::clone(&ring);
-            let meta = Arc::clone(&meta);
+            let tap_for_thread = tap.clone();
             let stop = Arc::clone(&stop);
             let bus_for_thread = self_bus.clone();
             let waveform_for_thread = self_waveform.clone();
@@ -122,8 +142,7 @@ impl AnalysisRuntime {
                 .spawn(move || {
                     run(
                         config,
-                        ring,
-                        meta,
+                        tap_for_thread,
                         stop,
                         bus_for_thread,
                         waveform_for_thread,
@@ -133,7 +152,7 @@ impl AnalysisRuntime {
         };
 
         Self {
-            tap: PcmTap { ring, meta },
+            tap,
             bus: self_bus,
             waveform: self_waveform,
             stop,
@@ -155,6 +174,30 @@ impl AnalysisRuntime {
     pub fn waveform_bus(&self) -> WaveformBus {
         self.waveform.clone()
     }
+
+    /// Copia la envolvente EN VIVO (la última ventana medida) en `out`.
+    ///
+    /// `out` recibe `[lmin, lmax, rmin, rmax]` por barra, para que la barra muestre
+    /// a la vez lo más alto y lo más bajo del tramo. Devuelve la generación del bus:
+    /// si no ha cambiado, no hay audio nuevo y el consumidor no tiene nada que
+    /// repintar. Es lo que permite que la superficie reaccione al sonido sin
+    /// repintarse cuando la pista está quieta.
+    pub fn read_live_waveform(&self, out: &mut [f32], bars: usize) -> u64 {
+        let waveform = self.waveform.clone();
+        read_live_envelope(waveform.latest(), waveform.generation(), out, bars)
+    }
+
+    /// Empieza otra fuente y reinicia el reloj del análisis.
+    ///
+    /// <p>El reloj del análisis (`hops × hop`) es tiempo de stream: sólo se
+    /// reinicia por un hueco o por un cambio de formato, y dos pistas consecutivas
+    /// del mismo proveedor llegan con el mismo formato. Sin esta señal, la segunda
+    /// pista se mide desde el final de la primera: las features marcan un tiempo
+    /// equivocado y cualquier consumidor que Dibuje contra ese eje se queda
+    /// congelado.
+    pub fn begin_new_source(&self) {
+        self.tap.begin_source();
+    }
 }
 
 impl Drop for AnalysisRuntime {
@@ -169,12 +212,16 @@ impl Drop for AnalysisRuntime {
 
 fn run(
     config: AnalysisConfig,
-    ring: Arc<SpScRing>,
-    meta_cell: Arc<Mutex<Option<StreamMeta>>>,
+    tap: PcmTap,
     stop: Arc<AtomicBool>,
     bus: FeatureBus,
     waveform: WaveformBus,
 ) {
+    let PcmTap {
+        ring,
+        meta: meta_cell,
+        epoch: epoch_cell,
+    } = tap;
     let mut analyzer = SpectrumAnalyzer::new(config.fft_size);
     let mut flux = FluxAnalyzer::new();
     let mut onset = OnsetDetector::new(43, 0.005);
@@ -194,6 +241,7 @@ fn run(
     let mut since_hop = 0usize;
     let mut hops_analyzed = 0u64;
     let mut current_meta: Option<StreamMeta> = None;
+    let mut seen_epoch = 0u64;
     let mut last_data = Instant::now();
     let mut flushed_on_gap = true;
     let mut bpm_hold = 0.0f32;
@@ -206,7 +254,26 @@ fn run(
         }
         let n = ring.pop(&mut buf);
 
-        // GAP: sin datos un rato ⇒ nueva canción/fin de stream. Reset total
+        // NUEVA FUENTE: el dueño de la reproducción lo declara aunque el formato
+        // sea idéntico. Sin esto, el reloj del análisis (y con él el eje de la
+        // forma de onda) continúa donde terminó la pista anterior.
+        let epoch = epoch_cell.load(Ordering::Acquire);
+        if epoch != seen_epoch {
+            seen_epoch = epoch;
+            left_window.clear();
+            right_window.clear();
+            since_hop = 0;
+            hops_analyzed = 0;
+            flux = FluxAnalyzer::new();
+            onset = OnsetDetector::new(43, 0.005);
+            bpm = BpmEstimator::new(hop_rate_of(current_meta, &config));
+            smoother.reset();
+            bpm_hold = 0.0;
+            current_meta = None;
+            flushed_on_gap = true;
+        }
+
+        // GAP: sin datos un rato ⇒ el stream se cortó. Reset total
         // para que la pista siguiente arranque limpia (sin cola de la vieja).
         if n == 0 {
             if !flushed_on_gap && last_data.elapsed() > Duration::from_millis(300) {
@@ -330,6 +397,8 @@ fn run(
             // consumidor visual la decima al ancho del terminal y la pinta por
             // puntos, conservando pico Y valle de cada canal. Un Arc por frame
             // ≈ 1 alloc extra por hop (documentada; la ruta del audio no la ve).
+            // Una alloc por hop (documentada): la instantánea que leen el
+            // visualizador del terminal y las barras de Android.
             waveform.publish(StereoWaveform::from_windows(&left_buf, &right_buf));
         }
     }
@@ -524,6 +593,126 @@ mod tests {
         );
         // Misma señal en L y R ⇒ curvas idénticas en cada bucket.
         assert_eq!(st.left, st.right, "el seno compartido clona ambas curvas");
+    }
+
+    #[test]
+    fn a_new_source_restarts_the_clock_even_with_the_same_format() {
+        const SR: u32 = 44_100;
+        let runtime = AnalysisRuntime::spawn(AnalysisConfig::default());
+        let tap = runtime.tap();
+        let features = runtime.bus();
+        tap.announce(StreamMeta {
+            sample_rate: SR,
+            channels: 2,
+        });
+
+        // Control de flujo: se alimenta un trozo y se ESPERA a que el hilo lo
+        // consuma. El anillo SPSC descarta lo que no cabe, así que alimentar a
+        // ciegas perdería audio justo en un test que existe para medir el reloj;
+        // y dormir de reloj en vez de esperar al consumo lo haría depender de la
+        // carga de la máquina.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let feed_until = |features: &FeatureBus, seconds: f64| -> f64 {
+            let chunk_seconds = 0.25f64;
+            let frames = (SR as f64 * chunk_seconds) as usize;
+            let mut fed = 0.0f64;
+            while fed < seconds {
+                if Instant::now() > deadline {
+                    break;
+                }
+                let mut batch = vec![0.0f32; frames * 2];
+                for (index, sample) in batch.iter_mut().enumerate() {
+                    let t = (index / 2) as f32 / SR as f32;
+                    *sample = sine_wave(120.0, SR as f32, t, 0.5);
+                }
+                tap.feed(&batch);
+                fed += chunk_seconds;
+                // Tolerancia de un hop: el reloj sólo avanza en fronteras de
+                // ventana, así que el último hop del trozo sigue en el buffer.
+                while Instant::now() < deadline {
+                    let stamp = features
+                        .latest()
+                        .map(|f| f.timestamp.as_secs_f64())
+                        .unwrap_or(0.0);
+                    if stamp + 0.05 >= fed {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            features
+                .latest()
+                .map(|f| f.timestamp.as_secs_f64())
+                .unwrap_or(0.0)
+        };
+
+        // Primera pista: seis segundos, el reloj llega a ~6 s.
+        let first_pass = feed_until(&features, 6.0);
+        assert!(first_pass >= 5.5, "primera pista medida: {first_pass}s");
+
+        // Segunda pista: MISMO formato, pero fuente nueva declarada.
+        runtime.begin_new_source();
+        let second_pass = feed_until(&features, 1.0);
+        assert!(
+            second_pass < 3.0,
+            "el reloj vuelve a cero y no continúa desde la pista anterior: {second_pass}s"
+        );
+    }
+
+    /// LA AMPLITUD DE LAS BARRAS TIENE QUE SER LA AMPLITUD DEL SONIDO.
+    ///
+    /// Una barra es una afirmación sobre lo que se está oyendo, así que un tono a
+    /// plena escala tiene que llenar el carril y uno a la mitad, la mitad. Si esta
+    /// medida se normaliza por el camino (por un RMS, por un ganho, por dividing por
+    /// el número de muestras) la pantalla sigue moviéndose y miente.
+    #[test]
+    fn a_full_scale_tone_fills_a_bar_and_a_quiet_one_does_not() {
+        const SR: u32 = 44_100;
+        let measure = |amplitude: f32| -> f32 {
+            let runtime = AnalysisRuntime::spawn(AnalysisConfig::default());
+            let tap = runtime.tap();
+            tap.announce(StreamMeta {
+                sample_rate: SR,
+                channels: 2,
+            });
+            let frames = SR as usize;
+            let mut batch = vec![0.0f32; frames * 2];
+            for frame in 0..frames {
+                let t = frame as f32 / SR as f32;
+                let value = sine_wave(440.0, SR as f32, t, amplitude);
+                batch[frame * 2] = value;
+                batch[frame * 2 + 1] = value;
+            }
+            tap.feed(&batch);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut peak = 0.0f32;
+            while Instant::now() < deadline {
+                let mut values = vec![0.0f32; 4 * 32];
+                runtime.read_live_waveform(&mut values, 32);
+                let highest = values
+                    .iter()
+                    .fold(0.0f32, |acc, value| acc.max(value.abs()));
+                if highest > peak {
+                    peak = highest;
+                }
+                if peak >= amplitude * 0.95 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            peak
+        };
+
+        let loud = measure(0.9f32);
+        let quiet = measure(0.1f32);
+        assert!(
+            loud >= 0.85,
+            "un tono a 0.9 tiene que medirse casi entero, se midió {loud}"
+        );
+        assert!(
+            quiet <= 0.2,
+            "un tono a 0.1 no puede llenar el carril, se midió {quiet}"
+        );
     }
 
     #[test]

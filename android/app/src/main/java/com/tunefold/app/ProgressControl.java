@@ -4,72 +4,75 @@ import android.content.Context;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.widget.LinearLayout;
-import android.widget.ProgressBar;
 import android.widget.TextView;
 
 /**
- * Elapsed time, the scrubber-looking bar, and the total.
+ * La superficie de progreso: barras reactivas, línea de posición y los dos tiempos.
  *
- * <p>Built around the position tick, which arrives twice a second for as long as
- * audio plays. That makes this the hottest surface in the app by a wide margin, and
- * the reason {@link #setPosition} is careful:
+ * <p>Son tres Cosas y una sola idea —dónde estamos y qué suena ahí—, por eso
+ * viven juntas. Antes esta clase tenía una barra de progreso y ahora tiene las
+ * barras del sonido: meter las dos cosas que significan «posición» en el mismo
+ * sitio era tener dos verdades sobre el mismo dato, y discrepaban un fotograma
+ * cada vez.
  *
- * <ul>
- *   <li>the two labels are only re-set when the <em>second</em> they display
- *       changes, so a 500&nbsp;ms tick allocates nothing at all and calls
- *       {@code setText} half as often;</li>
- *   <li>the bar is only re-set once its value has moved by at least one pixel
- *       ({@link ProgressScale#pixelStep}), because a permille step smaller than a
- *       pixel cannot be seen and setting it would schedule a redraw for nothing;</li>
- *   <li>both caches are invalidated by identity, so a track change can never leave a
- *       previous song's time over the new one.</li>
- * </ul>
- *
- * <p>Every one of those is a guard that turns a redundant {@code setText} /
- * {@code setProgress} — each of which requests layout and then draw — into a couple of
- * integer comparisons.
+ * <h3>El tick</h3>
+ * Dos cadencias distintas y deliberadas. Las barras leen el audio a 20 Hz
+ * ({@link #refreshSound}) y sólo redibujan si hay audio nuevo; la línea y las
+ * etiquetas van a 5 Hz ({@link #setPosition}) y sólo cambian cuando el segundo
+ * cambia o el punto cruza un píxel. Una superficie que dibuja a 20 Hz cuando el
+ * audio está parado es una superficie que no está en reposo.
  */
 final class ProgressControl extends LinearLayout {
 
-    private final ProgressBar bar;
+    private final SoundBarsView bars;
+    private final ProgressLineView line;
     private final TextView elapsed;
     private final TextView total;
 
     private final StringBuilder scratch = new StringBuilder(8);
-    /** Second currently shown on the left label, or -1. */
+    /** Segundo mostrado a la izquierda, o -1. */
     private long shownSecond = -1L;
-    /** Permille currently drawn on the bar. */
-    private int shownPermille = -1;
-    /** Identity the displayed time belongs to. */
+    /** Identidad a la que pertenece el tiempo mostrado. */
     private TrackKey shownKey;
-    /** Duration currently drawn on the right label, or -1. */
+    /** Duración mostrada a la derecha, o -1. */
     private long shownDuration = -1L;
+    /** Verdadero mientras la etiqueta izquierda muestra un destino, no la posición. */
+    private boolean previewing;
+    /** Color dado a la etiqueta izquierda, para no re-tintarla por fotograma. */
+    private int shownLabelColor = DesignTokens.Palette.ON_SURFACE_MUTED;
 
     ProgressControl(Context context) {
         super(context);
         DesignTokens.init(context);
-        setOrientation(HORIZONTAL);
-        setGravity(Gravity.CENTER_VERTICAL);
+        setOrientation(VERTICAL);
+
+        bars = new SoundBarsView(context);
+        addView(bars, new LayoutParams(LayoutParams.MATCH_PARENT,
+                DesignTokens.dp(DesignTokens.SOUNDBARS_HEIGHT)));
+
+        line = new ProgressLineView(context);
+        LayoutParams lineParams = new LayoutParams(LayoutParams.MATCH_PARENT,
+                DesignTokens.dp(DesignTokens.PROGRESS_LINE_THICKNESS)
+                        + DesignTokens.dp(DesignTokens.SOUNDBARS_HEAD_SIZE));
+        lineParams.topMargin = DesignTokens.dp(DesignTokens.SOUNDBARS_LANE_GAP);
+        addView(line, lineParams);
+
+        LinearLayout times = new LinearLayout(context);
+        times.setOrientation(HORIZONTAL);
+        times.setGravity(Gravity.CENTER_VERTICAL);
 
         elapsed = timeLabel(context);
         elapsed.setGravity(Gravity.START);
         total = timeLabel(context);
         total.setGravity(Gravity.END);
 
-        bar = new ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal);
-        bar.setMax(ProgressScale.PERMILLE);
-        bar.setProgress(0);
-        bar.setContentDescription("Playback position");
-
-        // Sized for the longest label the formatter can produce, "h:mm:ss", so a
-        // long track never clips its own duration.
         int labelWidth = DesignTokens.dp(DesignTokens.TIME_LABEL_WIDTH);
-        int barHeight = DesignTokens.dp(DesignTokens.PROGRESS_BAR_HEIGHT);
-        addView(elapsed, new LayoutParams(labelWidth, LayoutParams.WRAP_CONTENT));
-        addView(bar, new LayoutParams(0, barHeight, 1f));
-        LayoutParams totalParams = new LayoutParams(labelWidth, LayoutParams.WRAP_CONTENT);
-        totalParams.leftMargin = DesignTokens.dp(DesignTokens.GAP);
-        addView(total, totalParams);
+        times.addView(elapsed, new LayoutParams(labelWidth, LayoutParams.WRAP_CONTENT));
+        times.addView(total, new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f));
+        LayoutParams timesParams = new LayoutParams(LayoutParams.MATCH_PARENT,
+                LayoutParams.WRAP_CONTENT);
+        timesParams.topMargin = DesignTokens.dp(DesignTokens.GAP_TIGHT);
+        addView(times, timesParams);
     }
 
     private static TextView timeLabel(Context context) {
@@ -82,89 +85,77 @@ final class ProgressControl extends LinearLayout {
         return view;
     }
 
+    /** Las barras, para enlazar la fuente de audio. */
+    SoundBarsView bars() { return bars; }
+
     /**
-     * Applies a position tick.
+     * Compacta o devuelve la altura completa de las barras.
      *
-     * @param key        identity the position belongs to; a tick for anything else is
-     *                   refused, so a late update cannot repaint the previous song
-     * @param positionMs elapsed time of that identity
-     * @param durationMs total length, or {@code -1} when unknown
+     * <p>Una ventana corta —un teléfono en horizontal— no tiene sitio para las dos
+     * cosas: las barras y el transporte. Las barras son las que ceden, porque son las
+     * que siguen telling the truth at a glance; el transporte no se toca nunca.
+     *
+     * <p>Solo se escribe cuando el número cambia, porque cada {@code setLayoutParams}
+     * pide un layout de la tarjeta entera.
+     */
+    void setCompact(boolean value) {
+        int wanted = DesignTokens.dp(value
+                ? DesignTokens.SOUNDBARS_HEIGHT_COMPACT : DesignTokens.SOUNDBARS_HEIGHT);
+        LayoutParams params = (LayoutParams) bars.getLayoutParams();
+        if (params.height == wanted) return;
+        params.height = wanted;
+        bars.setLayoutParams(params);
+    }
+
+    /**
+     * Un tick de posición (5 Hz).
+     *
+     * @param key        identidad a la que pertenece la posición; un tick de otra
+     *                   pista se descarta, así que una actualización tardía no
+     *                   puede pintar el tiempo de la canción anterior
+     * @param positionMs tiempo transcurrido de esa identidad
+     * @param durationMs duración, o un valor no positivo si no se conoce
      */
     void setPosition(TrackKey key, long positionMs, long durationMs) {
         if (key == null) return;
         if (!key.equals(shownKey)) {
-            // A new identity resets every cache: nothing from the previous track may
-            // survive into the new one, not even the total.
+            // Una identidad nueva reinicia cada caché: nada de la pista anterior
+            // sobrevive en la nueva, ni siquiera la duración.
             shownKey = key;
             shownSecond = -1L;
-            shownPermille = -1;
             shownDuration = -1L;
+            previewing = false;
         }
         if (durationMs > 0L && durationMs != shownDuration) {
             shownDuration = durationMs;
             TimeFormat.time(durationMs, scratch);
             total.setText(scratch.toString());
         }
-        long second = ProgressScale.displayedSecond(positionMs);
-        if (second != shownSecond) {
-            shownSecond = second;
-            TimeFormat.time(positionMs, scratch);
-            elapsed.setText(scratch.toString());
-            // The announced position should only change as often as the visible one.
-            announce(second);
+        if (!previewing) {
+            long second = ProgressScale.displayedSecond(positionMs);
+            if (second != shownSecond) {
+                shownSecond = second;
+                TimeFormat.time(positionMs, scratch);
+                elapsed.setText(scratch.toString());
+            }
         }
-        int permille = ProgressScale.permille(positionMs, durationMs);
-        if (ProgressScale.shouldAdvanceBar(shownPermille, permille, pixelStep())) {
-            shownPermille = permille;
-            bar.setProgress(permille);
-        }
+        line.setPosition(positionMs, durationMs);
     }
 
-    /** Drops every cache; used when nothing is playing. */
+    /** Vacía la superficie; se usa cuando no suena nada. */
     void clear() {
         shownKey = null;
         shownSecond = -1L;
-        shownPermille = -1;
         shownDuration = -1L;
-        if (bar.getProgress() != 0) bar.setProgress(0);
+        previewing = false;
     }
 
-    /**
-     * Accessibility text for the elapsed second.
-     *
-     * <p>Recomposed only when the second changes, so a tick that cannot be seen is not
-     * announced either.
-     */
-    private void announce(long second) {
-        long minutes = second / 60L;
-        long remainder = second % 60L;
-        String text = minutes > 0L
-                ? minutes + " minutes " + remainder + " seconds"
-                : remainder + " seconds";
-        bar.setContentDescription("Playback position, " + text);
-    }
+    /** El tick rápido de las barras: lee el audio en vivo. */
+    void refreshSound(boolean playable) { bars.refresh(playable); }
 
-    private int cachedPixelWidth = -1;
-    private int cachedStep = -1;
+    /** Enlaza la fuente de audio en vivo. */
+    void attach(LiveAudioBars source) { bars.attach(source); }
 
-    /**
-     * Permille gap that moves the bar by one pixel.
-     *
-     * <p>Recomputed only when the bar's width actually changes, which happens on
-     * rotation and not on a tick.
-     */
-    private int pixelStep() {
-        int width = bar.getWidth();
-        if (width > 0 && width != cachedPixelWidth) {
-            cachedPixelWidth = width;
-            cachedStep = ProgressScale.pixelStep(width);
-        }
-        return cachedStep < 0 ? ProgressScale.PERMILLE : cachedStep;
-    }
-
-    @Override protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
-        super.onSizeChanged(width, height, oldWidth, oldHeight);
-        cachedPixelWidth = -1;
-        cachedStep = -1;
-    }
+    /** Contadores para el panel de diagnóstico. */
+    String stats() { return bars.stats(); }
 }

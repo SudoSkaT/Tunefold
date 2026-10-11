@@ -16,12 +16,26 @@
 //! El UI decima esos buckets al ancho de terminal sin re-rankear y pinta el
 //! trace columna a columna, con los extremos como acentos cuando aportan
 //! novedad sobre el trace.
-
+//!
+//! ## Lectura en vivo
+//!
+//! Para una visualización que reacciona al sonido, [`read_live_envelope`] copia
+//! la ÚLTIMA ventana publicada y devuelve la generación del bus: mientras ese
+//! número no cambie no hay audio nuevo, y el consumidor no tiene nada que
+//! repintar. Es lo que permite reaccionar a 20 Hz y estar de verdad en reposo.
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Nº de buckets (tríos trace/min/max por canal). Fijo para que el consumidor
 /// decime sin realojar: 128 cubren pantallas típicas de extremo a extremo.
 pub const WAVEFORM_BUCKETS: usize = 128;
+
+/// Floats por barra de la lectura en vivo: `lmin, lmax, rmin, rmax`.
+///
+/// El valle y el pico del mismo tramo van juntos para que una barra pueda
+/// dibujarlos a la vez: promediar en vez de unir los extremos escondería un
+/// impulso, que es justo lo que una barra tiene que enseñar.
+pub const LIVE_BAR_VALUES: usize = 4;
 
 /// Envolvente de UN canal: trace temporal + envolvente min/max (valores de
 /// amplitud sin normalizar, ~-1..1).
@@ -93,6 +107,19 @@ impl WaveformEnvelope {
             p = p.max(self.max[bucket].abs()).max(self.min[bucket].abs());
         }
         p
+    }
+
+    /// El valle más bajo de la ventana, es decir el `min` global.
+    ///
+    /// Es la mitad inferior de la envolvente y lo que el acumulador de pista
+    /// La lectura en vivo guarda de este canal el valle y el pico del tramo.
+    pub fn valley(&self) -> f32 {
+        self.min.iter().copied().fold(f32::INFINITY, f32::min)
+    }
+
+    /// El pico más alto de la ventana, es decir el `max` global.
+    pub fn crest(&self) -> f32 {
+        self.max.iter().copied().fold(f32::NEG_INFINITY, f32::max)
     }
 }
 
@@ -169,6 +196,13 @@ impl StereoWaveform {
 #[derive(Clone)]
 pub struct WaveformBus {
     slot: Arc<RwLock<Option<Arc<StereoWaveform>>>>,
+    /// Publicaciones desde el arranque.
+    ///
+    /// Es lo que permite a un consumidor saber, sin comparar valores, si hay audio
+    /// NUEVO: mientras el número no cambia, no hay nada que repintar. Sin esto, un
+    /// consumidor a 20 Hz redibuja 20 veces por segundo para pintar lo mismo cuando
+    /// la pista está en pausa.
+    generation: Arc<AtomicU64>,
 }
 
 impl Default for WaveformBus {
@@ -181,13 +215,20 @@ impl WaveformBus {
     pub fn new() -> Self {
         Self {
             slot: Arc::new(RwLock::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Publicaciones hasta ahora; 0 mientras no haya audio.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Publica la envolvente del último hop como la disponible.
     pub fn publish(&self, envelope: StereoWaveform) -> Arc<StereoWaveform> {
         let arc = Arc::new(envelope);
         *self.slot.write().unwrap() = Some(Arc::clone(&arc));
+        self.generation.fetch_add(1, Ordering::Release);
         arc
     }
 
@@ -197,8 +238,136 @@ impl WaveformBus {
     }
 }
 
+/// Copia la ÚLTIMA envolvente publicada en `out`, reducida a `buckets` columnas.
+///
+/// Es la lectura de una visualización en vivo: `out` recibe `[lmin, lmax, rmin,
+/// rmax]` por columna (el pico y el valle de cada canal en la misma barra) y lo que
+/// se devuelve es la generación del bus, para que el consumidor sepa si hay audio
+/// nuevo que pintar. Cero en `out` cuando todavía no ha sonado nada.
+///
+/// La reducción es una unión de min/max, nunca un promedio: un impulso de un
+/// bucket al lado de silencio tiene que verse, que es justo lo que un promedio
+/// borra.
+pub fn read_live_envelope(
+    snapshot: Option<Arc<StereoWaveform>>,
+    generation: u64,
+    out: &mut [f32],
+    buckets: usize,
+) -> u64 {
+    if out.is_empty() {
+        return generation;
+    }
+    out.fill(0.0);
+    let Some(stereo) = snapshot else {
+        return generation;
+    };
+    let usable = (out.len() / LIVE_BAR_VALUES).min(buckets);
+    if usable == 0 {
+        return generation;
+    }
+    for bucket in 0..usable {
+        let from = bucket * WAVEFORM_BUCKETS / usable;
+        let to = ((bucket + 1) * WAVEFORM_BUCKETS / usable)
+            .max(from + 1)
+            .min(WAVEFORM_BUCKETS);
+        let mut low_left = f32::INFINITY;
+        let mut high_left = f32::NEG_INFINITY;
+        let mut low_right = f32::INFINITY;
+        let mut high_right = f32::NEG_INFINITY;
+        for index in from..to {
+            low_left = low_left.min(stereo.left.min[index]);
+            high_left = high_left.max(stereo.left.max[index]);
+            low_right = low_right.min(stereo.right.min[index]);
+            high_right = high_right.max(stereo.right.max[index]);
+        }
+        let cursor = bucket * LIVE_BAR_VALUES;
+        out[cursor] = low_left;
+        out[cursor + 1] = high_left;
+        out[cursor + 2] = low_right;
+        out[cursor + 3] = high_right;
+    }
+    generation
+}
+
 #[cfg(test)]
 mod tests {
+    fn live(values: &mut [f32], buckets: usize, generation: u64) -> u64 {
+        let stereo = StereoWaveform::from_windows(&[0.4; 2048], &[0.8; 2048]);
+        read_live_envelope(Some(Arc::new(stereo)), generation, values, buckets)
+    }
+
+    #[test]
+    fn live_envelope_reduces_to_the_requested_buckets() {
+        let mut out = [0.0f32; 4 * 16];
+        assert_eq!(live(&mut out, 16, 7), 7, "devuelve la generación tal cual");
+        for bucket in 0..16 {
+            let base = bucket * 4;
+            assert!(
+                (out[base + 1] - 0.4).abs() < 1e-6,
+                "L pico {}",
+                out[base + 1]
+            );
+            assert!(
+                (out[base + 3] - 0.8).abs() < 1e-6,
+                "R pico {}",
+                out[base + 3]
+            );
+        }
+    }
+
+    #[test]
+    fn live_envelope_keeps_a_transient_that_an_average_would_erase() {
+        // Un impulso en un solo bucket del canal izquierdo: la barra que lo cubre
+        // tiene que mostrarlo entero.
+        let mut window = [0.0f32; 2048];
+        window[1001] = 1.0;
+        let stereo = StereoWaveform::from_windows(&window, &window);
+        let mut out = [0.0f32; 4 * 128];
+        read_live_envelope(Some(Arc::new(stereo)), 1, &mut out, 128);
+        assert!(
+            out.iter().any(|v| (*v - 1.0).abs() < 1e-6),
+            "el impulso sobrevive a la reducción"
+        );
+    }
+
+    #[test]
+    fn live_envelope_without_audio_is_silence() {
+        let mut out = [9.0f32; 16];
+        assert_eq!(read_live_envelope(None, 0, &mut out, 4), 0);
+        assert!(out.iter().all(|v| *v == 0.0), "sin audio no hay barra");
+    }
+
+    #[test]
+    fn live_envelope_never_writes_past_its_buffer() {
+        let mut out = [7.0f32; 10];
+        // 20 columnas pedidas en un búfer de 10 floats: sólo caben 2.
+        read_live_envelope(
+            Some(Arc::new(StereoWaveform::from_windows(
+                &[0.5; 2048],
+                &[0.5; 2048],
+            ))),
+            3,
+            &mut out,
+            20,
+        );
+        assert!(
+            out.iter().all(|v| *v != 7.0),
+            "no quedan floats sin escribir"
+        );
+    }
+
+    #[test]
+    fn the_bus_generation_moves_only_when_audio_does() {
+        let bus = WaveformBus::new();
+        assert_eq!(bus.generation(), 0);
+        bus.publish(StereoWaveform::from_windows(&[0.5; 2048], &[0.5; 2048]));
+        bus.publish(StereoWaveform::from_windows(&[0.5; 2048], &[0.5; 2048]));
+        assert_eq!(bus.generation(), 2);
+        // Leer no publica: el contador es del productor, no del consumidor.
+        assert_eq!(bus.latest().map(|s| s.peak()), Some(0.5));
+        assert_eq!(bus.generation(), 2);
+    }
+
     use super::*;
 
     #[test]

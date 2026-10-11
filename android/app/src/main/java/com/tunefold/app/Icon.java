@@ -130,6 +130,19 @@ enum Icon {
                     + " C 19.6 16.1974 16.1974 19.6 12 19.6 C 7.8026 19.6 4.4 16.1974 4.4 12 Z"
                     + " M 10.2 9.4 L 15.4 12 L 10.2 14.6 Z M 9.4 8.8 L 15.8 15.2"),
 
+    /**
+     * Clipboard with a sheet: paste a link.
+     *
+     * <p>A pair of {@code C} curves reads as a board with a page on it at 20dp, which
+     * is where it is used; anything more literal turned to mush at that size.
+     */
+    CLIPBOARD(false,
+            "M 9 4.6 L 9 3.6 L 15 3.6 L 15 4.6"
+                    + " M 9 4.6 C 8 4.6 7.2 5.4 7.2 6.4 L 7.2 19"
+                    + " C 7.2 20 8 20.8 9 20.8 L 15 20.8 C 16 20.8 16.8 20 16.8 19"
+                    + " L 16.8 6.4 C 16.8 5.4 16 4.6 15 4.6"
+                    + " M 10 9.4 L 14 9.4 M 10 12.4 L 14 12.4 M 10 15.4 L 12.6 15.4"),
+
     /** Chevron pointing left. */
     BACK(false, "M 14.5 5.5 L 8 12 L 14.5 18.5"),
 

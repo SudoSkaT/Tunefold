@@ -64,4 +64,20 @@ String provider() { return provider; }
     }
 
     @Override public String toString() { return provider + "/" + providerTrackId; }
+
+    /**
+     * Whether two identities name the same track, for caches that must not confuse
+     * "the same track" with "the same object".
+     *
+     * <p>{@link MediaTrack#key()} builds a <em>new</em> key on every call, so every
+     * position tick hands the UI an equal but distinct instance. Comparing those with
+     * {@code ==} says "a different track" five times a second: every cache that
+     * guards on identity throws itself away on every tick, the waveform rebuilds its
+     * geometry per tick, the auto-gain never settles and the accessibility sentence is
+     * recomposed continuously. That is a silent, whole-surface failure that no
+     * screenshot shows — it only shows up in the counters.
+     */
+    static boolean same(TrackKey left, TrackKey right) {
+        return left == null ? right == null : left.equals(right);
+    }
 }

@@ -53,22 +53,98 @@ final class ProviderRegistry implements AutoCloseable {
     }
 
     /** Artwork is fetched and decoded independently from source resolution. */
-    void loadArtwork(MediaTrack track, Callback<android.graphics.Bitmap> callback) {
+    void loadArtwork(MediaTrack track, int targetPx, Callback<android.graphics.Bitmap> callback) {
         ArtworkCache cache = artworkCache;
         if (cache == null || track.thumbnail.isEmpty()) {
             deliver(callback, null, "Artwork is unavailable");
             return;
         }
+        String identity = track.key() == null ? track.thumbnail : track.key().toString();
         artworkWorker.execute(() -> {
             long started = android.os.SystemClock.elapsedRealtimeNanos();
+            // A memory hit still repaints, and still owns the accent: a cover that is
+            // already decoded is the common case after a rotation, and skipping it
+            // would leave the surface showing the previous track's colour. It is
+            // checked HERE, on the artwork worker, because deriving the palette is
+            // bitmap work and must never run where a frame is being produced.
+            // Who asked decides what the answer has to be good enough for: a
+            // thumbnail cannot be stretched into the player's slot, so it is not a hit
+            // for a player-sized request, and a row's request never owns the palette.
+            boolean ownsPalette = ownsPalette(targetPx);
+            android.graphics.Bitmap cached = cache.memoryHit(identity);
+            if (cached != null && cached.getWidth() < minSide(targetPx)) cached = null;
+            if (cached != null) {
+                if (ownsPalette) applyDerivedAccent(cached);
+                deliver(callback, cached, null);
+                return;
+            }
             java.io.File file = cache.getOrDownload(track.thumbnail);
             if (file != null) track.artworkCachePath = file.getAbsolutePath();
-            android.graphics.Bitmap bitmap = file == null ? null : decodeArtwork(file);
+            int target = Math.max(DesignTokens.dp(DesignTokens.ARTWORK_THUMB),
+                    Math.min(targetPx, DesignTokens.ARTWORK_DECODE_MAX_PX));
+            android.graphics.Bitmap bitmap = file == null ? null : decodeArtwork(file, target);
+            if (bitmap != null) cache.rememberDecoded(identity, bitmap);
             android.util.Log.i("TunefoldPerf", "event=artwork_cache_"
-                    + (file == null ? "miss" : "ready") + " elapsed_ms="
+                    + (file == null ? "miss" : "ready") + " px=" + target
+                    + " elapsed_ms="
                     + ((android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000_000L));
+            if (bitmap != null && ownsPalette) applyDerivedAccent(bitmap);
             deliver(callback, bitmap, bitmap == null ? "Artwork unavailable" : null);
         });
+    }
+
+    /**
+     * Derives the two bar colours this cover implies and applies them on the UI
+     * thread.
+     *
+     * <p>The palette arithmetic runs on the artwork worker, against a 32×32
+     * downsample: {@code Bitmap.createScaledBitmap} on a 640² cover costs a
+     * millisecond or two of work that must never happen where a frame is being
+     * produced (the caller is always the artwork worker, never the UI thread).
+     * Only the finished palette crosses to the main thread, and
+     * {@link ArtworkTheme#setPalette} is a no-op when nothing moved, so a cover
+     * that yields the brand mint repaints nothing at all.
+     */
+    /**
+     * Whether this request is for a cover big enough to BE the player's cover.
+     *
+     * <p>Asked of the request, not of the decoded bitmap: providers hand out covers
+     * of whatever size they like, and a 320px thumbnail of a 320px source is a fine
+     * cover for the player — refusing to take its colours because the file was small
+     * is refusing the palette, not protecting it.
+     */
+    private static boolean ownsPalette(int targetPx) {
+        return targetPx >= DesignTokens.dp(DesignTokens.ARTWORK_MIN);
+    }
+
+    private static int minSide(int targetPx) {
+        return Math.max(DesignTokens.dp(DesignTokens.ARTWORK_THUMB),
+                Math.min(targetPx, DesignTokens.ARTWORK_DECODE_MAX_PX));
+    }
+
+    private void applyDerivedAccent(android.graphics.Bitmap bitmap) {
+        int side = DesignTokens.ARTWORK_PALETTE_SAMPLE_PX;
+        ArtworkPalette.Palette palette;
+        try {
+            android.graphics.Bitmap sample =
+                    android.graphics.Bitmap.createScaledBitmap(bitmap, side, side, true);
+            int[] pixels = new int[side * side];
+            sample.getPixels(pixels, 0, side, 0, 0, side, side);
+            if (sample != bitmap) sample.recycle();
+            palette = ArtworkPalette.derive(pixels);
+        } catch (RuntimeException failure) {
+            // A palette that cannot be read is not a reason to lose the cover.
+            android.util.Log.d("TunefoldPerf",
+                    "event=artwork_palette_failed " + failure.getClass().getSimpleName());
+            return;
+        }
+        // Once per cover, and only when something actually moved: the palette is the
+        // one thing here whose outcome cannot be read off the screen afterwards.
+        android.util.Log.i("TunefoldPerf", "event=artwork_palette derived=" + palette.derived
+                + " primary=" + String.format(java.util.Locale.ROOT, "#%08X", palette.primary)
+                + " secondary=" + String.format(java.util.Locale.ROOT, "#%08X",
+                        palette.secondary));
+        main.post(() -> ArtworkTheme.setPalette(palette));
     }
 
     /** The bounded local-media store, owned by this registry. */
@@ -131,12 +207,23 @@ final class ProviderRegistry implements AutoCloseable {
         });
     }
 
-    private static android.graphics.Bitmap decodeArtwork(java.io.File file) {
+    /**
+     * Decodes a cover no larger than {@code targetPx} on its long side.
+     *
+     * <p>Two passes: the first reads only the bounds, so the second can pick an
+     * {@code inSampleSize} from the real dimensions instead of allocating a full
+     * size bitmap and throwing it away. The sample is a power of two, which is all
+     * {@code inSampleSize} can express; the remaining scale happens once, in the
+     * hardware pipeline, when the view draws it.
+     */
+    private static android.graphics.Bitmap decodeArtwork(java.io.File file, int targetPx) {
         android.graphics.BitmapFactory.Options bounds = new android.graphics.BitmapFactory.Options();
         bounds.inJustDecodeBounds = true;
         android.graphics.BitmapFactory.decodeFile(file.getAbsolutePath(), bounds);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
+        int longest = Math.max(bounds.outWidth, bounds.outHeight);
         int sample = 1;
-        while (bounds.outWidth / sample > 256 || bounds.outHeight / sample > 256) sample *= 2;
+        while (longest / sample > targetPx) sample *= 2;
         android.graphics.BitmapFactory.Options options = new android.graphics.BitmapFactory.Options();
         options.inSampleSize = sample;
         return android.graphics.BitmapFactory.decodeFile(file.getAbsolutePath(), options);

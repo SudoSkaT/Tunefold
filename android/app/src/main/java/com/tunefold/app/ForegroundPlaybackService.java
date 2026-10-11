@@ -127,20 +127,17 @@ public final class ForegroundPlaybackService extends Service {
                 notification.updatePosition(
                         session == null ? 0L : session.readPosition(position).positionMs, 1f);
             }
-            handler.postDelayed(this, POSITION_INTERVAL_MS);
+            handler.postDelayed(this, DesignTokens.SESSION_REFRESH_INTERVAL_MS);
         }
     };
 
     /**
      * Reused holder for the poll's position read.
      *
-     * <p>Allocated once per service rather than once per tick: this runs twice a
-     * second from the moment playback starts until it stops.
+     * <p>Allocated once per service rather than once per tick: this runs for as long
+     * as playback lasts, from the moment it starts until it stops.
      */
     private final PlaybackPosition position = new PlaybackPosition();
-
-    /** Kept in step with {@link DesignTokens#POSITION_INTERVAL_MS}. */
-    private static final long POSITION_INTERVAL_MS = 500L;
 
     /**
      * The engine changed state; feed it into the session so the product state,

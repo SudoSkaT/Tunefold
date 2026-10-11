@@ -11,9 +11,28 @@
         android:label="Tunefold"
         android:theme="@android:style/Theme.Material.NoActionBar"
         android:usesCleartextTraffic="false">
+        <!--
+            The screen owns its whole tree and re-derives it from the window, so a
+            configuration change is a re-measure and not a rebuild. `orientation`,
+            `screenSize` and `keyboardHidden` were already declared; the rest are here
+            because each one used to cost a full Activity recreation — the window,
+            the decor, the pooled rows, the decoded cover and the service binding —
+            for something this Activity can absorb on its own:
+
+              uiMode            the app is dark by design and has two themes, not one
+              fontScale         tokens are re-read in onConfigurationChanged
+              density           so are the pixel conversions
+              screenLayout      a phone becoming a tablet, e.g. unfolding
+              smallestScreenSize the same, in the other direction
+
+            A recreation would also throw away the mini player's identity for nothing:
+            it is fed by a snapshot and keeps no state of its own, but rebuilding it
+            is not free, and "the strip disappeared" is the kind of bug that only
+            reproduces on the device that folds.
+        -->
         <activity
             android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|fontScale|density"
             android:windowSoftInputMode="stateAlwaysHidden|adjustResize"
             android:exported="true">
             <intent-filter>

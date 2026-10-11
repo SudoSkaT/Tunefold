@@ -5,6 +5,7 @@ import android.graphics.Typeface;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.View;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -36,12 +37,40 @@ final class TrackRow extends LinearLayout {
         void onAdvanceDownload(TrackRow row);
     }
 
+    /**
+     * Where covers come from, as one function.
+     *
+     * <p>A row asks for its cover when it is bound, so a row that was never built can
+     * never ask for one: that is the whole memory argument for a windowed list, and it
+     * only holds if the ask happens here and nowhere else.
+     */
+    interface ArtworkLoader {
+        /**
+         * @param track    the track whose cover is wanted
+         * @param identity the identity the answer must carry
+         * @param sidePx   the side the cover will be drawn at
+         */
+        void load(MediaTrack track, String identity, int sidePx);
+    }
+
+    /** Asks the row for its contextual actions; long press and overflow share it. */
+    interface OverflowHost {
+        /**
+         * @param row     the row the actions belong to
+         * @param anchor  the view to show them next to
+         */
+        void onOverflow(TrackRow row, View anchor);
+    }
+
     private final ArtworkView artwork;
     private final TextView title;
     private final TextView attribution;
-    private final SecondaryActionButton like;
-    private final SecondaryActionButton download;
+    private final TextView status;
+    private final TextView duration;
+    private final IconButton overflow;
     private final Callbacks callbacks;
+    private ArtworkLoader loader;
+    private OverflowHost overflowHost;
 
     /** Reused so composing an accessibility description allocates nothing. */
     private final StringBuilder scratch = new StringBuilder(96);
@@ -52,6 +81,9 @@ final class TrackRow extends LinearLayout {
     private boolean liked;
     private DownloadState.Phase downloadPhase = DownloadState.Phase.IDLE;
     private int downloadPercent = -1;
+    private CharSequence renderedStatus = "";
+    private CharSequence renderedDuration = "";
+    private int artworkSidePx;
 
     TrackRow(Context context, Callbacks callbacks) {
         super(context);
@@ -94,27 +126,50 @@ final class TrackRow extends LinearLayout {
         text.addView(attribution, new LayoutParams(LayoutParams.MATCH_PARENT,
                 LayoutParams.WRAP_CONTENT));
 
-        like = new SecondaryActionButton(context);
-        like.setOnClickListener(view -> {
-            if (callbacks != null) callbacks.onToggleLike(this);
-        });
-        like.setAction(Icon.HEART, "Not liked. Double tap to add to L1K3D.");
-        addView(like, new LayoutParams(DesignTokens.dp(DesignTokens.CONTROL_TARGET_SECONDARY),
-                DesignTokens.dp(DesignTokens.CONTROL_TARGET_SECONDARY)));
+        // Status: what this track already IS, not what it could be. A row is scanned,
+        // not operated, and the two actions it does offer live in one place: the
+        // overflow. Two always-present buttons per row is also two always-present
+        // focus stops in a list of fifty.
+        status = new TextView(context);
+        status.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_CAPTION_SIZE);
+        status.setLetterSpacing(DesignTokens.TYPE_LABEL_TRACKING);
+        status.setMaxLines(1);
+        status.setTextColor(DesignTokens.Palette.ON_SURFACE_FAINT);
+        status.setGravity(Gravity.CENTER);
+        LayoutParams statusParams = new LayoutParams(LayoutParams.WRAP_CONTENT,
+                DesignTokens.dp(DesignTokens.ROW_STATUS_HEIGHT));
+        statusParams.rightMargin = DesignTokens.dp(DesignTokens.SPACE_2);
+        text.addView(status, statusParams);
 
-        download = new SecondaryActionButton(context);
-        download.setOnClickListener(view -> {
-            if (callbacks != null) callbacks.onAdvanceDownload(this);
+        duration = new TextView(context);
+        duration.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_CAPTION_SIZE);
+        duration.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        duration.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        duration.setMaxLines(1);
+        LayoutParams durationParams = new LayoutParams(
+                DesignTokens.dp(DesignTokens.ROW_DURATION_WIDTH),
+                DesignTokens.dp(DesignTokens.ROW_STATUS_HEIGHT));
+        durationParams.rightMargin = DesignTokens.dp(DesignTokens.SPACE_1);
+        addView(duration, durationParams);
+
+        overflow = new IconButton(context, DesignTokens.CONTROL_TARGET_OVERFLOW,
+                DesignTokens.ICON_SIZE_SMALL);
+        overflow.setAction(Icon.MORE, "More actions");
+        overflow.setOnClickListener(view -> {
+            if (overflowHost != null) overflowHost.onOverflow(this, overflow);
         });
-        download.setAction(Icon.DOWNLOAD, "Not downloaded. Double tap to download.");
-        LayoutParams downloadParams = new LayoutParams(
-                DesignTokens.dp(DesignTokens.CONTROL_TARGET_SECONDARY),
-                DesignTokens.dp(DesignTokens.CONTROL_TARGET_SECONDARY));
-        downloadParams.leftMargin = DesignTokens.dp(DesignTokens.SPACE_2);
-        addView(download, downloadParams);
+        addView(overflow, new LayoutParams(
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET_OVERFLOW),
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET_OVERFLOW)));
 
         setOnClickListener(view -> {
             if (callbacks != null) callbacks.onPlay(this);
+        });
+        // A long press opens the same menu as the button: the gesture is the one people
+        // already know, and the button is the one a screen reader can reach.
+        setOnLongClickListener(view -> {
+            if (overflowHost != null) overflowHost.onOverflow(this, overflow);
+            return true;
         });
     }
 
@@ -133,14 +188,46 @@ final class TrackRow extends LinearLayout {
     /** The artwork sub-view, so a host can feed it decoded covers. */
     ArtworkView artwork() { return artwork; }
 
+    /** The one path covers take, set once per screen. */
+    void setArtworkLoader(ArtworkLoader value) { loader = value; }
+
+    /** Where the contextual actions are shown from. */
+    void setOverflowHost(OverflowHost value) { overflowHost = value; }
+
+    /** The action that advances this row's download by one step, for a menu. */
+    void advanceDownload() {
+        if (callbacks != null) callbacks.onAdvanceDownload(this);
+    }
+
+    /** Toggles L1K3D membership for this row's track, for a menu. */
+    void toggleLike() {
+        if (callbacks != null) callbacks.onToggleLike(this);
+    }
+
     /** Re-points the row at {@code value}, applying every visible piece of state. */
     void bind(MediaTrack value, boolean isLiked, DownloadState download) {
         track = value;
         key = value == null ? null : value.key();
         applyIdentity();
         applyText();
+        applyDuration();
         applyLike(isLiked);
         applyDownload(download);
+        requestCover();
+    }
+
+    /**
+     * Asks for the cover of whatever this row now shows.
+     *
+     * <p>Through the pool's loader, once per binding: a row that is rebound to the
+     * track it already showed asks again only because the loader answers from its
+     * cache, which is where that answer belongs.
+     */
+    private void requestCover() {
+        if (track == null || loader == null) return;
+        if (track.thumbnail.isEmpty()) return;
+        artworkSidePx = DesignTokens.dp(DesignTokens.ARTWORK_THUMB);
+        loader.load(track, artworkIdentity(), artworkSidePx);
     }
 
     /**
@@ -164,17 +251,12 @@ final class TrackRow extends LinearLayout {
         return key.provider() + "/" + key.providerTrackId();
     }
 
-    /** Applies L1K3D membership. */
+    /** Applies L1K3D membership, which the row shows as status, not as a control. */
     void applyLike(boolean value) {
         if (liked == value) return;
         liked = value;
-        like.setToggleState(value);
-        like.setPhase(value ? Icon.HEART_FILLED : Icon.HEART,
-                value ? SecondaryActionButton.Phase.DONE : SecondaryActionButton.Phase.IDLE,
-                -1);
-        like.applyDescription(value
-                ? "Liked. Double tap to remove from L1K3D."
-                : "Not liked. Double tap to add to L1K3D.");
+        applyStatus();
+        applyDescription();
     }
 
     /** Applies download state. */
@@ -185,9 +267,59 @@ final class TrackRow extends LinearLayout {
         if (state.phase == downloadPhase && percent == downloadPercent) return;
         downloadPhase = state.phase;
         downloadPercent = percent;
-        download.setPhase(downloadIcon(state.phase), phaseFor(state.phase), percent);
-        download.applyDescription(downloadDescription(state.phase, percent));
+        applyStatus();
         applyDescription();
+    }
+
+    /**
+     * The optional status line: what this track already is.
+     *
+     * <p>Empty when there is nothing to say, so a plain track's row is title, artist,
+     * duration and one button. Liked and downloaded are the two states a row earns,
+     * and a running download shows its own word because that is the only place it is
+     * visible without opening the player.
+     */
+    private void applyStatus() {
+        CharSequence next = statusOf(downloadPhase, downloadPercent, liked);
+        if (TextUtils.equals(next, renderedStatus)) return;
+        renderedStatus = next;
+        status.setText(renderedStatus);
+        status.setVisibility(renderedStatus.length() == 0 ? View.GONE : View.VISIBLE);
+    }
+
+    /** The words a row shows for what this track already is; package-visible to test. */
+    static CharSequence statusOf(DownloadState.Phase phase, int percent, boolean liked) {
+        String word;
+        switch (phase) {
+            case RESOLVING_SOURCE: word = "PREPARING"; break;
+            case DOWNLOADING:
+                word = percent >= 0 ? "SAVING " + percent + "%" : "SAVING";
+                break;
+            case COMPLETED:
+            case ALREADY_DOWNLOADED: word = "SAVED"; break;
+            case FAILED:
+            case CANCELLED: word = "FAILED"; break;
+            default:
+                word = liked ? "LIKED" : "";
+                break;
+        }
+        return word;
+    }
+
+    /**
+     * The track's own duration, when the provider told us.
+     *
+     * <p>Unknown stays blank rather than becoming {@code --:--}: a row that does not
+     * know how long a song is has no business pretending it is zero.
+     */
+    private void applyDuration() {
+        long milliseconds = track == null ? -1L : track.durationMs;
+        CharSequence next = milliseconds > 0L
+                ? TimeFormat.time(milliseconds) : "";
+        if (TextUtils.equals(next, renderedDuration)) return;
+        renderedDuration = next;
+        duration.setText(renderedDuration);
+        duration.setVisibility(renderedDuration.length() == 0 ? View.GONE : View.VISIBLE);
     }
 
     private void applyIdentity() {
@@ -210,6 +342,7 @@ final class TrackRow extends LinearLayout {
             renderedAttribution = nextAttribution;
             attribution.setText(renderedAttribution);
         }
+        applyStatus();
         applyDescription();
     }
 
@@ -231,6 +364,8 @@ final class TrackRow extends LinearLayout {
         scratch.setLength(0);
         scratch.append(name);
         if (who.length() > 0) scratch.append(", ").append(who);
+        CharSequence length = renderedDuration;
+        if (length.length() > 0) scratch.append(", ").append(length);
         scratch.append(". ");
         scratch.append(liked ? "Liked. " : "Not liked. ");
         scratch.append(downloadDescription(downloadPhase, downloadPercent));

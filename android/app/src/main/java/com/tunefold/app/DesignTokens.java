@@ -185,8 +185,108 @@ final class DesignTokens {
 
     /** Width reserved for each timestamp beside the progress bar, in {@code dp}. */
     static final float TIME_LABEL_WIDTH = 52f;
+    /**
+     * Width reserved for a track's duration at the end of its row, in {@code dp}.
+     *
+     * <p>A fixed box, so a row's actions do not move when one track's duration is a
+     * different number of characters than another's.
+     */
+    static final float ROW_DURATION_WIDTH = 44f;
+    /** Target of the row's overflow button, in {@code dp}. */
+    static final float CONTROL_TARGET_OVERFLOW = 40f;
+    /**
+     * Height of a row's status line and duration box, in {@code dp}.
+     *
+     * <p>Below the caption size so a row with a status and a row without one are the
+     * same height: rows are recycled, and a list that changes its own row height while
+     * scrolling is a list that scrolls wrongly.
+     */
+    static final float ROW_STATUS_HEIGHT = 20f;
+
+    // ------------------------------------------------------- bottom navigation
+
+    /**
+     * Height of the bottom navigation bar, in {@code dp}.
+     *
+     * <p>The accessibility floor ({@link #TOUCH_TARGET_MIN}) plus the caption, and no
+     * more: it is permanently on screen, so every dp here is a dp the content does
+     * not get. The bar sits at the bottom because the thumb is there and because a
+     * navigation strip that has to be scrolled to is not navigation.
+     */
+    static final float BOTTOM_NAV_HEIGHT = 60f;
+    /** Thickness of the rule that separates the bar from the content, in {@code dp}. */
+    static final float BOTTOM_NAV_RULE = SPACE_1;
+    /** Background behind the bar, so content scrolling under it cannot show through. */
+    static final int BOTTOM_NAV_SURFACE = Palette.SURFACE_BASE;
+    /** Caption size under each destination glyph, in {@code sp}. */
+    static final float NAV_CAPTION_SIZE = 10f;
+
+    // ---------------------------------------------------------- mini player
+
+    /**
+     * Height of the persistent mini player, in {@code dp}.
+     *
+     * <p>The whole point of this surface is that it costs almost nothing: 56dp leaves
+     * room for a 40dp cover and a 48dp target, and no more. Every dp it takes is a dp
+     * of content that stays hidden behind it.
+     */
+    static final float MINI_PLAYER_HEIGHT = 56f;
+    /** Cover side inside the mini player, in {@code dp}. */
+    static final float MINI_PLAYER_ARTWORK = 40f;
+    /** Gap between the mini player's cover and its text, in {@code dp}. */
+    static final float MINI_PLAYER_GAP = SPACE_3;
+
+    // --------------------------------------------------------- windowed list
+
+    /**
+     * Rows laid out above and below the visible window, in {@code units of a row}.
+     *
+     * <p>Enough to cover a fling before the first frame of it has to wait for a bind,
+     * and no more: rows outside the window are the only rows a long library pays for,
+     * and this is what bounds that cost.
+     */
+    static final int LIST_PREFETCH_ROWS = 3;
     /** Thickness of the playback progress bar, in {@code dp}. */
     static final float PROGRESS_BAR_HEIGHT = SPACE_3;
+
+    // ------------------------------------------------------ live sound bars
+
+    /**
+     * Alto de las barras reactivas, en {@code dp}.
+     *
+     * <p>Más bajo que la antigua forma de onda: ya no tiene que contar la historia
+     * de la pista (eso lo cuenta la posición), sólo mostrar el sonido de ahora, y
+     * el sitio que se le devuelve lo gana el aire y los controles.
+     */
+    static final float SOUNDBARS_HEIGHT = 56f;
+    /**
+     * Alto de las barras en una ventana corta, en {@code dp}.
+     *
+     * <p>Un teléfono en horizontal tiene que repartir la altura entre las barras y el
+     * transporte, y el transporte no se toca nunca: bajan las barras. No es una escala
+     * de todo, es el bloque que puede ceder su alto sin dejar de decir lo que dice.
+     */
+    static final float SOUNDBARS_HEIGHT_COMPACT = 34f;
+    /** Separación entre el carril izquierdo y el derecho, en {@code dp}. */
+    static final float SOUNDBARS_LANE_GAP = SPACE_3;
+    /** Paso de una barra a la siguiente, en {@code dp}. */
+    static final float SOUNDBARS_BAR_PITCH = 4f;
+    /** Hueco entre barras, en {@code dp}. */
+    static final float SOUNDBARS_BAR_GAP = SPACE_1;
+    /** Diámetro del punto de la línea de posición, en {@code dp}. */
+    static final float SOUNDBARS_HEAD_SIZE = 10f;
+    /** Grosor de la línea de posición, en {@code dp}. */
+    static final float PROGRESS_LINE_THICKNESS = SPACE_1;
+
+    /**
+     * Cadencia de las barras, en {@code ms}.
+     *
+     * <p>20 Hz: suficiente para que el sonido se sienta vivo, muy por debajo de
+     * lo que costaría perseguir el valor a la tasa de refresco. Las barras sólo
+     * redibujan cuando hay audio nuevo, así que en pausa esta cadencia no dibuja
+     * nada en absoluto.
+     */
+    static final long VISUAL_INTERVAL_MS = 50L;
 
     // --------------------------------------------------------------- artwork
 
@@ -200,6 +300,37 @@ final class DesignTokens {
     static final float ARTWORK_GUTTER_LANDSCAPE = SPACE_6;
     /** Gap between cover and details in portrait. */
     static final float ARTWORK_GUTTER_PORTRAIT = SPACE_4;
+    /**
+     * Cover width as a share of the width available to it, portrait.
+     *
+     * <p>The cover is the loudest thing on this surface, so it takes the great
+     * majority of the available width (78–88%); everything else is set by what
+     * is left over.
+     */
+    static final float ARTWORK_PORTRAIT_WIDTH_RATIO = 0.84f;
+    /**
+     * Cover height budget as a share of the window height, portrait.
+     *
+     * <p>The other half of the ratio's guard: a cover sized by width alone on a
+     * very tall phone pushes every control under the fold, which is the opposite
+     * of what Now Playing is for.
+     */
+    static final float ARTWORK_PORTRAIT_HEIGHT_RATIO = 0.42f;
+    /** Cover width share in landscape, where the details need the rest. */
+    static final float ARTWORK_LANDSCAPE_WIDTH_RATIO = 0.42f;
+    /** Cover height share in landscape: it competes for the shorter dimension. */
+    static final float ARTWORK_LANDSCAPE_HEIGHT_RATIO = 0.88f;
+    /**
+     * Longest side of a decoded cover, in pixels.
+     *
+     * <p>Decoding more than this wastes memory (a cover is the largest bitmap in
+     * the app), and decoding less means upscaling a visibly soft cover. 640 px
+     * covers a ~300 dp Now Playing square on a 2x–3x screen without scaling it
+     * hard.
+     */
+    static final int ARTWORK_DECODE_MAX_PX = 640;
+    /** Edge length of the tiny cover sampled for the palette, in pixels. */
+    static final int ARTWORK_PALETTE_SAMPLE_PX = 32;
 
     // -------------------------------------------------------------- typography
 
@@ -232,6 +363,16 @@ final class DesignTokens {
     /** Letterspacing of the label type, in {@code em}. */
     static final float TYPE_LABEL_TRACKING = 0.06f;
 
+    // ------------------------------------------------------------ state glyph
+
+    /**
+     * Size of the state indicator beside the status word, in {@code dp}.
+     *
+     * <p>Small on purpose: it has to read as a status, not as an icon competing
+     * with the transport.
+     */
+    static final float STATE_DOT_SIZE = 14f;
+
     // ------------------------------------------------------------------ motion
 
     /** Press feedback duration, in {@code ms}. */
@@ -240,8 +381,37 @@ final class DesignTokens {
     static final long DURATION_BASE = 150L;
     /** Larger surface transition, in {@code ms}. */
     static final long DURATION_SLOW = 260L;
-    /** Position refresh cadence, in {@code ms}. */
-    static final long POSITION_INTERVAL_MS = 500L;
+    /**
+     * Position refresh cadence, in {@code ms}.
+     *
+     * <p>The tick that feeds the elapsed label, the playhead and the waveform.
+     * It is shorter than a second because the playhead has to move smoothly, and
+     * the waveform shape arrives in bursts of ~128 ms of audio that would
+     * otherwise be applied half a second at a time. It is still 5 Hz: the elapsed
+     * label only changes once a second, so four ticks out of five cost a handful
+     * of integer comparisons and nothing else.
+     */
+    static final long POSITION_INTERVAL_MS = 200L;
+    /**
+     * Engine refresh cadence, in {@code ms}: the service poll that drives the
+     * notification, the lock screen and the session's own state.
+     *
+     * <p>Deliberately slower than {@link #POSITION_INTERVAL_MS}. A refresh takes a
+     * full snapshot of the session, and the session notifies every observer, which
+     * re-renders the whole surface. Paying that 5 times a second to redraw a
+     * notification twice a second would be work for nothing, and the surface's own
+     * tick already reads the position directly.
+     */
+    static final long SESSION_REFRESH_INTERVAL_MS = 500L;
+    /**
+     * Interval of the working-state segments, in {@code ms}.
+     *
+     * <p>Driven by the same UI tick as everything else instead of a frame
+     * callback: an indeterminate spinner redraws at 60–120 fps for as long as a
+     * track takes to resolve, and it says nothing a 2.5 Hz three-segment
+     * indicator does not.
+     */
+    static final long STATE_SEGMENT_INTERVAL_MS = 400L;
 
     // ----------------------------------------------------------------- colours
 
@@ -304,7 +474,18 @@ final class DesignTokens {
         /** Scrim behind the cover when it is still decoding. */
         static final int SCRIM = 0x660D1117;
 
-        /** Alpha for a disabled glyph, applied to its role colour. */
+        /**
+         * Colour of a state that is work in progress (resolving, buffering).
+         *
+         * <p>The warning hue, deliberately <em>not</em> the accent: the accent
+         * means "this is what you act on", and work in progress is something the
+         * user is waiting for, not something they chose.
+         */
+        static final int STATE_WORKING = WARNING;
+
+        /**
+         * Alpha for a disabled glyph, applied to its role colour.
+         */
         static final float ALPHA_DISABLED = 0.38f;
         /** Alpha for a hairline or a decorative rule. */
         static final float ALPHA_HAIRLINE = 0.12f;
@@ -336,6 +517,13 @@ final class DesignTokens {
     }
 
     /** Replaces {@code color}'s alpha with {@code alpha}, keeping its RGB. */
+    /**
+     * Alpha of a shape that is context, not content: the rest of a progress line,
+     * the still part of a bar field. Loud enough to belong to the composition,
+     * quiet enough never to read as a value.
+     */
+    static final float ALPHA_MUTED_SHAPE = 0.45f;
+
     static int scaleAlpha(int color, float alpha) {
         int scaled = Math.round(Math.max(0f, Math.min(1f, alpha))
                 * ((color >>> 24) & 0xFF));
