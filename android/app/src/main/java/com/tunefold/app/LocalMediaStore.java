@@ -33,6 +33,8 @@ interface LocalMediaStore {
      */
     boolean register(String provider, String id, File path, String title);
 
+    boolean register(String provider, String id, File path, String title, String thumbnail);
+
     boolean remove(String provider, String id);
 
     /**
@@ -58,13 +60,20 @@ interface LocalMediaStore {
         public final long size;
         /** Title remembered at download time, or {@code null} when unknown. */
         private final String title;
+        /** Thumbnail URL remembered at download time, or {@code null} when unknown. */
+        private final String thumbnail;
         private final File audio;
 
         Entry(TrackKey key, long size, File audio, String title) {
+            this(key, size, audio, title, null);
+        }
+
+        Entry(TrackKey key, long size, File audio, String title, String thumbnail) {
             this.key = key;
             this.size = size;
             this.audio = audio;
             this.title = title;
+            this.thumbnail = thumbnail;
         }
 
         /** The audio file. Guaranteed to exist: the entry was validated. */
@@ -81,6 +90,9 @@ interface LocalMediaStore {
          * outlive the thing it describes.
          */
         public String title() { return title; }
+
+        /** Thumbnail URL the file was downloaded under, or {@code null} when unknown. */
+        public String thumbnail() { return thumbnail; }
 
         @Override public String toString() { return key + " (" + size + " bytes)"; }
     }

@@ -73,6 +73,20 @@ final class TrackGroup extends LinearLayout {
         header.setTitle(title, count);
     }
 
+    /**
+     * Where this block leads.
+     *
+     * <p>{@code null} takes the way out away: a block whose whole content fits on
+     * screen has nothing to lead to, and a control that leads nowhere is a lie about
+     * what the app can do.
+     */
+    void setAction(CharSequence label, Runnable target) {
+        header.setAction(label, target);
+    }
+
+    /** Whether this group leads anywhere; the surface decides the wording. */
+    boolean hasAction() { return header.hasAction(); }
+
     /** The list, for a caller that fills it. */
     TrackList list() { return list; }
 
@@ -142,7 +156,21 @@ void setVisibleGroup(boolean value) {
         setVisibleGroup(true);
     }
 
-    /** Content, with its state settled. */
+    /**
+     * Nothing here, and the one action that can change that.
+     *
+     * <p>An empty block with no way forward is a dead end, and the block that offers
+     * the search when there is nothing saved yet is the difference between a screen
+     * that waits for the user and one that asks them.
+     */
+    void showAction(CharSequence text, CharSequence description, Icon icon, Runnable onRun) {
+        state.setActionHost(onRun::run);
+        state.setAction(icon, description);
+        state.show(SectionState.Phase.EMPTY, text, true);
+        setVisibleGroup(true);
+    }
+
+/** Content, with its state settled. */
     void showContent() {
         state.show(SectionState.Phase.CONTENT, "", false);
         setVisibleGroup(true);

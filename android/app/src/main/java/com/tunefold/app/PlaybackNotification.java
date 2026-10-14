@@ -151,43 +151,168 @@ final class PlaybackNotification {
         MediaTrack track = snapshot.currentTrack;
         String title = track == null ? "Tunefold" : track.title;
         String artist = track == null ? "" : attribution(track);
-        String text = diagnostics == null ? snapshot.state.label() : diagnostics;
+        boolean paused = snapshot.state == PlaybackState.PAUSED;
 
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(service, CHANNEL_ID)
                 : new Notification.Builder(service);
-        builder.setSmallIcon(android.R.drawable.ic_media_play)
+        builder.setSmallIcon(smallIcon())
                 .setContentTitle(title)
-                .setContentText(artist.isEmpty() ? text : artist + " · " + text)
+                // El estado va en su propia línea, no pegado al artista con un punto:
+                // el sistema reserva ese renglón para "en pausa" y para lo que el
+                // comando de voz o el relojongo tengan que decir, y mezclado con el
+                // nombre del artista quedaba ilegible en la pantalla de bloqueo.
+                .setContentText(artist)
+                .setSubText(snapshot.state.label())
+                .setCategory(Notification.CATEGORY_TRANSPORT)
+                // Sin esto la notificación se oculta en la pantalla de bloqueo y el
+                // sistema la expone como una más: los controles de medios disappears
+                // con ella, que es justo donde se usan.
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setOngoing(snapshot.state == PlaybackState.PLAYING)
                 .setOnlyAlertOnce(true)
                 .setShowWhen(false);
 
         Bitmap icon = notificationArtwork(snapshot);
         if (icon != null) builder.setLargeIcon(icon);
+        // El acento en la barra de estado y en el LED: la notificación de una pista
+        // con portada azul no puede ser el mismo gris de todas las demás.
+        builder.setColor(accentColor);
 
-        PendingIntent open = PendingIntent.getActivity(service, 0,
-                new Intent(service, MainActivity.class)
-                        .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
-                pendingIntentFlags());
-        builder.setContentIntent(open);
+        builder.setContentIntent(contentIntent());
+        // Swipe-away on a paused notification stops the service: without a delete
+        // intent the swipe is swallowed and the service stays foreground with
+        // nothing playing.
+        builder.setDeleteIntent(actionIntent(ACTION_STOP, 9));
 
         // Previous and Play/Pause flanking Next matches the platform convention.
-        builder.addAction(android.R.drawable.ic_media_previous,
-                "Previous", actionIntent(ACTION_PREVIOUS, 1));
-        if (snapshot.state == PlaybackState.PAUSED) {
-            builder.addAction(android.R.drawable.ic_media_play, "Play",
-                    actionIntent(ACTION_TOGGLE, 2));
-        } else {
-            builder.addAction(android.R.drawable.ic_media_pause, "Pause",
-                    actionIntent(ACTION_TOGGLE, 2));
-        }
-        builder.addAction(android.R.drawable.ic_media_next, "Next",
-                actionIntent(ACTION_NEXT, 3));
-        builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop",
-                actionIntent(ACTION_STOP, 4));
+        builder.addAction(action(notificationIcon(Icon.PREVIOUS), "Previous",
+                actionIntent(ACTION_PREVIOUS, 1)));
+        builder.addAction(action(notificationIcon(paused ? Icon.PLAY : Icon.PAUSE),
+                paused ? "Play" : "Pause", actionIntent(ACTION_TOGGLE, 2)));
+        builder.addAction(action(notificationIcon(Icon.NEXT), "Next",
+                actionIntent(ACTION_NEXT, 3)));
+        // Los controles grandes, para cuando el móvil está bloqueado: es la misma
+        // pantalla del reproductor, puesta delante del candado.
+        builder.addAction(action(notificationIcon(Icon.REMOTE), "Controls",
+                PendingIntent.getActivity(service, 10,
+                        new Intent(service, LockScreenControlsActivity.class),
+                        pendingIntentFlags())));
+
+        // MediaStyle es lo que convierte esto en una notificación de medios: la
+        //趟 que dibuja el sistema en la pantalla de bloqueo, en el panel rápido, en
+        // el coche y en los auriculares. Con addAction a secas era una notificación
+        // normal con tres botones y no aparecía en ninguno de esos sitios.
+        builder.setStyle(new Notification.MediaStyle()
+                .setMediaSession(session.getSessionToken())
+                // Expandida se ven los cuatro; en la versión corta caben tres y el
+                // que se quita es el de los controles grandes, que en pantalla
+                // bloqueada no se puede tocar sin desbloquear.
+                .setShowActionsInCompactView(0, 1, 2));
 
         return builder.build();
+    }
+
+    /**
+     * Qué abre la tarjeta de medios.
+     *
+     * <p>Con la pantalla encendida, la app: quien toca la notificación quiere el
+     * reproductor y todo lo que hay alrededor. Con la pantalla apagada, los controles
+     * sobre el candado: esa tarjeta es lo único que se puede tocar sin desbloquear, y
+     * abrir la app entera obligaría a autenticarse para cambiar de canción — que es
+     * justo lo que una pantalla de bloqueo no debería obligar a hacer.
+     *
+     * <p>Se decide al publicar, no al tocar: el sistema arma el intent cuando recibe
+     * la notificación y no vuelve a preguntarle.
+     */
+    private PendingIntent contentIntent() {
+        boolean interactive = service.getSystemService(android.os.PowerManager.class) != null
+                && service.getSystemService(android.os.PowerManager.class).isInteractive();
+        Intent target = interactive
+                ? new Intent(service, MainActivity.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                : new Intent(service, LockScreenControlsActivity.class);
+        return PendingIntent.getActivity(service, interactive ? 0 : 1, target,
+                pendingIntentFlags());
+    }
+
+    /**
+     * Una acción con glifo propio.
+     *
+     * <p>El atajo {@code Notification.Builder.addAction(Icon, …)} no existe en el
+     * {@code android.jar} con el que compila este proyecto, y el camino que sí existe
+     * —un id de recurso— obligaría a crear la carpeta {@code res/} que la app no
+     * tiene. El constructor de {@code Action} acepta el icono dibujado, que es
+     * justo lo que hace falta para que el botón de la notificación tenga el mismo
+     * glifo que el reproductor.
+     */
+    private static Notification.Action action(android.graphics.drawable.Icon icon,
+            CharSequence title, PendingIntent intent) {
+        return new Notification.Action.Builder(icon, title, intent).build();
+    }
+
+    /**
+     * El icono pequeño, dibujado una vez.
+     *
+     * <p>El del framework era un triángulo del tema del sistema: al lado de una
+     * portada en color parecía una notificación de otra aplicación. El sistema exige
+     * que sea una silueta blanca, así que va el glifo de barras en blanco y plano,
+     * con la misma traza que el reproductor.
+     */
+    private android.graphics.drawable.Icon smallIcon() {
+        if (smallIcon == null) {
+            IconDrawable drawable = new IconDrawable(Icon.DIAGNOSTICS);
+            drawable.setColor(android.graphics.Color.WHITE);
+            int side = DesignTokens.dp(DesignTokens.ICON_SIZE_SMALL);
+            android.graphics.Bitmap bitmap = android.graphics.Bitmap.createBitmap(side, side,
+                    android.graphics.Bitmap.Config.ARGB_8888);
+            drawable.setBounds(0, 0, side, side);
+            drawable.draw(new android.graphics.Canvas(bitmap));
+            smallIcon = android.graphics.drawable.Icon.createWithBitmap(bitmap);
+        }
+        return smallIcon;
+    }
+
+    private android.graphics.drawable.Icon smallIcon;
+
+    /**
+     * El acento de la barra de estado.
+     *
+     * <p>El de la app y no el del sistema: el servicio no ve la portada —la Activity
+     * es quien la decodifica— y cruzar ese dato para pintar un píxel del color de la
+     * barra de estado no compensa una dependencia nueva entre las dos mitades.
+     */
+    private final int accentColor = DesignTokens.Palette.ACCENT;
+
+    /** Caché por icono: el mismo glifo se pide en cada reconstrucción. */
+    private final java.util.EnumMap<Icon, android.graphics.drawable.Icon> actionIcons =
+            new java.util.EnumMap<>(Icon.class);
+
+    /**
+     * Los iconos de la notificación son los de la app.
+     *
+     * <p>Los del framework dibujaban triángulos amarillos de otra época al lado de
+     * una portada en color, y en la pantalla de bloqueo esa mezcla se leía como dos
+     * cosas distintas. El mismo glifo que en el reproductor, con el mismo trazo.
+     *
+     * <p>Se rasterizan una vez por icono y se recordan: la notificación se reconstruye
+     * en cada tick del servicio, y dibujar un icono nuevo en cada una sería una
+     * asignación por tick para siempre.
+     */
+    private android.graphics.drawable.Icon notificationIcon(Icon icon) {
+        android.graphics.drawable.Icon cached = actionIcons.get(icon);
+        if (cached != null) return cached;
+        int side = DesignTokens.dp(DesignTokens.ICON_SIZE_MEDIUM);
+        IconDrawable drawable = new IconDrawable(icon);
+        drawable.setColor(android.graphics.Color.WHITE);
+        android.graphics.Bitmap bitmap = android.graphics.Bitmap.createBitmap(side, side,
+                android.graphics.Bitmap.Config.ARGB_8888);
+        drawable.setBounds(0, 0, side, side);
+        drawable.draw(new android.graphics.Canvas(bitmap));
+        android.graphics.drawable.Icon made =
+                android.graphics.drawable.Icon.createWithBitmap(bitmap);
+        actionIcons.put(icon, made);
+        return made;
     }
 
     /**
@@ -259,6 +384,11 @@ final class PlaybackNotification {
                 NotificationManager.IMPORTANCE_LOW);
         channel.setDescription("Tunefold audio playback");
         channel.setShowBadge(false);
+        // Sin sonido ni vibración: el canal de reproducción no es un aviso, es la
+        // línea de estado de lo que ya se está oyendo. Con sonido, cambiar de pista
+        // —que pasa cada tres minutos— hacía sonar el móvil con el volumen al alto.
+        channel.setSound(null, null);
+        channel.enableVibration(false);
         notifications.createNotificationChannel(channel);
     }
 

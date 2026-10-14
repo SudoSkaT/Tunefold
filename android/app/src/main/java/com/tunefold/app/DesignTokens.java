@@ -220,6 +220,15 @@ final class DesignTokens {
     static final int BOTTOM_NAV_SURFACE = Palette.SURFACE_BASE;
     /** Caption size under each destination glyph, in {@code sp}. */
     static final float NAV_CAPTION_SIZE = 10f;
+    /**
+     * Smallest a destination caption may shrink to, in {@code sp}.
+     *
+     * <p>Four destinations across 360dp is ninety each, and the longest word in the
+     * set does not fit at ten. Rather than truncating a navigation label — which reads
+     * as a broken screen rather than as a short word — the caption takes the largest
+     * size in this range that fits its slot, on any font scale and in any locale.
+     */
+    static final float NAV_CAPTION_MIN_SIZE_SP = 8f;
 
     // ---------------------------------------------------------- mini player
 
@@ -258,7 +267,13 @@ final class DesignTokens {
      * de la pista (eso lo cuenta la posición), sólo mostrar el sonido de ahora, y
      * el sitio que se le devuelve lo gana el aire y los controles.
      */
-    static final float SOUNDBARS_HEIGHT = 56f;
+    /**
+     * Alto de las barras en una ventana normal, en {@code dp}.
+     *
+     * <p>Medio carril, no dos: la figura es una sola fila y lo que se freed va a la
+     * letra, que informa más que un segundo canal dibujado.
+     */
+    static final float SOUNDBARS_HEIGHT = 36f;
     /**
      * Alto de las barras en una ventana corta, en {@code dp}.
      *
@@ -266,7 +281,7 @@ final class DesignTokens {
      * transporte, y el transporte no se toca nunca: bajan las barras. No es una escala
      * de todo, es el bloque que puede ceder su alto sin dejar de decir lo que dice.
      */
-    static final float SOUNDBARS_HEIGHT_COMPACT = 34f;
+    static final float SOUNDBARS_HEIGHT_COMPACT = 26f;
     /** Separación entre el carril izquierdo y el derecho, en {@code dp}. */
     static final float SOUNDBARS_LANE_GAP = SPACE_3;
     /** Paso de una barra a la siguiente, en {@code dp}. */
@@ -344,6 +359,16 @@ final class DesignTokens {
     static final float TYPE_LABEL_SIZE = 13f;
     /** Timestamps and small state. */
     static final float TYPE_CAPTION_SIZE = 11f;
+
+    /**
+     * Lo que se ve donde la letra calla.
+     *
+     * <p>Un LRC real tiene líneas vacías entre frases y en los instrumentales. Dejar
+     * ahí la última frase escrita es decir que se está cantando algo que ya terminó, y
+     * vaciar el espacio en cada corte parpadea. Una nota apagada dice las dos cosas:
+     * aquí no hay letra, pero la canción sigue sonando.
+     */
+    static final String LYRICS_SILENCE = "\u266a";
     /** Diagnostics body; fixed pitch so columns line up. */
     static final float TYPE_MONOSPACE_SIZE = 11f;
 

@@ -1,9 +1,11 @@
 # Tunefold Android runtime host
 
 Phase 2 (Now Playing, artwork, live sound bars) is documented in
-[`NOW_PLAYING_REPORT.md`](NOW_PLAYING_REPORT.md), and **Phase 4 (navigation,
-Home, Search, library and lists)** in [`NAVIGATION_REPORT.md`](NAVIGATION_REPORT.md):
-what was measured, what is a bound, and what still needs a device.
+[`NOW_PLAYING_REPORT.md`](NOW_PLAYING_REPORT.md), **Phase 4 (navigation,
+Home, Search, library and lists)** in [`NAVIGATION_REPORT.md`](NAVIGATION_REPORT.md)
+and **Phase 5 (responsive layout, mini player, adaptive composition)** in
+[`LAYOUT_REPORT.md`](LAYOUT_REPORT.md): what was measured, what is a bound, and what
+still needs a device.
 
 This is a minimal test host for the Rust Android playback engine. Playback is
 owned by `ForegroundPlaybackService`; `MainActivity` binds to its
@@ -113,6 +115,39 @@ buffering (the shape survives, the state dot shows three segments), rotation (th
 shape is rebuilt, not re-decoded), autoplay, and a download while playing (the
 download control's arc moves; the status line keeps saying "Playing").
 
+## Validating the layout on a device
+
+Two scripts walk the surfaces and leave evidence, instead of asking a reviewer to
+look at six screens and remember what looked wrong:
+
+```sh
+tools/measure_layout.sh <label>   # startup, idle frames, navigation, rotation, memory
+tools/validate_layout.sh <dir>    # 4 windows x 2 orientations, screenshots + audit
+tools/validate_states.sh <dir>    # rotation/navigation while playing, buffering, downloading
+```
+
+`validate_layout.sh` emulates the windows it cannot hold (`wm size` + `wm density`):
+a large phone, a small phone, a tablet and a large-screen tablet, each in both
+orientations, capturing the list, the mini player and the full player. For every one
+of them it audits the accessibility tree against the window and reports the nodes
+that fall outside it or that are drawn with no area — which is how "the transport is
+off the bottom of a landscape phone" becomes a line of output instead of a memory.
+
+`validate_states.sh` covers what a screenshot cannot: rotation during playback,
+during a resolve and during a download; navigation during playback; and the player
+across a rotation. It asserts the Activity is never recreated, nothing lands in the
+crash buffer, the mini player survives, and the transport stays reachable in both
+orientations.
+
+Each configuration change logs one line:
+
+```text
+I Tunefold: window 1080x2232 @3.0 -> 360x744/360/0P gutter=20dp column=full cover=360dp space
+```
+
+That is the window the app read and the rules it derived from it — the difference
+between a layout that "looked wrong on that tablet" and a number.
+
 ## Interface
 
 Now Playing is the primary surface, and its hierarchy is fixed: **artwork,
@@ -135,7 +170,14 @@ window, never from a fixed dimension:
   `ARTWORK_PORTRAIT_HEIGHT_RATIO` (42%) of the window height so a very tall phone
   cannot push every control below the fold;
 * **landscape** — the cover sits beside the metadata and controls, at 42% of the
-  width and at most 88% of the height.
+  width and at most 88% of the height, and it always yields at least
+  `LayoutRules.DETAILS_MIN_DP` to the region beside it: the cover is computed
+  first, so without that floor it could take the whole column and leave the
+  transport nowhere to live.
+
+Both numbers come out of `LayoutRules.artworkSideDp`, which also keeps the cover
+inside `[ARTWORK_MIN, artworkMaxDp]` on every screen, and the whole column inside
+`LayoutRules.CONTENT_MAX_DP` once the window is a tablet's.
 
 Covers are decoded **at the size they are drawn at** (capped at
 `ARTWORK_DECODE_MAX_PX`, 640 px ≈ 1.6 MB as ARGB_8888), on the artwork worker,
@@ -300,7 +342,26 @@ reachable through a parked row.
 views behind a bottom bar, and the player is a view that covers them. A switch is a
 visibility change, so no navigation recreates the Activity and no destination loses
 what the user did in it. `MiniPlayer` is fed only by `PlaybackSession.Snapshot` and
-holds no playback state of its own.
+holds no playback state of its own. A destination's glyph is **not a control**:
+`IconButton.asGlyph()` makes it invisible to touch entirely, because a long-clickable
+child keeps the whole gesture and the destination stops responding exactly where the
+finger lands (Phase 5, §9 of the layout report).
+
+**Adaptive layout.** One class decides everything about a window: `LayoutRules`
+answers, in pure `dp` arithmetic with no `View` and no `Resources`, which kind of
+window this is, how large the cover may be, how wide the column may get, and whether
+the window is short enough that the sound bars should give up height. The screen
+reads the window in exactly one place and hands the result to the surfaces that
+care. Touch targets, type and control sizes never move: a tablet gets more air, a
+bigger cover and a wider column, and nothing else.
+
+| Concern | Owner |
+| --- | --- |
+| The rules that turn a window into a layout | `LayoutRules` |
+| Applying them to the player, once per change | `NowPlayingView.setWindow` |
+| Applying them to the content column | `MainActivity.applyWindow` |
+| The same content is not a new list | `TrackList.sameTracks` |
+| Whether L1K3D has changed since the last render | `Library.revision` |
 
 **A cover is not one thing.** The player's covers get two slots in the decoded cache
 (1.6 MB each); list thumbnails get a separate 4 MB byte budget, about fifty of them

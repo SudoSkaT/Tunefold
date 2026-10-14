@@ -21,3 +21,5 @@ tunefold-*
 platforms/
 build/
 .gradle/
+# Rutas locales del SDK: son de esta máquina, no del proyecto.
+local.properties

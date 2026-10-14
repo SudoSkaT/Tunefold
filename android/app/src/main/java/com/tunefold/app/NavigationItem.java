@@ -55,6 +55,9 @@ final class NavigationItem extends LinearLayout implements ArtworkTheme.AccentLi
         // The slot is the target; the inner button is only a glyph. Without this the
         // button reserves a full 56dp height and pushes the caption out of the slot.
         icon.asGlyph();
+        // The long-press word belongs to the slot, which is what a finger actually
+        // presses; the glyph is a picture inside it.
+        setTooltipText(label);
         icon.setAction(glyph, label);
         int iconSide = DesignTokens.dp(DesignTokens.ICON_SIZE_SMALL);
         LayoutParams iconParams = new LayoutParams(iconSide, iconSide);
@@ -62,14 +65,26 @@ final class NavigationItem extends LinearLayout implements ArtworkTheme.AccentLi
 
         caption = new TextView(context);
         caption.setText(label);
-        caption.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_LABEL_SIZE);
+        // El pie usa el tamaño que existe para él, no el de una etiqueta de cuerpo:
+        // cuatro slots en 360dp son 90dp cada uno y "Descargadas" no cabe en 90dp a
+        // 13sp. El tamaño se ajusta solo dentro de su propio rango en vez de
+        // recortarse, porque un pie de navegación cortado no se lee como una palabra
+        // más corta: se lee como un texto roto.
+        caption.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.NAV_CAPTION_SIZE);
+        // Medido: el ajuste automático no cuesta arranque (986 ms con él, 986 ms
+        // sin él) y es lo único que mantiene el pie dentro de su hueco con una
+        // escala de fuente grande o una etiqueta más larga.
+        caption.setAutoSizeTextTypeUniformWithConfiguration(
+                Math.round(DesignTokens.NAV_CAPTION_MIN_SIZE_SP),
+                Math.round(DesignTokens.NAV_CAPTION_SIZE),
+                1, TypedValue.COMPLEX_UNIT_SP);
         caption.setGravity(Gravity.CENTER);
         caption.setLetterSpacing(DesignTokens.TYPE_LABEL_TRACKING);
         caption.setMaxLines(1);
         caption.setEllipsize(TextUtils.TruncateAt.END);
         caption.setIncludeFontPadding(false);
         caption.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
-        LayoutParams captionParams = new LayoutParams(LayoutParams.WRAP_CONTENT,
+        LayoutParams captionParams = new LayoutParams(LayoutParams.MATCH_PARENT,
                 LayoutParams.WRAP_CONTENT);
         captionParams.topMargin = DesignTokens.dp(DesignTokens.SPACE_1);
         addView(caption, captionParams);

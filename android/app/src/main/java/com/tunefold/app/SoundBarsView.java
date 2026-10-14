@@ -43,13 +43,24 @@ import android.view.View;
  */
 final class SoundBarsView extends View implements ArtworkTheme.AccentListener {
 
-    private static final int LANES = 2;
+    /**
+     * Cuántos carriles se dibujan: <b>uno</b>.
+     *
+     * <p>Dos, que es lo que había: un canal arriba y otro abajo. El argumento para
+     * los dos era que una visualización estéreo con un solo color se lee como el mismo
+     * dibujo repetido, y eso sigue siendo cierto — por eso los dos carriles usan dos
+     * tintes derivados de la portada. El argumento en contra pesó más: dos filas en
+     * posiciones distintas parecen dos elementos descolocados en lugar de una figura,
+     * y la mitad de la altura que ocupaban era más valiosa mostrando la letra.
+     *
+     * <p>Un carril no es una barra menos: es la envolvente de <em>ambos</em> canales,
+     * así que sigue moviéndose con todo lo que se oye.
+     */
+    private static final int LANES = 1;
 
     /** Un trazo vertical por barra; los extremos redondeados salen del trazo. */
-    private final Paint leftPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint rightPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Path left = new Path();
-    private final Path right = new Path();
+    private final Paint barPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Path bars = new Path();
 
     private LiveAudioBars source;
     private int paintedBars;
@@ -68,10 +79,8 @@ final class SoundBarsView extends View implements ArtworkTheme.AccentListener {
     SoundBarsView(Context context) {
         super(context);
         DesignTokens.init(context);
-        leftPaint.setStyle(Paint.Style.STROKE);
-        leftPaint.setStrokeCap(Paint.Cap.ROUND);
-        rightPaint.setStyle(Paint.Style.STROKE);
-        rightPaint.setStrokeCap(Paint.Cap.ROUND);
+        barPaint.setStyle(Paint.Style.STROKE);
+        barPaint.setStrokeCap(Paint.Cap.ROUND);
         setContentDescription("Live stereo level");
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
         paintColors(ArtworkTheme.barsPrimary(), ArtworkTheme.barsSecondary());
@@ -91,8 +100,7 @@ final class SoundBarsView extends View implements ArtworkTheme.AccentListener {
     void attach(LiveAudioBars value) {
         source = value;
         if (value != null) value.clear();
-        left.rewind();
-        right.rewind();
+        bars.rewind();
         paintedBars = 0;
         invalidate();
     }
@@ -115,8 +123,7 @@ final class SoundBarsView extends View implements ArtworkTheme.AccentListener {
             // queda, congelado, en lugar de parpadear a vacío.
             return false;
         }
-        int wanted = LiveAudioBars.barsFor(getWidth(),
-                DesignTokens.dp(DesignTokens.SOUNDBARS_BAR_PITCH));
+        int wanted = barsThatFit();
         wantedBars = wanted;
         if (!current.poll(wanted)) return false;
         build(current);
@@ -129,8 +136,7 @@ final class SoundBarsView extends View implements ArtworkTheme.AccentListener {
         // La geometría es una medida por tamaño, no una por fotograma: se calcula
         // aquí y `build()` la usa tal cual.
         measureGeometry();
-        int wanted = LiveAudioBars.barsFor(width,
-                DesignTokens.dp(DesignTokens.SOUNDBARS_BAR_PITCH));
+        int wanted = barsThatFit();
         if (wanted == wantedBars && paintedBars > 0) {
             // Mismo número de barras, otro ancho: la figura se recoloca sobre los
             // valores que ya están en memoria. Ni una lectura al motor, ni una
@@ -145,55 +151,73 @@ final class SoundBarsView extends View implements ArtworkTheme.AccentListener {
         if (source != null) refresh(true);
     }
 
-    /** Mide el alto de un carril y reparte el ancho en pasos de barra. */
+/**
+ * Mide el alto de un carril y reparte el ancho en pasos de barra.
+ *
+ * <p>El paso no es el del token cuando el ancho no lo permite: ver
+ * {@link LiveAudioBars#pitchFor}. Se calcula aquí, una vez por tamaño, porque es
+ * geometría y la geometría no se recalcula veinte veces por segundo.
+ */
     private void measureGeometry() {
-        int gap = DesignTokens.dp(DesignTokens.SOUNDBARS_LANE_GAP);
-        laneHeight = Math.max(1, (getHeight() - gap) / LANES);
-        barPitch = DesignTokens.dp(DesignTokens.SOUNDBARS_BAR_PITCH);
+        // Todo el alto es del carril. El hueco entre carriles dejó de tener sentido
+        // cuando sólo hay uno, y descontarlo aquí robaba una cuarta parte de una banda
+        // de 36dp: la barra crecía hacia dentro mientras el carril se quedaba corto.
+        laneHeight = Math.max(1, getHeight() / LANES);
+        barPitch = LiveAudioBars.pitchFor(getWidth(),
+                DesignTokens.dp(DesignTokens.SOUNDBARS_BAR_PITCH));
         barWidth = Math.max(1, barPitch - DesignTokens.dp(DesignTokens.SOUNDBARS_BAR_GAP));
-        leftPaint.setStrokeWidth(barWidth);
-        rightPaint.setStrokeWidth(barWidth);
+        barPaint.setStrokeWidth(barWidth);
+    }
+
+    /** Cuántas barras caben ahora mismo en el ancho actual. */
+    private int barsThatFit() {
+        return LiveAudioBars.barsFor(getWidth(), LiveAudioBars.pitchFor(getWidth(),
+                DesignTokens.dp(DesignTokens.SOUNDBARS_BAR_PITCH)));
     }
 
     /**
-     * Convierte las barras medidas en dos trazados, ya colocados.
+     * Convierte las barras medidas en un trazado, ya colocado.
      *
      * <p>Un segmento vertical por barra, centrado en su paso. La escala convierte
-     * amplitud normalizada a píxeles contra el alto del carril, y un canal mudo se
-     * dibuja como una marca mínima en el eje en vez de desaparecer: que un canal
-     * esté en silencio es información, no la ausencia de información.
+     * amplitud normalizada a píxeles contra el alto del carril, y un silencio se dibuja
+     * como una marca mínima en el eje en vez de desaparecer: que no suene nada es
+     * información, no la ausencia de información.
+     *
+     * <p>Con un solo carril cada barra es la <b>envolvente de los dos canales</b>: el
+     * mínimo más bajo y el máximo más alto de la izquierda y la derecha. Dibujar un
+     * canal y tirar el otro sería media información; promediarlos sería media
+     * dinámica.
      */
     private void build(LiveAudioBars current) {
         if (laneHeight <= 0) measureGeometry();
-        left.rewind();
-        right.rewind();
+        bars.rewind();
         peak = 0f;
         int count = Math.min(current.bars(), LiveAudioBars.MAX_BARS);
         float[] data = current.values();
-        int gap = DesignTokens.dp(DesignTokens.SOUNDBARS_LANE_GAP);
         float scale = laneHeight;
-        for (int lane = 0; lane < LANES; lane++) {
-            Path path = lane == 0 ? left : right;
-            float middle = (lane * (laneHeight + gap)) + laneHeight / 2f;
-            for (int bar = 0; bar < count; bar++) {
-                int index = LiveAudioBars.BAR_VALUES * bar + lane * 2;
-                float x = (bar + 0.5f) * barPitch;
-                // Raíz: una pista tranquila es toda la música de quien la escucha, y
-                // con escala lineal sus barras no se moverían. La raíz expande los
-                // valores bajos sin tocar los altos, así que la dinámica se sigue
-                // viendo y ninguna barra llega a salirse del carril.
-                float top = middle - expand(data[index + 1]) * scale;
-                float bottom = middle - expand(data[index]) * scale;
-                if (data[index + 1] > peak) peak = data[index + 1];
-                if (-data[index] > peak) peak = -data[index];
-                if (top - bottom < 1f) {
-                    float centre = (top + bottom) * 0.5f;
-                    top = centre - 0.5f;
-                    bottom = centre + 0.5f;
-                }
-                path.moveTo(x, top);
-                path.lineTo(x, bottom);
+        float middle = laneHeight / 2f;
+        for (int bar = 0; bar < count; bar++) {
+            int index = LiveAudioBars.BAR_VALUES * bar;
+            // Los dos canales se leen en la misma barra: mínimo y máximo de la
+            // envolvente de izquierda y derecha.
+            float low = Math.min(data[index], data[index + 2]);
+            float high = Math.max(data[index + 1], data[index + 3]);
+            float x = (bar + 0.5f) * barPitch;
+            // Raíz: una pista tranquila es toda la música de quien la escucha, y
+            // con escala lineal sus barras no se moverían. La raíz expande los
+            // valores bajos sin tocar los altos, así que la dinámica se sigue
+            // viendo y ninguna barra llega a salirse del carril.
+            float top = middle - expand(high) * scale;
+            float bottom = middle - expand(low) * scale;
+            if (high > peak) peak = high;
+            if (-low > peak) peak = -low;
+            if (top - bottom < 1f) {
+                float centre = (top + bottom) * 0.5f;
+                top = centre - 0.5f;
+                bottom = centre + 0.5f;
             }
+            bars.moveTo(x, top);
+            bars.lineTo(x, bottom);
         }
         paintedBars = count;
     }
@@ -211,8 +235,7 @@ final class SoundBarsView extends View implements ArtworkTheme.AccentListener {
         repaints++;
         long started = SystemClock.elapsedRealtimeNanos();
         if (paintedBars > 0) {
-            canvas.drawPath(left, leftPaint);
-            canvas.drawPath(right, rightPaint);
+            canvas.drawPath(bars, barPaint);
         }
         lastDrawNanos = SystemClock.elapsedRealtimeNanos() - started;
     }
@@ -224,15 +247,15 @@ final class SoundBarsView extends View implements ArtworkTheme.AccentListener {
     }
 
     @Override public void onPaletteChanged(int barsPrimary, int barsSecondary) {
-        // La figura no cambia, el color sí: un invalidate y nada más.
-        leftPaint.setColor(barsPrimary);
-        rightPaint.setColor(barsSecondary);
+        // La figura no cambia, el color sí: un invalidate y nada más. Con un solo
+        // carril la tinta es la del canal dominante; la segunda se queda para cuando
+        // las barras vuelvan a ser dos.
+        barPaint.setColor(barsPrimary);
         invalidate();
     }
 
     private void paintColors(int barsPrimary, int barsSecondary) {
-        leftPaint.setColor(barsPrimary);
-        rightPaint.setColor(barsSecondary);
+        barPaint.setColor(barsPrimary);
     }
 
     /** Una línea para el panel de diagnóstico. */

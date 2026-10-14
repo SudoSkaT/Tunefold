@@ -53,6 +53,9 @@ final class SectionState extends LinearLayout {
     private CharSequence renderedText = "";
     private CharSequence renderedAction = "";
     private boolean renderedActionVisible;
+    /** What the one action offers; a retry is the default, not the only option. */
+    private Icon actionIcon = Icon.RETRY;
+    private CharSequence actionDescription = "Try again";
 
     SectionState(Context context, View content) {
         super(context);
@@ -72,7 +75,8 @@ final class SectionState extends LinearLayout {
         addView(message, messageParams);
 
         action = new IconButton(context);
-        action.setAction(Icon.RETRY, "Try again");
+        // No glyph until one is asked for: `setAction` gives this button its face,
+        // and a section that never offers its action never needs one.
         action.setVisibility(View.GONE);
         action.setOnClickListener(view -> {
             if (actionHost != null) actionHost.onSectionAction();
@@ -91,6 +95,24 @@ final class SectionState extends LinearLayout {
 
     /** The phase last shown, for the tests and for the surfaces that ask. */
     Phase phase() { return phase; }
+
+    /**
+     * What the action button is, for a state whose action is not a retry.
+     *
+     * <p>"No tracks, and here is the one thing you can do about it" is the same
+     * shape as "it failed, try again", so it is the same control wearing different
+     * words — and a button labelled "try again" next to a block that has nothing to
+     * retry is a control that lies about what it does.
+     */
+    void setAction(Icon icon, CharSequence description) {
+        if (icon == null) icon = Icon.RETRY;
+        if (description == null || description.length() == 0) description = "Try again";
+        if (icon == actionIcon && TextUtils.equals(description, actionDescription)) return;
+        actionIcon = icon;
+        actionDescription = description;
+        action.setAction(icon, description);
+        action.setContentDescription(description);
+    }
 
     /** The phase a section is in, as a pure function of what is known. */
     static Phase phaseOf(boolean loading, boolean failed, int count) {
@@ -120,7 +142,7 @@ final class SectionState extends LinearLayout {
             renderedActionVisible = retryable;
             action.setVisibility(retryable ? View.VISIBLE : View.GONE);
         }
-        CharSequence described = retryable ? "Try again" : "";
+        CharSequence described = retryable ? actionDescription : "";
         if (!TextUtils.equals(described, renderedAction)) {
             renderedAction = described;
             action.setContentDescription(renderedAction);

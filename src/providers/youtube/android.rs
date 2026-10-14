@@ -15,7 +15,10 @@ use tokio::runtime::Runtime;
 
 use crate::api::ComposedMedia;
 use crate::catalog::CatalogError;
-use crate::domain::{source::Source, track::Track};
+use crate::domain::artist::Artist;
+use crate::domain::lyrics::SyncLyrics;
+use crate::domain::source::Source;
+use crate::domain::track::Track;
 use crate::infrastructure::config::FeatureFlags;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -193,6 +196,122 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_resolveYoutubeUrl(
         super::link::LinkKind::Invalid => {
             return return_json(&mut env, failure("invalid_url", "Unsupported YouTube URL"))
         }
+    };
+    let result = (|| {
+        let media = MEDIA.get().ok_or_else(|| {
+            (
+                "provider_unavailable",
+                "provider is not initialized".to_string(),
+            )
+        })?;
+        let provider = media.catalog.get(Source::YouTube).ok_or_else(|| {
+            (
+                "provider_unavailable",
+                "YouTube catalog is disabled".to_string(),
+            )
+        })?;
+        runtime().block_on(async {
+            provider
+                .get_track(&video_id)
+                .await
+                .map_err(|error| (catalog_error_category(&error), error.to_string()))
+        })
+    })();
+    match result {
+        Ok(track) => return_json(&mut env, encode_tracks(vec![track])),
+        Err((category, message)) => return_json(&mut env, failure(category, message)),
+    }
+}
+
+/// Synchronised lyrics for a track the caller only knows by its own words.
+///
+/// Goes through LRCLIB directly, which is the point: the karaoke source is not a
+/// streaming provider and must keep working in binaries that compile none. The LRC
+/// is parsed by the same [`SyncLyrics`] the console uses, and returned as timed
+/// lines so the caller can pick the active one per position without asking again.
+///
+/// Returns `{"ok": false}` when there is no synchronised lyric: a plain lyric is
+/// never mixed in as an alternative, because a line that is not timed is a line
+/// that cannot be the line being sung.
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_syncedLyrics(
+    mut env: JNIEnv,
+    _class: JClass,
+    title: JString,
+    artist: JString,
+    duration_ms: jint,
+) -> jstring {
+    let title = match read_string(&mut env, &title) {
+        Ok(value) => value,
+        Err(error) => return return_json(&mut env, failure("invalid_request", error)),
+    };
+    let artist = match read_string(&mut env, &artist) {
+        Ok(value) => value,
+        Err(error) => return return_json(&mut env, failure("invalid_request", error)),
+    };
+    let result = (|| {
+        let mut track = Track::new(
+            title.trim().to_string(),
+            vec![Artist::new(artist.trim().to_string(), None, None, None)],
+            Source::YouTube,
+        );
+        if duration_ms > 0 {
+            track.duration = Some(std::time::Duration::from_millis(duration_ms as u64));
+        }
+        let client = crate::providers::lyrics::lrclib_client();
+        let lrc = runtime()
+            .block_on(crate::providers::lyrics::fetch_lrclib_lyrics(
+                &client, &track,
+            ))
+            .ok_or_else(|| {
+                (
+                    "lyrics_unavailable",
+                    "No synchronised lyrics were found".to_string(),
+                )
+            })?;
+        let parsed = SyncLyrics::parse(&lrc);
+        if parsed.is_empty() {
+            return Err((
+                "lyrics_unavailable",
+                "The lyric has no timed line".to_string(),
+            ));
+        }
+        let lines: Vec<Value> = parsed
+            .lines
+            .iter()
+            .map(|line| {
+                json!({
+                    "t": line.time.as_millis() as i64,
+                    "s": line.text,
+                })
+            })
+            .collect();
+        Ok(json!({"ok": true, "lines": lines}))
+    })();
+    match result {
+        Ok(value) => return_json(&mut env, value),
+        Err((category, message)) => return_json(&mut env, failure(category, message)),
+    }
+}
+
+/// Metadata for a video the caller only holds an identity for.
+///
+/// `resolveYoutubeUrl` needs a link to parse; a remembered track has only the
+/// provider's own id for it, and that is all `get_track` asks for. This is the
+/// missing half for anything saved before its metadata was kept: L1K3D holds
+/// identities, `Descargadas` holds files, and neither holds a cover.
+///
+/// The id is the provider's, so this stays inside this module: nothing outside
+/// `providers/youtube` learns what a YouTube identity looks like.
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_metadataYoutube(
+    mut env: JNIEnv,
+    _class: JClass,
+    video_id: JString,
+) -> jstring {
+    let video_id = match read_string(&mut env, &video_id) {
+        Ok(id) if !id.trim().is_empty() => id,
+        _ => return return_json(&mut env, failure("invalid_request", "video id is empty")),
     };
     let result = (|| {
         let media = MEDIA.get().ok_or_else(|| {

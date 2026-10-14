@@ -120,4 +120,27 @@ final class LiveAudioBars {
         if (count < 8) return widthPx > 0 ? 8 : 0;
         return Math.min(count, MAX_BARS);
     }
+
+    /**
+     * El paso real para un ancho dado.
+     *
+     * <p>El paso que se quiere es un mínimo de legibilidad, no un contrato: en una
+     * pantalla ancha cabrían cientos de barras al paso previsto y eso no cabe en
+     * {@link #MAX_BARS}. Así que el paso crece lo justo para que las barras que sí
+     * caben <em>llenen</em> el ancho en vez de agruparse en una esquina.
+     *
+     * <p>Sin esto, girar un móvil a una tableta dejaba la forma de onda dibujada a
+     * un tercio de su región: el mismo número de barras, apiñadas a la izquierda.
+     *
+     * @param widthPx        ancho disponible
+     * @param desiredPitchPx el paso que se-usaría si todo cabía
+     * @return el paso efectivo, nunca menor de uno
+     */
+    static int pitchFor(int widthPx, int desiredPitchPx) {
+        int floor = Math.max(1, desiredPitchPx);
+        if (widthPx <= 0) return floor;
+        // Tope por ancho: con este paso caben como mucho MAX_BARS.
+        int forWidth = (widthPx + MAX_BARS - 1) / MAX_BARS;
+        return Math.max(floor, forWidth);
+    }
 }

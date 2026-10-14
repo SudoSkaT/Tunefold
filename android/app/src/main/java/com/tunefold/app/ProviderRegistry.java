@@ -151,6 +151,67 @@ final class ProviderRegistry implements AutoCloseable {
     LocalMediaStore localMediaStore() { return localMediaStore; }
 
     /**
+     * Synchronised lyrics for a track, parsed once per track.
+     *
+     * <p>The provider worker, because it is a network round trip and the main thread
+     * must not spend eight seconds' worth of waiting. Nothing is cached here: the
+     * session owns one lyric per identity for the life of the process, and a second
+     * cache would be a second copy of the same answer.
+     */
+    void syncedLyrics(MediaTrack track, Callback<LyricTrack> callback) {
+        if (track == null || track.title == null || track.title.trim().isEmpty()) {
+            deliver(callback, null, "Track has no title to look lyrics up by");
+            return;
+        }
+        String who = !track.artist.isEmpty() ? track.artist : track.channel;
+        worker.execute(() -> {
+            long started = android.os.SystemClock.elapsedRealtimeNanos();
+            try {
+                String response = TunefoldBridge.syncedLyrics(track.title.trim(), who,
+                        (int) Math.max(0L, track.durationMs));
+                LyricTrack parsed = LyricTrack.parse(identityOf(track), response);
+                if (parsed.isEmpty()) {
+                    android.util.Log.i("TunefoldPerf", "event=LYRICS_NONE id=" + identityOf(track)
+                            + " query=\"" + track.title.trim() + "\" / \"" + who + "\" / "
+                            + track.durationMs + "ms bytes="
+                            + (response == null ? -1 : response.length())
+                            + " head=" + (response == null || response.isEmpty()
+                                    ? "<vacio>" : response.substring(0, Math.min(90, response.length()))));
+                    deliver(callback, null, "No synchronised lyrics");
+                    return;
+                }
+                android.util.Log.i("TunefoldPerf", "event=LYRICS_READY id=" + identityOf(track)
+                        + " lines=" + parsed.lines().size()
+                        + " ms="
+                        + ((android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000_000L));
+                deliver(callback, parsed, null);
+            } catch (Exception failure) {
+                android.util.Log.i("TunefoldPerf", "event=LYRICS_FAILED id=" + identityOf(track)
+                        + " error=" + failure.getClass().getSimpleName());
+                deliver(callback, null, failure.toString());
+            }
+        });
+    }
+
+    /** Identity as the artwork and the logs spell it; the lyric is cached by it. */
+    private static String identityOf(MediaTrack track) {
+        TrackKey key = track.key();
+        return key == null ? "" : key.toString();
+    }
+
+    /**
+     * Runs disk work away from the main thread.
+     *
+     * <p>Rewriting a sidecar is I/O and the UI thread must not pay for it (§27). The
+     * work goes on the provider worker rather than a second executor, because it is
+     * the same kind of work: the file behind what the user is looking at.
+     */
+    void runOffUi(Runnable action) {
+        if (action == null) return;
+        worker.execute(action);
+    }
+
+    /**
      * Tracks related to a video, for Home and autoplay (§15).
      *
      * <p>Uses the provider's own related list. Deduplication is NOT done here:
@@ -261,6 +322,12 @@ final class ProviderRegistry implements AutoCloseable {
      * it with a {@code file:} source, otherwise the provider resolves a
      * temporary URL. Resolution never downloads the whole track, and a resolved
      * URL is never stored as a permanent media reference.
+     *
+     * <p>A track reconstructed from a remembered identity carries no provider
+     * metadata, only the provider's own URL for it. Rather than refusing those —
+     * which is what every member of L1K3D met on a cold start, and every download
+     * whose file was removed — the URL is resolved back into full metadata first
+     * and the source is resolved from that.
      */
     void playableSource(MediaTrack track, PlaybackTrace trace, Callback<PlayableSource> callback) {
         resolutionWorker.execute(() -> {
@@ -277,12 +344,17 @@ final class ProviderRegistry implements AutoCloseable {
             if (trace != null) trace.mark(PlaybackTrace.SOURCE_RESOLUTION_START, "hit=none");
             if (!available) { deliver(callback, null, "YouTube provider is not initialized"); return; }
             try {
+                String trackJson = withProviderMetadata(track);
+                if (trackJson == null) {
+                    deliver(callback, null, "No provider metadata to resolve this track");
+                    return;
+                }
                 long start = android.os.SystemClock.elapsedRealtimeNanos();
                 // Entry/exit markers: a resolution that never returns is otherwise
                 // indistinguishable from one that was never requested.
                 android.util.Log.i("TunefoldPerf", "event=RESOLVE_ENTER id="
                         + track.provider + "/" + track.providerId);
-                JSONObject root = new JSONObject(TunefoldBridge.resolveYoutubeSource(track.rawJson));
+                JSONObject root = new JSONObject(TunefoldBridge.resolveYoutubeSource(trackJson));
                 android.util.Log.i("TunefoldPerf", "event=RESOLVE_EXIT id="
                         + track.provider + "/" + track.providerId + " ms="
                         + ((android.os.SystemClock.elapsedRealtimeNanos() - start) / 1_000_000L));
@@ -303,6 +375,88 @@ final class ProviderRegistry implements AutoCloseable {
                 deliver(callback, null, error.toString());
             }
         });
+    }
+
+    /**
+     * Metadata for an identity, answered by the provider and nowhere else.
+     *
+     * <p>For a track remembered from a session that is gone: L1K3D holds identities and
+     * {@code Descargadas} holds files, and neither holds a cover, a duration or
+     * anything to resolve a source from. The provider is the only thing that knows
+     * what its own ids mean.
+     */
+    void trackMetadata(TrackKey key, Callback<MediaTrack> callback) {
+        if (key == null || key.providerTrackId().isEmpty()) {
+            deliver(callback, null, "Track has no identity");
+            return;
+        }
+        worker.execute(() -> {
+            if (!available) { deliver(callback, null, "YouTube provider is not initialized"); return; }
+            long started = android.os.SystemClock.elapsedRealtimeNanos();
+            try {
+                JSONObject root = new JSONObject(TunefoldBridge.metadataYoutube(key.providerTrackId()));
+                JSONArray values = root.optJSONArray("tracks");
+                JSONObject first = values == null ? null : values.optJSONObject(0);
+                if (first == null || !root.optBoolean("ok")) {
+                    android.util.Log.i("TunefoldPerf", "event=METADATA_MISS id=" + key);
+                    deliver(callback, null, root.optString("error", "No metadata for this track"));
+                    return;
+                }
+                MediaTrack resolved = MediaTrack.fromJson(first);
+                android.util.Log.i("TunefoldPerf", "event=METADATA_READY id=" + key
+                        + " ms="
+                        + ((android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000_000L));
+                deliver(callback, resolved, null);
+            } catch (Exception failure) {
+                android.util.Log.i("TunefoldPerf", "event=METADATA_FAILED id=" + key
+                        + " error=" + failure.getClass().getSimpleName());
+                deliver(callback, null, failure.toString());
+            }
+        });
+    }
+
+    /**
+     * The provider metadata {@link #playableSource} needs, or {@code null}.
+     *
+     * <p>Provider metadata is the track's own JSON, and a track that came from a
+     * search or a recommendation carries it. A track that came from a remembered
+     * identity does not, so it is asked for again: by the URL that was remembered when
+     * there is one, and by the identity itself when there is not — which is the case
+     * for everything saved before either was kept.
+     */
+    private String withProviderMetadata(MediaTrack track) {
+        if (track == null) return null;
+        String json = track.rawJson;
+        if (json != null && !json.isEmpty() && !json.equals("{}")) return json;
+        String url = track.providerUrl;
+        if (url != null && !url.trim().isEmpty()) {
+            String response = TunefoldBridge.resolveYoutubeUrl(url.trim());
+            String parsed = firstTrackJson(response);
+            if (parsed != null) {
+                android.util.Log.i("TunefoldPerf", "event=RESOLVE_FROM_URL id="
+                        + track.provider + "/" + track.providerId);
+                return parsed;
+            }
+        }
+        String byId = firstTrackJson(TunefoldBridge.metadataYoutube(track.providerId));
+        if (byId != null) {
+            android.util.Log.i("TunefoldPerf", "event=RESOLVE_FROM_ID id="
+                    + track.provider + "/" + track.providerId);
+        }
+        return byId;
+    }
+
+    /** The first track of a provider answer, or {@code null} if there is none. */
+    private static String firstTrackJson(String response) {
+        try {
+            JSONArray values = new JSONObject(response).optJSONArray("tracks");
+            JSONObject first = values == null ? null : values.optJSONObject(0);
+            return first == null ? null : first.toString();
+        } catch (Exception malformed) {
+            android.util.Log.i("TunefoldPerf", "event=RESOLVE_PARSE_FAILED error="
+                    + malformed.getClass().getSimpleName());
+            return null;
+        }
     }
 
     /** Explicit local save hook; playback itself never downloads a complete file. */

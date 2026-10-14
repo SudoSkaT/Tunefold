@@ -238,6 +238,18 @@ final class TrackList extends ViewGroup {
     /** How many tracks this list holds, whether or not they are built. */
     int trackCount() { return tracks.size(); }
 
+    /**
+     * The tracks this list shows, in display order.
+     *
+     * <p>An unmodifiable view of the live list, not a copy: it is read at the moment a
+     * row is tapped and copied immediately by the queue, so a list of five hundred
+     * tracks is not rebuilt on every tap. Nobody outside this class can reach the
+     * backing array.
+     */
+    java.util.List<MediaTrack> tracks() {
+        return java.util.Collections.unmodifiableList(tracks);
+    }
+
     /** How many rows exist right now: the window, never the library. */
     int boundRowCount() { return bound.size(); }
 
@@ -321,6 +333,9 @@ final class TrackList extends ViewGroup {
         while (bound.size() < wanted) {
             int index = first + bound.size();
             TrackRow row = pool.obtain();
+            // A pooled row carries the list it was last bound in, so it is told this
+            // one before anything reads it: a tap has to play the list on screen.
+            row.setList(this);
             LayoutParams params = (LayoutParams) row.getLayoutParams();
             addView(row, params != null ? params
                     : new LayoutParams(LayoutParams.MATCH_PARENT, rowHeight));

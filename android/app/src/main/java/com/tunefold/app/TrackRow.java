@@ -76,6 +76,8 @@ final class TrackRow extends LinearLayout {
     private final StringBuilder scratch = new StringBuilder(96);
     private MediaTrack track;
     private TrackKey key;
+    /** The list this row belongs to, which is what a tap plays. */
+    private TrackList list;
     private CharSequence renderedTitle = "";
     private CharSequence renderedAttribution = "";
     private boolean liked;
@@ -176,6 +178,27 @@ final class TrackRow extends LinearLayout {
     /** The track this row currently shows. */
     MediaTrack track() { return track; }
 
+    /**
+     * Declares which list this row belongs to.
+     *
+     * <p>On the row, and re-declared on every binding, because a row is pooled: the
+     * same object is handed to whichever list asks for one next, and a row that
+     * remembered the previous list would make "play this track" mean "play a list the
+     * user is no longer looking at".
+     */
+    void setList(TrackList value) { list = value; }
+
+    /**
+     * The tracks of the list this row belongs to, in display order.
+     *
+     * <p>What a tap plays: the row's own track, plus the list it was tapped in, so
+     * the song that plays next is the one the list shows next. Empty when the row
+     * belongs to no list, which the caller treats as "just this track".
+     */
+    java.util.List<MediaTrack> listTracks() {
+        return list == null ? java.util.Collections.<MediaTrack>emptyList() : list.tracks();
+    }
+
     /** The identity this row currently shows. */
     TrackKey key() { return key; }
 
@@ -222,10 +245,14 @@ final class TrackRow extends LinearLayout {
      * <p>Through the pool's loader, once per binding: a row that is rebound to the
      * track it already showed asks again only because the loader answers from its
      * cache, which is where that answer belongs.
+     *
+     * <p><b>Asked even when the track has no cover URL.</b> A track remembered from a
+     * session that is gone carries only its identity, and the loader is the one that
+     * can turn that into a cover — so refusing to ask here is what left a whole
+     * library of grey squares on screen for ever.
      */
     private void requestCover() {
         if (track == null || loader == null) return;
-        if (track.thumbnail.isEmpty()) return;
         artworkSidePx = DesignTokens.dp(DesignTokens.ARTWORK_THUMB);
         loader.load(track, artworkIdentity(), artworkSidePx);
     }

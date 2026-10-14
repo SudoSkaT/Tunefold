@@ -3,6 +3,7 @@ package com.tunefold.app;
 import android.util.Log;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -106,6 +107,11 @@ final class PlaybackSession {
     private MediaTrack currentTrack;
     private PlaybackError error;
     private PlaybackTrace trace;
+    /** Metadata learned from the provider this process, most-recently-used first. */
+    private final java.util.Map<TrackKey, MediaTrack> learned =
+            new java.util.LinkedHashMap<>(64, 0.75f, true);
+    /** How many learned tracks one process keeps; the data itself is the bound. */
+    private static final int LEARNED_LIMIT = 200;
     /** Guards against two concurrent autoplay fetches for one EOF (§16). */
     private boolean autoplayInFlight;
     /** True once autoplay has been considered for the current EOF. */
@@ -196,14 +202,82 @@ final class PlaybackSession {
                     "Track has no identity"));
             return;
         }
-        queue.playNow(track);
+        // One track is a list of one: playing something replaces the queue rather than
+        // appending to whatever was there, so "continue listening" is what the user
+        // last chose to play and not an accumulation of everything they ever tapped.
+        queue.replaceWith(Collections.singletonList(track), track.key());
         startCurrent();
+    }
+
+    /**
+     * Plays {@code selected} out of {@code tracks}, in {@code tracks}' order.
+     *
+     * <p>The list becomes the queue, so a song played from L1K3D or from
+     * {@code Descargadas} is followed by the next one in that list when it ends
+     * instead of stopping there. The order is the order the rows are shown in, which is
+     * the only order the user can see, and it is preserved exactly: nothing is sorted
+     * and nothing is shuffled behind their back.
+     *
+     * <p>Falls back to playing {@code selected} alone when the list is unusable, so a
+     * tap always produces a track playing rather than a row that does nothing.
+     */
+    void playList(List<MediaTrack> tracks, MediaTrack selected) {
+        if (selected == null) return;
+        if (selected.key() == null) {
+            setError(PlaybackError.classify(PlaybackError.Stage.SOURCE_RESOLUTION,
+                    "Track has no identity"));
+            return;
+        }
+        if (tracks == null || queue.replaceWith(tracks, selected.key()) < 0) play(selected);
+        else startCurrent();
     }
 
     /** Appends to the queue without interrupting playback. */
     void enqueue(MediaTrack track) {
         if (track == null) return;
         if (queue.append(track) >= 0) notifyChanged();
+    }
+
+    /** Whether this identity is somewhere in the queue, playing or not. */
+    boolean isQueued(TrackKey key) { return queue.contains(key); }
+
+    /**
+     * Takes one entry out of the queue.
+     *
+     * <p>"Continue listening" on the discovery screen is the queue shown as a list, so
+     * a list the user cannot edit is a picture of a decision they cannot change. This
+     * is that change: the row goes, and the cursor moves to whatever now sits where it
+     * was rather than to nothing.
+     *
+     * @return {@code true} when something was removed
+     */
+    boolean removeFromQueue(TrackKey key) {
+        if (key == null || !queue.remove(key)) return false;
+        PlaybackTrace.markCurrent(PlaybackTrace.QUEUE_NEXT, "removed=" + key);
+        notifyChanged();
+        return true;
+    }
+
+    /**
+     * Empties the queue.
+     *
+     * <p>What is playing stays in it. Clearing a queue is a statement about what comes
+     * <em>next</em>, not about stopping: a user who empties the queue wants the song to
+     * end and then stop, and taking the current track out of its own queue while its
+     * audio is still running would blank the player mid-song and make Home believe
+     * nothing is playing.
+     *
+     * @return {@code true} when there was something ahead to clear
+     */
+    boolean clearQueue() {
+        MediaTrack current = queue.current();
+        synchronized (queue.lock()) {
+            if (queue.size() <= 1) return false;
+        }
+        queue.replaceWith(Collections.singletonList(current), TrackKey.of(current));
+        PlaybackTrace.markCurrent(PlaybackTrace.QUEUE_NEXT, "cleared");
+        notifyChanged();
+        return true;
     }
 
     /** Resolves a pasted URL and plays it. */
@@ -225,7 +299,7 @@ final class PlaybackSession {
                         "Track has no identity"));
                 return;
             }
-            queue.playNow(track);
+            queue.replaceWith(Collections.singletonList(track), track.key());
             startCurrent();
         });
     }
@@ -381,6 +455,69 @@ final class PlaybackSession {
      *
      * @return {@code true} when a seek was attempted on a pipeline that can do it
      */
+    /**
+     * Salta a una pista que ya está en la cola y la reproduce.
+     *
+     * <p>Es para lo que sirve una lista de "sigue": el cursor se mueve y la pista
+     * elegida suena, en vez de quitar de en medio lo que ya se estaba oyendo.
+     *
+     * @return {@code true} si la identidad estaba en la cola
+     */
+    boolean playQueued(TrackKey key) {
+        int index = queue.indexOfKey(key);
+        if (index < 0) return false;
+        MediaTrack target = queue.at(index);
+        if (target == null) return false;
+        PlaybackTrace.markCurrent(PlaybackTrace.QUEUE_NEXT, "jump=" + key);
+        if (!queue.moveTo(index)) return false;
+        startCurrent();
+        return true;
+    }
+
+    /**
+     * La letra sincronizada de lo que suena, una vez por pista y por proceso.
+     *
+     * <p>Es una ida y vuelta a la red, así que se recuerda lo que respondió: la misma
+     * canción vuelve veinte segundos después y no se vuelve a preguntar. Una pista sin
+     * letra se recuerda como "no hay", no como error: una respuesta vacía es un
+     * resultado, y volver a insistir en ella cada vez que se repinta sería gastar
+     * batería por un "no" que ya se sabe.
+     */
+    void lyrics(MediaTrack track, ProviderRegistry.Callback<LyricTrack> callback) {
+        TrackKey key = track == null ? null : track.key();
+        if (key == null) {
+            if (callback != null) callback.complete(null, "The track has no identity");
+            return;
+        }
+        boolean asked;
+        synchronized (lyricCache) {
+            asked = lyricCache.containsKey(key);
+            if (!asked) lyricCache.put(key, null);
+        }
+        if (asked) {
+            LyricTrack known;
+            synchronized (lyricCache) { known = lyricCache.get(key); }
+            if (callback != null) callback.complete(known, null);
+            return;
+        }
+        providers.syncedLyrics(track, (found, error) -> {
+            synchronized (lyricCache) {
+                if (lyricCache.size() >= LYRIC_CACHE_LIMIT) {
+                    java.util.Iterator<TrackKey> oldest = lyricCache.keySet().iterator();
+                    if (oldest.hasNext()) oldest.next();
+                    oldest.remove();
+                }
+                lyricCache.put(key, found);
+            }
+            if (callback != null) callback.complete(found, error);
+        });
+    }
+
+    /** Letra por identidad ya preguntada; acotado, porque son unos pocos textos. */
+    private final java.util.Map<TrackKey, LyricTrack> lyricCache =
+            new java.util.LinkedHashMap<>();
+    private static final int LYRIC_CACHE_LIMIT = 8;
+
     boolean seekTo(long positionMs) {
         MediaTrack track = queue.current();
         if (track == null || positionMs < 0L) return false;
@@ -438,14 +575,24 @@ final class PlaybackSession {
     /** L1K3D contents, for the playlist screen. */
     List<TrackKey> likedKeys() { return library.likedKeys(); }
 
-    /** `Descargadas`: exactly the store's valid contents (§5). */
+    /**
+     * Downloads, described from what is remembered about each one.
+     *
+     * <p>Derived from the registry's identities rather than from
+     * {@link LocalMediaStore#entries()}: the enumeration is disk I/O and this is read
+     * on the main thread, twice a second, for every notification (§27). The registry
+     * holds the same identities in memory and is seeded from that same store scan.
+     *
+     * <p>Describing them goes through {@link #describeRemembered(TrackKey)}, so a
+     * download that is also liked is described once, from the freshest copy of its
+     * metadata.
+     */
     List<MediaTrack> downloadedTracks() {
-        // Membership is not stored here: the playlist is derived from the store.
         List<MediaTrack> result = new ArrayList<>();
-        if (downloader == null) return result;
-        for (TrackKey key : downloadedKeys()) result.add(new MediaTrack(
-                key.provider(), key.providerTrackId(), trackTitle(key), "", "", "", "artist",
-                -1, "", "", "{}"));
+        for (TrackKey key : downloadedKeys()) {
+            MediaTrack track = describeRemembered(key);
+            if (track != null) result.add(track);
+        }
         return result;
     }
 
@@ -500,6 +647,95 @@ final class PlaybackSession {
                 ? key.providerTrackId() : remembered;
     }
 
+    /**
+     * What a remembered identity actually is, asked once per process.
+     *
+     * <p>Everything saved before the app kept its metadata has none of it: an identity,
+     * a title and nothing else. The provider is the only thing that can turn an
+     * identity back into a cover and a playable source, so the row that needs one asks
+     * for it — and the answer is remembered everywhere it belongs (the library for a
+     * member, the sidecar for a download), so this happens once for the life of the
+     * data and not once per launch.
+     *
+     * @param key      an identity with no usable metadata
+     * @param callback the real track, or {@code null} when the provider cannot say
+     */
+    void learnMetadata(TrackKey key, ProviderRegistry.Callback<MediaTrack> callback) {
+        if (key == null) {
+            if (callback != null) callback.complete(null, "Track has no identity");
+            return;
+        }
+        // Already known — either live, or learned earlier in this process.
+        MediaTrack known = findKnown(key);
+        if (known != null && !known.thumbnail.isEmpty()) {
+            if (callback != null) callback.complete(known, null);
+            return;
+        }
+        synchronized (learned) {
+            MediaTrack cached = learned.get(key);
+            if (cached != null) {
+                if (callback != null) callback.complete(cached, null);
+                return;
+            }
+        }
+        providers.trackMetadata(key, (track, error) -> {
+            if (track != null) {
+                remember(track);
+                synchronized (learned) {
+                    learned.put(key, track);
+                    // Bounded: a library of five hundred identities is the data, and a
+                    // process must not turn into a second copy of it.
+                    if (learned.size() > LEARNED_LIMIT) {
+                        java.util.Iterator<TrackKey> oldest = learned.keySet().iterator();
+                        if (oldest.hasNext()) oldest.next();
+                        oldest.remove();
+                    }
+                }
+            } else {
+                Log.i(TAG, "event=METADATA_UNAVAILABLE id=" + key);
+            }
+            if (callback != null) callback.complete(track, error);
+        });
+    }
+
+    /** Where learned metadata is written, so the next launch does not ask again. */
+    private void remember(MediaTrack track) {
+        TrackKey key = track.key();
+        if (library.learnMetadata(key, track)) return;
+        if (downloader != null) downloader.learnMetadata(track);
+    }
+
+    /**
+     * The cover URL remembered for an identity, or the empty string.
+     *
+     * <p>A remembered identity is all L1K3D and {@code Descargadas} hold after a
+     * restart, and an identity has no artwork: without this every one of their rows
+     * asked for nothing and stayed a grey square for ever, even though the cover URL
+     * was sitting in the very sidecar written when the track was saved.
+     *
+     * <p>The download sidecar first, because it describes a file that is still on disk
+     * and was written when the cover was known; the like's copy is a label remembered
+     * for a membership.
+     */
+    private String thumbnailFor(TrackKey key) {
+        String downloaded = downloader == null ? null : downloader.registry().thumbnailOf(key);
+        if (downloaded != null && !downloaded.isEmpty()) return downloaded;
+        String remembered = library.thumbnailFor(key);
+        return remembered == null ? "" : remembered;
+    }
+
+    /**
+     * The provider URL remembered for an identity, or the empty string.
+     *
+     * <p>What makes a member that nothing else knows about playable: source resolution
+     * needs provider metadata, and the only copy of it that survives the process is the
+     * one the library kept.
+     */
+    private String sourceFor(TrackKey key) {
+        String remembered = library.sourceFor(key);
+        return remembered == null ? "" : remembered;
+    }
+
     /** Finds a track we already know about, by identity. */
     MediaTrack findKnown(TrackKey key) {
         if (key == null) return null;
@@ -512,19 +748,24 @@ final class PlaybackSession {
     }
 
     /**
-     * A track for a liked identity, reconstructed from its remembered label.
+     * A track for a remembered identity, reconstructed from what outlived it.
      *
-     * <p>L1K3D is only membership, so after a restart there is no live track to
-     * find; without this the rows would read "Resolving &lt;provider/id&gt;".
+     * <p>L1K3D is membership and {@code Descargadas} is a directory, so after a restart
+     * there is no live track to find; without this the rows would read
+     * "Resolving &lt;provider/id&gt;". Everything a row cannot derive from the key —
+     * what to read, what to draw, what to play — is handed in from the library and the
+     * download registry.
+     *
+     * @param key a liked or downloaded identity; {@code null} yields {@code null}
      */
-    MediaTrack describeLiked(TrackKey key) {
+    MediaTrack describeRemembered(TrackKey key) {
         MediaTrack known = findKnown(key);
         if (known != null) return known;
         if (key == null) return null;
         // providerId must stay the real identity: it is what the download registry
         // and the queue key on. Only the display fields are synthesised.
         return new MediaTrack(key.provider(), key.providerTrackId(), trackTitle(key),
-                "", "", "", "", -1, "", "", "{}");
+                "", "", "", "", -1, thumbnailFor(key), sourceFor(key), "{}");
     }
 
     // ------------------------------------------------------------- download

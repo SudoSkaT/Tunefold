@@ -49,36 +49,182 @@ pub(crate) async fn fetch_lrclib_lyrics(http: &reqwest::Client, track: &Track) -
         .to_string();
     let seconds = track.duration.map(|d| d.as_secs()).unwrap_or(0);
 
-    let mut url = reqwest::Url::parse(LRCLIB_API).ok()?;
-    {
-        let mut q = url.query_pairs_mut();
-        q.append_pair("track_name", title);
-        if !artist.is_empty() {
-            q.append_pair("artist_name", &artist);
-        }
-        q.append_pair("page_size", "20");
+    // El título que llega aquí es el de un vídeo, no el de una canción: trae
+    // "(Radio Edit)", "[Official Video]" y a veces "Artista - Título". LRCLIB
+    // busca canciones, así que se prueba primero con el título limpio y, si no
+    // hay nada, con la parte posterior al guion, que es donde está el nombre
+    // real de la canción. Dos intentos y ninguno más: la letra se pide una vez
+    // por pista y esperar más tiempo sólo retrasa la respuesta.
+    let mut candidates: Vec<String> = Vec::with_capacity(2);
+    let clean = lrclib_query_title(title);
+    if !clean.is_empty() {
+        candidates.push(clean);
     }
-    let resp = http.get(url).send().await.ok()?;
-    if !resp.status().is_success() {
-        // 404 = sin registros; 429 = rate-limit. Ambos se tratan como "sin
-        // letras" aquí.
+    if let Some(after_dash) = lrclib_title_after_dash(title) {
+        if !candidates.iter().any(|value| value == &after_dash) {
+            candidates.push(after_dash);
+        }
+    }
+    if candidates.is_empty() {
+        candidates.push(title.to_string());
+    }
+
+    for candidate in candidates {
+        let mut url = reqwest::Url::parse(LRCLIB_API).ok()?;
+        {
+            let mut q = url.query_pairs_mut();
+            q.append_pair("track_name", &candidate);
+            if !artist.is_empty() {
+                q.append_pair("artist_name", &artist);
+            }
+            q.append_pair("page_size", "20");
+        }
+        let resp = http.get(url).send().await.ok()?;
+        if !resp.status().is_success() {
+            // 404 = sin registros; 429 = rate-limit. Ambos se tratan como "sin
+            // letras" para este candidato, y el siguiente puede acertar.
+            continue;
+        }
+        let results: Vec<serde_json::Value> = resp.json().await.ok()?;
+
+        let best = results
+            .into_iter()
+            .filter_map(|r| {
+                let score = lrclib_score(&r, &candidate, &artist, seconds)?;
+                Some((score, r))
+            })
+            .min_by_key(|(score, _)| *score)?
+            .1;
+
+        if let Some(synced) = best
+            .get("syncedLyrics")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(synced.to_string());
+        }
+    }
+    None
+}
+
+/// Palabras que sólo hablan de cómo se publicó el vídeo, no de qué canción es.
+///
+/// Se comparan sin acentos y en minúsculas porque así llegan desde el título.
+const LRCLIB_NOISE: &[&str] = &[
+    "radio edit",
+    "radioversion",
+    "radio version",
+    "official video",
+    "official audio",
+    "official music video",
+    "official lyric video",
+    "official visualizer",
+    "music video",
+    "lyric video",
+    "lyrics video",
+    "with lyrics",
+    "lyrics",
+    "lyric",
+    "audio",
+    "video",
+    "visualizer",
+    "hd",
+    "hq",
+    "4k",
+    "remaster",
+    "remastered",
+    "live",
+    "full album",
+    "album version",
+    "extended",
+    "extended mix",
+    "edit",
+];
+
+/// Si un grupo entre paréntesis o corchetes no habla de la canción, no se busca.
+///
+/// Se quita sólo lo que va al final y sólo si el grupo entero es ruido: "(feat.
+/// Ana)" dice quién canta y "(Versión acústica)" cambia la canción, así que
+/// ninguno de los dos se toca aunque contengan palabras de esta lista.
+fn lrclib_group_is_noise(inner: &str) -> bool {
+    let lowered: String = inner
+        .chars()
+        .flat_map(|c| c.to_lowercase())
+        .collect::<String>();
+    let cleaned: String = lowered
+        .trim()
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != ' ')
+        .to_string();
+    if cleaned.is_empty() {
+        return false;
+    }
+    LRCLIB_NOISE.iter().any(|noise| {
+        cleaned == *noise
+            || cleaned.starts_with(&format!("{} ", noise))
+            || cleaned.ends_with(&format!(" {}", noise))
+    })
+}
+
+/// El título como lo escribiría una discografía.
+///
+/// ```
+/// use tunefold::providers::lyrics::lrclib_query_title;
+///
+/// assert_eq!(lrclib_query_title("One More Time (Radio Edit)"), "One More Time");
+/// assert_eq!(lrclib_query_title("Bohemian Rhapsody [Official Video]"), "Bohemian Rhapsody");
+/// assert_eq!(lrclib_query_title("Cure - (Intro)"), "Cure - (Intro)");
+/// ```
+pub(crate) fn lrclib_query_title(title: &str) -> String {
+    let mut value = title.trim().to_string();
+    loop {
+        let last = value.chars().last();
+        let opener = match last {
+            Some(')') => Some('('),
+            Some(']') => Some('['),
+            _ => None,
+        };
+        let Some(opener) = opener else { break };
+        // El grupo tiene que abrir y cerrar aquí; si no, el título está a medias
+        // y se deja como está: adivinar media canción no ayuda a nadie.
+        let Some(open) = value.rfind(opener) else {
+            break;
+        };
+        let inner = &value[open + 1..value.len() - 1];
+        if !lrclib_group_is_noise(inner) {
+            break;
+        }
+        let before = value[..open].trim_end().to_string();
+        // Un guion delante del grupo ("One More Time - (Radio Edit)") se va con él.
+        let before = before
+            .strip_suffix('-')
+            .unwrap_or(&before)
+            .trim_end()
+            .to_string();
+        if before.is_empty() {
+            break;
+        }
+        value = before;
+    }
+    value
+}
+
+/// Lo que hay tras el último guion, cuando ese gesto parece poner el nombre de
+/// la canción después del del artista.
+///
+/// Sólo con guion largo y con texto a los dos lados: "AC/DC - Thunder" sí es un
+/// artista delante, y "Yeah - Yeah - Yeah" no pierde nada porque el resultado se
+/// usa sólo como candidato adicional.
+pub(crate) fn lrclib_title_after_dash(title: &str) -> Option<String> {
+    let (head, tail) = title.rsplit_once(" - ")?;
+    if head.trim().is_empty() || tail.trim().is_empty() {
         return None;
     }
-    let results: Vec<serde_json::Value> = resp.json().await.ok()?;
-
-    let best = results
-        .into_iter()
-        .filter_map(|r| {
-            let score = lrclib_score(&r, title, &artist, seconds)?;
-            Some((score, r))
-        })
-        .min_by_key(|(score, _)| *score)?
-        .1;
-
-    best.get("syncedLyrics")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
+    let cleaned = lrclib_query_title(tail);
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
 }
 
 /// Clasifica un registro de búsqueda de LRCLIB para el track pedido.
@@ -268,6 +414,80 @@ fn artist_core(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// El título de un vídeo trae ruido de publicación que la canción no tiene.
+    #[test]
+    fn lrclib_query_title_drops_publishing_noise() {
+        assert_eq!(
+            lrclib_query_title("One More Time (Radio Edit)"),
+            "One More Time"
+        );
+        assert_eq!(
+            lrclib_query_title("Bohemian Rhapsody [Official Video]"),
+            "Bohemian Rhapsody"
+        );
+        assert_eq!(
+            lrclib_query_title("Yesterday (Remastered 2009)"),
+            "Yesterday"
+        );
+        assert_eq!(
+            lrclib_query_title("Billie Jean (Official Music Video)"),
+            "Billie Jean"
+        );
+        assert_eq!(lrclib_query_title("Shape of You [HD]"), "Shape of You");
+        assert_eq!(lrclib_query_title("Thunder (Radio Version)"), "Thunder");
+        // Varios grupos de ruido seguidos: se van todos.
+        assert_eq!(lrclib_query_title("Wannabe (Radio Edit) [HD]"), "Wannabe");
+        // Y el guion delante también.
+        assert_eq!(
+            lrclib_query_title("One More Time - (Radio Edit)"),
+            "One More Time"
+        );
+    }
+
+    /// Lo que dice quién canta o qué versión es no se quita.
+    #[test]
+    fn lrclib_query_title_keeps_what_identifies_the_song() {
+        for kept in [
+            "Intro",
+            "The Song (feat. Ana)",
+            "Canción (Versión acústica)",
+            "Theme (From \"The Movie\")",
+            "Live and Let Die",
+            "Lady (Hear Me Tonight)",
+        ] {
+            assert_eq!(lrclib_query_title(kept), kept, "{}", kept);
+        }
+    }
+
+    /// Un título a medias no se toca: media conjetura no es una conjetura.
+    #[test]
+    fn lrclib_query_title_leaves_broken_titles_alone() {
+        assert_eq!(lrclib_query_title("Cure - (Intro)"), "Cure - (Intro)");
+        assert_eq!(
+            lrclib_query_title("Unbalanced (Radio Edit"),
+            "Unbalanced (Radio Edit"
+        );
+        assert_eq!(lrclib_query_title("(Radio Edit)"), "(Radio Edit)");
+        assert_eq!(lrclib_query_title("  Space Oddity  "), "Space Oddity");
+    }
+
+    /// Con "Artista - Título" la parte del final es el nombre de la canción.
+    #[test]
+    fn lrclib_title_after_dash_finds_the_song() {
+        assert_eq!(
+            lrclib_title_after_dash("Daft Punk - One More Time (Radio Edit)"),
+            Some("One More Time".to_string())
+        );
+        assert_eq!(
+            lrclib_title_after_dash("AC/DC - Thunder"),
+            Some("Thunder".to_string())
+        );
+        // Sin nada detrás no hay título alternativo que probar.
+        assert_eq!(lrclib_title_after_dash("One More Time"), None);
+        assert_eq!(lrclib_title_after_dash("One More Time - "), None);
+        assert_eq!(lrclib_title_after_dash(" - One More Time"), None);
+    }
 
     #[test]
     fn lrclib_score_picks_exact_title_and_artist_first() {

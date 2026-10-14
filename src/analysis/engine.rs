@@ -652,6 +652,31 @@ mod tests {
 
         // Segunda pista: MISMO formato, pero fuente nueva declarada.
         runtime.begin_new_source();
+        // Un trozo primero, y sólo después medir. El reinicio lo aplica el hilo del
+        // análisis cuando procesa audio nuevo, así que sin este trozo la espera
+        // posterior leía el reloj de la pista anterior (~6 s), y el test pasaba o
+        // fallaba según cuándo llegara el hilo.
+        {
+            let chunk_seconds = 0.25f64;
+            let frames = (SR as f64 * chunk_seconds) as usize;
+            let mut batch = vec![0.0f32; frames * 2];
+            for (index, sample) in batch.iter_mut().enumerate() {
+                let t = (index / 2) as f32 / SR as f32;
+                *sample = sine_wave(120.0, SR as f32, t, 0.5);
+            }
+            tap.feed(&batch);
+            let restart_deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < restart_deadline {
+                let stamp = features
+                    .latest()
+                    .map(|f| f.timestamp.as_secs_f64())
+                    .unwrap_or(0.0);
+                if stamp < 3.0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         let second_pass = feed_until(&features, 1.0);
         assert!(
             second_pass < 3.0,

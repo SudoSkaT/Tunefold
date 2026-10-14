@@ -347,8 +347,12 @@ final class TrackDownloader implements AutoCloseable {
         // file is what survives, and a download row that lost its name on every restart
         // read as a bare provider id.
         String title = job.track == null ? null : job.track.title;
+        String thumbnail = job.track == null ? null : job.track.thumbnail;
         boolean registered = committed != null
-                && store.register(key.provider(), key.providerTrackId(), new File(committed), title);
+                && store.register(key.provider(), key.providerTrackId(), new File(committed), title, thumbnail);
+        // Remembered as well as written: the sidecar only reaches the list again when
+        // the store is next scanned, and the row for this track is on screen now.
+        if (thumbnail != null) registry.rememberThumbnail(key, thumbnail);
         if (!registered) {
             String message = readError();
             if (message.isEmpty()) {
@@ -367,6 +371,27 @@ final class TrackDownloader implements AutoCloseable {
         registry.complete(key, size, title);
         PlaybackTrace.markCurrent(PlaybackTrace.DOWNLOAD_COMPLETE, "id=" + key + " bytes=" + size);
         Log.i(TAG, "event=DOWNLOAD_COMPLETE id=" + key + " bytes=" + size);
+    }
+
+    /**
+     * Rewrites a download's sidecar with metadata the provider has just taught us.
+     *
+     * <p>The file is the authority and the store owns its sidecar, so this goes back
+     * through {@link LocalMediaStore#register} rather than editing a JSON file beside
+     * it. Off the UI thread (§27), and best-effort: losing a cover is a row that goes
+     * back to its placeholder, not a download that stops working.
+     */
+    void learnMetadata(MediaTrack track) {
+        TrackKey key = TrackKey.of(track);
+        if (key == null || track == null || !registry.isDownloaded(key)) return;
+        registry.rememberTitle(key, track.title);
+        registry.rememberThumbnail(key, track.thumbnail);
+        providers.runOffUi(() -> {
+            File audio = store.get(key.provider(), key.providerTrackId());
+            if (audio == null) return;
+            store.register(key.provider(), key.providerTrackId(), audio,
+                    track.title, track.thumbnail);
+        });
     }
 
     private String readError() {

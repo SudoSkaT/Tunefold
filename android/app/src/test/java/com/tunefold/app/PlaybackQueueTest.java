@@ -8,6 +8,8 @@ import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
+import java.util.ArrayList;
+
 /** Playback queue (§12, §13, §29). */
 public class PlaybackQueueTest {
 
@@ -174,5 +176,127 @@ public class PlaybackQueueTest {
         assertTrue(queue.contains(TrackKey.of("YouTube", "a")));
         assertTrue(queue.queuedKeys().contains(TrackKey.of("YouTube", "b")));
         assertFalse(queue.contains(TrackKey.of("YouTube", "zzz")));
+    }
+
+    // ------------------------------------------------------- playing from a list
+
+    private static java.util.List<MediaTrack> tracks(String... ids) {
+        java.util.List<MediaTrack> list = new java.util.ArrayList<>();
+        for (String id : ids) list.add(TestTracks.of("YouTube", id));
+        return list;
+    }
+
+    /**
+     * The regression this class exists for: a tap on a row used to queue exactly one
+     * track, so the song ended and there was nothing behind it.
+     */
+    @Test public void playingFromAListQueuesTheWholeList() {
+        PlaybackQueue queue = new PlaybackQueue();
+        queue.replaceWith(tracks("a", "b", "c"), TrackKey.of("YouTube", "a"));
+
+        assertEquals(3, queue.size());
+        assertEquals("b", TrackKey.of(queue.peekNext()).providerTrackId());
+        assertTrue(queue.advance());
+        assertEquals("c", TrackKey.of(queue.peekNext()).providerTrackId());
+        assertTrue(queue.advance());
+        assertEquals("the end of the list is the end of the queue",
+                null, queue.peekNext());
+    }
+
+    /** The tapped track is the one that starts, wherever it was in the list. */
+    @Test public void theTappedTrackIsTheOneThatStarts() {
+        PlaybackQueue queue = new PlaybackQueue();
+        queue.replaceWith(tracks("a", "b", "c"), TrackKey.of("YouTube", "c"));
+        assertEquals("c", TrackKey.of(queue.current()).providerTrackId());
+        assertEquals("and nothing follows it", null, queue.peekNext());
+    }
+
+    @Test public void theListOrderIsTheOrderThatIsKept() {
+        PlaybackQueue queue = new PlaybackQueue();
+        queue.replaceWith(tracks("c", "a", "b"), TrackKey.of("YouTube", "c"));
+
+        assertEquals("nothing is sorted or shuffled behind the user's back",
+                "c", TrackKey.of(queue.current()).providerTrackId());
+        queue.advance();
+        assertEquals("a", TrackKey.of(queue.current()).providerTrackId());
+    }
+
+    /** A list replaces the queue rather than adding to whatever was playing. */
+    @Test public void replacingLeavesNothingOfThePreviousQueue() {
+        PlaybackQueue queue = new PlaybackQueue();
+        queue.playNow(TestTracks.of("YouTube", "old-1"));
+        queue.append(TestTracks.of("YouTube", "old-2"));
+        queue.replaceWith(tracks("a", "b"), TrackKey.of("YouTube", "b"));
+
+        assertEquals(2, queue.size());
+        assertEquals("b", TrackKey.of(queue.current()).providerTrackId());
+        assertFalse("nothing from the previous queue survives",
+                queue.contains(TrackKey.of("YouTube", "old-1")));
+    }
+
+    /** Two rows showing the same song must not make it play twice in a row. */
+    @Test public void aRepeatedIdentityIsQueuedOnce() {
+        PlaybackQueue queue = new PlaybackQueue();
+        queue.replaceWith(tracks("a", "b", "a", "c"), TrackKey.of("YouTube", "a"));
+        assertEquals(3, queue.size());
+        assertEquals("b", TrackKey.of(queue.peekNext()).providerTrackId());
+    }
+
+    /** A row with no identity could never be stepped to, so it is not queued. */
+    @Test public void unidentifiableEntriesAreNotQueued() {
+        PlaybackQueue queue = new PlaybackQueue();
+        queue.replaceWith(tracks("a", ""), TrackKey.of("YouTube", "a"));
+        assertEquals(1, queue.size());
+    }
+
+    /** An unusable list must still leave something playing. */
+    @Test public void anEmptyListLeavesNothingToPlay() {
+        PlaybackQueue queue = new PlaybackQueue();
+        queue.playNow(TestTracks.of("YouTube", "a"));
+        assertEquals("nothing was queued", -1,
+                queue.replaceWith(new ArrayList<>(), TrackKey.of("YouTube", "a")));
+        assertTrue(queue.isEmpty());
+        assertNull(queue.current());
+    }
+
+    @Test public void aNullListIsTheSameAsAnEmptyOne() {
+        PlaybackQueue queue = new PlaybackQueue();
+        assertEquals(-1, queue.replaceWith(null, TrackKey.of("YouTube", "a")));
+        assertTrue(queue.isEmpty());
+    }
+
+    /** A start that is not in the list falls back to the front, never to nothing. */
+    @Test public void anUnknownStartFallsBackToTheFirstEntry() {
+        PlaybackQueue queue = new PlaybackQueue();
+        queue.replaceWith(tracks("a", "b"), TrackKey.of("YouTube", "gone"));
+        assertEquals(0, queue.currentIndex());
+        assertEquals("a", TrackKey.of(queue.current()).providerTrackId());
+    }
+
+    @Test public void noStartMeansTheFrontOfTheList() {
+        PlaybackQueue queue = new PlaybackQueue();
+        queue.replaceWith(tracks("a", "b"), null);
+        assertEquals("a", TrackKey.of(queue.current()).providerTrackId());
+    }
+
+    /** The bound holds whatever the screen hands over. */
+    @Test public void theQueueIsBounded() {
+        PlaybackQueue queue = new PlaybackQueue();
+        java.util.List<MediaTrack> huge = new ArrayList<>();
+        for (int index = 0; index < PlaybackQueue.MAX_ENTRIES + 250; index++) {
+            huge.add(TestTracks.of("YouTube", "id" + index));
+        }
+        queue.replaceWith(huge, TrackKey.of("YouTube", "id0"));
+        assertEquals(PlaybackQueue.MAX_ENTRIES, queue.size());
+    }
+
+    /** A replaced queue can still be stepped through in both directions. */
+    @Test public void previousWalksBackThroughTheList() {
+        PlaybackQueue queue = new PlaybackQueue();
+        queue.replaceWith(tracks("a", "b", "c"), TrackKey.of("YouTube", "b"));
+        queue.retreat();
+        assertEquals("a", TrackKey.of(queue.current()).providerTrackId());
+        assertEquals("and Next still walks forward through the list",
+                "b", TrackKey.of(queue.peekNext()).providerTrackId());
     }
 }

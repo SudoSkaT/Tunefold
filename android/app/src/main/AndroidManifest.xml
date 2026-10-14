@@ -40,6 +40,27 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!--
+            Los controles sobre la pantalla de bloqueo. Se abre desde la notificación,
+            no desde la app, así que va marcada como `excludeFromRecents`: aparecer en
+            "Aplicaciones recientes" al lado de Tunefold y no hacer nada al tocarla
+            desde allí sería una pantalla fantasma.
+
+            `showOnLockScreen` + `turnScreenOn=false` son el camino que Android admite
+            para esto: la actividad se coloca encima del candado y, al bloquear de
+            nuevo, el sistema la retira sola. No hay ninguna ventana legítima que
+            pueda dibujar sobre la pantalla de bloqueo.
+        -->
+        <activity
+            android:name=".LockScreenControlsActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:showOnLockScreen="true"
+            android:screenOrientation="portrait"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Material.NoActionBar" />
+
         <service
             android:name=".ForegroundPlaybackService"
             android:exported="false"

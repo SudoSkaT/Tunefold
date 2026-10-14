@@ -31,6 +31,15 @@ final class PlaybackQueue {
         ONE
     }
 
+    /**
+     * Most entries {@link #replaceWith} will hold.
+     *
+     * <p>A bound, because the list comes from the screen and a screen's list is only
+     * bounded by what the user collected. A queue that grows without limit is the one
+     * thing in this class that can take the process down with it.
+     */
+    static final int MAX_ENTRIES = 500;
+
     private final Object mutex = new Object();
     private final List<MediaTrack> items = new ArrayList<>();
     private int currentIndex = -1;
@@ -145,6 +154,45 @@ final class PlaybackQueue {
         }
     }
 
+    /**
+     * Makes a whole list the queue and points the cursor at one of its entries.
+     *
+     * <p>This is what "play from a list" means: the list the user is looking at becomes
+     * the order things play in, in the order they are shown, so the track after the one
+     * they tapped is the one the list shows after it and the end of the list is the end
+     * of the queue — where {@link AutoplayPolicy} decides between a recommendation and
+     * stopping. Playing a row used to call {@link #playNow}, which queued exactly one
+     * track: the song ended and there was nothing behind it to continue with.
+     *
+     * <p>Order is the caller's order and nothing is sorted or reordered, so what plays
+     * next is what the list shows next. Entries without an identity are dropped — they
+     * could never be stepped to — and a repeated identity is kept once, because two
+     * rows showing the same song would otherwise play it twice in a row.
+     *
+     * @param tracks the list, in display order; {@code null} or empty empties the queue
+     * @param start  the entry to play first; the first one when it is not in the list
+     * @return the index the cursor ended up at, or {@code -1} when nothing was queued
+     */
+    int replaceWith(List<MediaTrack> tracks, TrackKey start) {
+        synchronized (mutex) {
+            items.clear();
+            currentIndex = -1;
+            if (tracks != null) {
+                for (MediaTrack track : tracks) {
+                    if (items.size() >= MAX_ENTRIES) break;
+                    if (track == null || TrackKey.of(track) == null) continue;
+                    if (indexOf(TrackKey.of(track)) >= 0) continue;
+                    items.add(track);
+                }
+            }
+            // A start that is not in the list still has to leave something playing, so
+            // the cursor falls back to the front rather than to "nothing".
+            currentIndex = start == null ? -1 : indexOf(start);
+            if (currentIndex < 0) currentIndex = items.isEmpty() ? -1 : 0;
+            return currentIndex;
+        }
+    }
+
     /** Removes one entry, keeping the current index pointing at the same track. */
     boolean remove(TrackKey key) {
         if (key == null) return false;
@@ -161,6 +209,12 @@ final class PlaybackQueue {
             }
             return true;
         }
+    }
+
+    /** Where an identity sits, or {@code -1}; for jumping to what the player lists. */
+    int indexOfKey(TrackKey key) {
+        if (key == null) return -1;
+        synchronized (mutex) { return indexOf(key); }
     }
 
     private int indexOf(TrackKey key) {
@@ -205,6 +259,20 @@ final class PlaybackQueue {
             if (previous >= 0) return items.get(previous);
             if (repeatMode == RepeatMode.ALL) return items.get(items.size() - 1);
             return null;
+        }
+    }
+
+    /**
+     * Puts the cursor on a known index.
+     *
+     * <p>For jumping: the caller found the index, so the queue does not look it up
+     * again, and a jump is not a step — it may go backwards.
+     */
+    boolean moveTo(int index) {
+        synchronized (mutex) {
+            if (index < 0 || index >= items.size()) return false;
+            currentIndex = index;
+            return true;
         }
     }
 

@@ -39,6 +39,16 @@ final class DownloadRegistry {
      * The store writes the title once at commit and seeds it back on every scan.
      */
     private final Map<TrackKey, String> titles = new LinkedHashMap<>();
+    /**
+     * Cover URL each download was committed under, seeded from its sidecar.
+     *
+     * <p>Memory for the same reason as {@link #titles}, and with the same consequence
+     * if it is missing: {@code Descargadas} renders from the identities alone after a
+     * restart, and a row with no cover URL never asks for one — so the whole list of
+     * downloads came back as grey squares even though every file carried the artwork
+     * it was downloaded with.
+     */
+    private final Map<TrackKey, String> thumbnails = new LinkedHashMap<>();
     private final StoredProbe probe;
     /** True once a full store enumeration has been seeded. */
     private volatile boolean scanComplete;
@@ -174,6 +184,35 @@ final class DownloadRegistry {
         synchronized (states) { return titles.get(key); }
     }
 
+    /**
+     * Remembers a cover URL for an identity, replacing any earlier one.
+     *
+     * <p>A blank URL is ignored rather than stored: an empty string is what a row would
+     * ask for, and asking for nothing is how a saved track ends up with no cover.
+     *
+     * @return {@code true} when the remembered URL changed
+     */
+    boolean rememberThumbnail(TrackKey key, String thumbnail) {
+        if (key == null || thumbnail == null || thumbnail.trim().isEmpty()) return false;
+        String cleaned = thumbnail.trim();
+        synchronized (states) {
+            if (cleaned.equals(thumbnails.get(key))) return false;
+            thumbnails.put(key, cleaned);
+        }
+        return true;
+    }
+
+    /**
+     * Cover URL remembered for an identity, or {@code null}.
+     *
+     * <p>Read from memory like {@link #titleOf}, because the row that asks for the
+     * cover is on the main thread and the sidecar is on disk (§27).
+     */
+    String thumbnailOf(TrackKey key) {
+        if (key == null) return null;
+        synchronized (states) { return thumbnails.get(key); }
+    }
+
     DownloadState fail(TrackKey key, String error) {
         DownloadState next = new DownloadState(key, DownloadState.Phase.FAILED,
                 0, -1, -1, error == null ? "Download failed" : error);
@@ -211,6 +250,7 @@ final class DownloadRegistry {
             // The title described a file that no longer exists; keeping it would
             // leave a label behind for a track `Descargadas` no longer lists.
             titles.remove(key);
+            thumbnails.remove(key);
         }
         DownloadState next = stateOf(key);
         if (previous != null && previous.isDownloaded()) revision.incrementAndGet();
@@ -239,6 +279,9 @@ final class DownloadRegistry {
             // Seeded from the sidecar, so the title survives a restart exactly like
             // the file does.
             rememberTitle(entry.key, entry.title());
+            // And so does the cover: the sidecar was written with the artwork the
+            // track had when it was saved, which is the only copy left of it.
+            rememberThumbnail(entry.key, entry.thumbnail());
         }
         // Every stored identity is now known, so later reads answer from memory.
         scanComplete = true;

@@ -36,15 +36,32 @@ final class ArtworkPalette {
         final int secondary;
         /** {@code false} cuando la portada no ofreció nada y manda la marca. */
         final boolean derived;
+        /**
+         * Si la portada ofreció de verdad <em>dos</em> tonos distintos.
+         *
+         * <p>No es lo mismo que "derivada": una portada monocroma sí da color, y con
+         * ese color se tiñen las barras, pero los dos canales son el mismo dibujo y
+         * una composición que se apoya en el contraste entre dos zonas no tiene nada
+         * que enseñar. La decisión de componer en dos regiones se toma sobre esto.
+         */
+        final boolean duoTone;
 
         Palette(int primary, int secondary, boolean derived) {
+            this(primary, secondary, derived, primary != secondary);
+        }
+
+        Palette(int primary, int secondary, boolean derived, boolean duoTone) {
             this.primary = primary;
             this.secondary = secondary;
             this.derived = derived;
+            this.duoTone = duoTone;
         }
 
         /** La paleta de marca: lo que se ve cuando la portada no tiene color. */
-        static Palette brand(int brand) { return new Palette(brand, brand, false); }
+        static Palette brand(int brand) { return new Palette(brand, brand, false, false); }
+
+        /** Si esta portada ofrece más de un color. */
+        boolean offersMoreThanOneColour() { return derived && duoTone; }
     }
 
     /** Resolución del matiz en el recuento de la portada. */
@@ -102,14 +119,18 @@ final class ArtworkPalette {
         int primaryColor = averageOf(sums, counts, first);
         int secondaryColor = second >= 0 ? averageOf(sums, counts, second) : primaryColor;
         // Dos tonos casi idénticos no son dos canales: si los matices están a menos
-        // de 25 grados, el segundo canal usa el mismo color y lo dice así.
+        // de 25 grados, el segundo canal usa el mismo color y lo dice así. Y si
+        // la portada no tenía un segundo tono, tampoco lo hay.
+        boolean duoTone = second >= 0;
         if (second >= 0 && hueDistance(hue[first] / counts[first], hue[second] / counts[second]) < 25f) {
             secondaryColor = primaryColor;
+            duoTone = false;
         }
         return new Palette(
                 readableOnCard(vivid(primaryColor)),
                 readableOnCard(vivid(secondaryColor)),
-                true);
+                true,
+                duoTone);
     }
 
     /**

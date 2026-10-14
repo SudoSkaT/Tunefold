@@ -237,12 +237,15 @@ public class DesignTokensTest {
     /**
      * A bar field too short cannot show bars, and one too tall pushes the
      * transport off a short window.
+     *
+     * <p>The floor is one lane, not two: the player draws a single row and spends
+     * what the second one used to take on the lyric being sung.
      */
     @Test public void theSoundBarsAreAUsableBand() {
-        assertTrue("the lanes need room", DesignTokens.SOUNDBARS_HEIGHT >= 40f);
+        assertTrue("a lane needs room", DesignTokens.SOUNDBARS_HEIGHT >= 32f);
         assertTrue("and not the whole card", DesignTokens.SOUNDBARS_HEIGHT <= 96f);
-        assertTrue("the gap must leave both lanes visible",
-                DesignTokens.SOUNDBARS_LANE_GAP > 0f);
+        assertTrue("the compact band keeps the proportion of the normal one",
+                DesignTokens.SOUNDBARS_HEIGHT_COMPACT <= DesignTokens.SOUNDBARS_HEIGHT);
         assertTrue("a bar thinner than its gap is a line",
                 DesignTokens.SOUNDBARS_BAR_GAP > 0f);
         assertTrue("bars must be drawn, not hinted",

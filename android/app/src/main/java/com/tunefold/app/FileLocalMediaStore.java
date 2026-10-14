@@ -87,7 +87,8 @@ final class FileLocalMediaStore implements LocalMediaStore {
                     continue;
                 }
                 String title = entry.optString("title", "").trim();
-                found.add(new Entry(key, actual, audio, title.isEmpty() ? null : title));
+                String thumbnail = entry.optString("thumbnail", "").trim();
+                found.add(new Entry(key, actual, audio, title.isEmpty() ? null : title, thumbnail.isEmpty() ? null : thumbnail));
             } catch (Exception corrupt) {
                 sidecar.delete();
             }
@@ -144,6 +145,11 @@ final class FileLocalMediaStore implements LocalMediaStore {
 
     @Override
     public synchronized boolean register(String provider, String id, File path, String title) {
+        return register(provider, id, path, title, null);
+    }
+
+    @Override
+    public synchronized boolean register(String provider, String id, File path, String title, String thumbnail) {
         if (provider == null || provider.isEmpty() || id == null || id.isEmpty()) return false;
         if (path == null || !path.isFile()) return false;
         File target = audioFile(provider, id);
@@ -166,6 +172,7 @@ final class FileLocalMediaStore implements LocalMediaStore {
             // Remembered so `Descargadas` can show a real title after a restart; a
             // blank title is left out entirely rather than stored as an empty string.
             if (title != null && !title.trim().isEmpty()) entry.put("title", title.trim());
+            if (thumbnail != null && !thumbnail.trim().isEmpty()) entry.put("thumbnail", thumbnail.trim());
             entry.put("updated_at_ms", System.currentTimeMillis());
             try (FileOutputStream output = new FileOutputStream(metadataPart)) {
                 output.write(entry.toString().getBytes(StandardCharsets.UTF_8));

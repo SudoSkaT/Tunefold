@@ -45,6 +45,28 @@ final class ArtworkTheme {
     private static volatile int accent = DesignTokens.Palette.ACCENT;
     private static volatile int barsPrimary = DesignTokens.Palette.ACCENT;
     private static volatile int barsSecondary = DesignTokens.Palette.ACCENT;
+    /** Si la portada actual ofrece de verdad dos tonos distintos. */
+    private static volatile boolean duoTone;
+    private static volatile boolean derived;
+
+    /**
+     * Si la portada en pantalla trajo color, o si manda el color de marca.
+     *
+     * <p>Lo lee la composición del reproductor: una portada gris, negra o blanca no
+     * tiene con qué construir una composición partida, y fingir el contraste de dos
+     * zonas con la misma tinta sólo hace que la pantalla parezca partida sin motivo.
+     * En cuanto la portada lendió su color —aunque sean dos tonos muy próximos y las
+     * barras compartan tinta— la partida se justifica.
+     */
+    static boolean paletteDerived() { return derived; }
+
+    /**
+     * Si la portada trajo dos tonos distintos entre sí.
+     *
+     * <p>No gobierna la composición: gobierna las barras, que son dos canales y
+     * necesitan dos tintas para no leerse como el mismo dibujo repetido.
+     */
+    static boolean duoTone() { return duoTone; }
 
     private ArtworkTheme() { }
 
@@ -99,11 +121,16 @@ final class ArtworkTheme {
                 ? ArtworkPalette.lift(palette.primary) : DesignTokens.Palette.ACCENT;
         int primary = palette.derived ? palette.primary : DesignTokens.Palette.ACCENT;
         int secondary = palette.derived ? palette.secondary : DesignTokens.Palette.ACCENT;
-        if (control == accent && primary == barsPrimary && secondary == barsSecondary) return;
+        boolean two = palette.offersMoreThanOneColour();
+        boolean lent = palette.derived;
+        if (control == accent && primary == barsPrimary && secondary == barsSecondary
+                && two == duoTone && lent == derived) return;
         boolean accentMoved = control != accent;
         accent = control;
         barsPrimary = primary;
         barsSecondary = secondary;
+        duoTone = two;
+        derived = lent;
         for (AccentListener listener : LISTENERS) {
             if (accentMoved) listener.onAccentChanged(control);
             listener.onPaletteChanged(primary, secondary);

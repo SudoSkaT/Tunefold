@@ -267,6 +267,128 @@ public class LibraryTest {
         assertEquals("Nice Title", reader.labelFor(TrackKey.of("YouTube", "labelled")));
     }
 
+    // ------------------------------------------------------------ cover and source
+
+    /** A track as the provider describes it: cover and source URL included. */
+    private static MediaTrack described(String id) {
+        return new MediaTrack("YouTube", id, "Nice Title", "Artist", "", "", "artist",
+                213_000L, "https://img.example/" + id + ".jpg",
+                "https://provider.example/watch?v=" + id, "{}");
+    }
+
+    /**
+     * The cover a member was liked with has to outlive the session that fetched it.
+     *
+     * <p>This is the whole L1K3D-cover bug: membership is an identity, the queue holds
+     * real tracks only for what is playing right now, and a row synthesised from the
+     * identity alone asks for no cover and renders as a grey square for ever.
+     */
+    @Test public void aLikedCoverSurvivesAReload() {
+        Library writer = new Library(directory);
+        writer.toggleLiked(described("a"));
+
+        Library reader = new Library(directory);
+        reader.load();
+        assertEquals("https://img.example/a.jpg",
+                reader.thumbnailFor(TrackKey.of("YouTube", "a")));
+    }
+
+    /** The provider URL is what makes that same member playable again. */
+    @Test public void aLikedSourceSurvivesAReload() {
+        Library writer = new Library(directory);
+        writer.toggleLiked(described("a"));
+
+        Library reader = new Library(directory);
+        reader.load();
+        assertEquals("https://provider.example/watch?v=a",
+                reader.sourceFor(TrackKey.of("YouTube", "a")));
+    }
+
+    @Test public void coverLabelAndSourceRoundTripTogether() {
+        Library writer = new Library(directory);
+        writer.toggleLiked(described("a"));
+        writer.toggleLiked(described("b"));
+        writer.awaitWritesForTest();
+
+        Library reader = new Library(directory);
+        reader.load();
+        for (String id : new String[] {"a", "b"}) {
+            TrackKey key = TrackKey.of("YouTube", id);
+            assertEquals("https://img.example/" + id + ".jpg", reader.thumbnailFor(key));
+            assertEquals("https://provider.example/watch?v=" + id, reader.sourceFor(key));
+            assertEquals("Nice Title", reader.labelFor(key));
+            assertTrue(reader.isLiked(TestTracks.of("YouTube", id)));
+        }
+    }
+
+    /** Unliking forgets everything remembered about the identity. */
+    @Test public void unlikingForgetsTheCoverAndTheSource() {
+        Library library = new Library(directory);
+        library.toggleLiked(described("a"));
+        library.toggleLiked(described("a"));
+        assertNull(library.thumbnailFor(TrackKey.of("YouTube", "a")));
+        assertNull(library.sourceFor(TrackKey.of("YouTube", "a")));
+        assertNull(library.labelFor(TrackKey.of("YouTube", "a")));
+    }
+
+    /** A blank cover is "unknown", not "an empty URL to fetch". */
+    @Test public void aBlankCoverIsNotRemembered() {
+        Library library = new Library(directory);
+        library.toggleLiked(TestTracks.of("YouTube", "a"));
+        assertNull(library.thumbnailFor(TrackKey.of("YouTube", "a")));
+        assertNull(library.sourceFor(TrackKey.of("YouTube", "a")));
+    }
+
+    /**
+     * Files written before covers and sources existed must keep loading.
+     *
+     * <p>They are whole-line records of their own, so nothing about the membership
+     * record's own shape changed and a title containing the separator still reads back
+     * as one label rather than as a label and a cover.
+     */
+    @Test public void legacyDocumentsStillLoadWithoutCovers() {
+        Library reader = new Library(directory);
+        reader.loadFromForTest("l|YouTube|legacy\n"
+                + "l|YouTube|separated|Odd | Title\n"
+                + "r|YouTube|played\n");
+        assertTrue(reader.isLiked(TestTracks.of("YouTube", "legacy")));
+        assertTrue(reader.isLiked(TestTracks.of("YouTube", "separated")));
+        assertEquals("a separator in a title is still part of the title",
+                "Odd | Title", reader.labelFor(TrackKey.of("YouTube", "separated")));
+        assertTrue(reader.wasPlayedRecently(TrackKey.of("YouTube", "played")));
+        assertNull("and there is simply no cover", reader.thumbnailFor(TrackKey.of("YouTube", "legacy")));
+        assertNull(reader.sourceFor(TrackKey.of("YouTube", "legacy")));
+    }
+
+    /** A cover or source record for an identity that is no longer liked is ignored. */
+    @Test public void orphanedCoverRecordsAreIgnored() {
+        Library reader = new Library(directory);
+        reader.loadFromForTest("t|YouTube|ghost|https://img.example/g.jpg\n"
+                + "u|YouTube|ghost|https://provider.example/g\n"
+                + "t|YouTube|noCover\n");
+        assertTrue(reader.isEmpty());
+        assertNull(reader.thumbnailFor(TrackKey.of("YouTube", "ghost")));
+        assertNull(reader.sourceFor(TrackKey.of("YouTube", "ghost")));
+        assertNull("an empty field is not a URL", reader.thumbnailFor(TrackKey.of("YouTube", "noCover")));
+    }
+
+    /** Nothing a cover URL contains may forge a second record. */
+    @Test public void aCoverSurvivesAsOneRecord() {
+        Library writer = new Library(directory);
+        writer.toggleLiked(described("a"));
+        writer.awaitWritesForTest();
+
+        String document = readLibraryFile();
+        assertEquals("three records: membership, cover and source",
+                3, document.split("\n", -1).length - 1);
+
+        Library reader = new Library(directory);
+        reader.loadFromForTest(document);
+        assertEquals("https://img.example/a.jpg",
+                reader.thumbnailFor(TrackKey.of("YouTube", "a")));
+        assertTrue("membership survived too", reader.isLiked(TestTracks.of("YouTube", "a")));
+    }
+
     private String readLibraryFile() {
         File file = new File(directory, "library.json");
         if (!file.isFile()) return "";

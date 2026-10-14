@@ -11,6 +11,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import java.util.ArrayList;
+import java.util.List;
 
 /**
  * The now-playing surface: artwork, then identity, then state, then progress, then the
@@ -40,7 +41,7 @@ import java.util.ArrayList;
  *
  * <p>Technical diagnostics never appear here; they belong to {@link PlaybackDebugPanel}.
  */
-final class NowPlayingView {
+final class NowPlayingView implements ArtworkTheme.AccentListener {
 
     /** Callbacks to the Activity. All invoked on the UI thread. */
     interface Actions {
@@ -59,6 +60,16 @@ final class NowPlayingView {
     /** What the error action offers; decides its glyph, its description and its effect. */
     private enum ErrorAction { NONE, RETRY, SKIP }
 
+    /** Told when a row of "next" is tapped. */
+    interface QueuedTrackChosen {
+        void onQueuedTrackChosen(MediaTrack track);
+    }
+
+    /** How many tracks the player shows as coming next. */
+    private static final int UP_NEXT_ROWS = 4;
+    /** La letra se apaga, no desaparece, mientras la canción no tiene qué cantar. */
+    private static final float LYRICS_SILENCE_ALPHA = 0.45f;
+
     private static final CharSequence NOTHING_PLAYING = "Nothing playing";
 
     private final Actions actions;
@@ -73,6 +84,14 @@ final class NowPlayingView {
     private final TextView errorLabel;
     private final IconButton errorAction;
     private final ProgressControl progress;
+    private final TextView lyricLine;
+    private final LinearLayout upNext;
+    private LyricTrack lyricTrack;
+    private long lyricPositionMs = -1L;
+    /** Qué lista de "sigue" está construida; el mismo contenido no se reconstruye. */
+    private String queuedKey;
+    /** What the "next" rows do; the screen owns the queue, this owns the buttons. */
+    private QueuedTrackChosen queuedTrackChosen;
     private final IconButton previous;
     private final PrimaryPlaybackButton playPause;
     private final IconButton next;
@@ -103,10 +122,29 @@ final class NowPlayingView {
     private LayoutRules.Profile window;
     /** Identity of the current window's layout, so a repeated call costs one compare. */
     private String windowKey = "";
+    /**
+     * Identity of the composition itself: window and cover together.
+     *
+     * <p>Separate from {@link #windowKey} because the cover can change the composition
+     * on its own — a track change is not a configuration change.
+     */
+    private String compositionKey = "";
     private int artworkSidePx;
     private String artworkSideKey = "";
+    /**
+     * El lado que la ventana pide para la portada, antes de que los datos la aprieten.
+     *
+     * <p>Es el techo al que puede volver a crecer: sin él el único número disponible
+     * era el lado actual, ya recortado, y una portada encogida por una cola larga se
+     * quedaba pequeña para siempre.
+     */
+    private int preferredArtworkSidePx;
+
+    /** El contexto de la pantalla, para lo que se construye más tarde. */
+    private final Context context;
 
     NowPlayingView(Context context, Actions actions) {
+        this.context = context;
         DesignTokens.init(context);
         this.actions = actions;
         int pad = DesignTokens.dp(DesignTokens.CARD_PADDING);
@@ -175,6 +213,18 @@ final class NowPlayingView {
         progress = new ProgressControl(context);
         addDetails(progress, DesignTokens.BLOCK_GAP);
 
+        // La línea que se está cantando. Va donde estaba la mitad de las barras que
+        // ya no hay, y es la misma regla que la consola: la última línea cuyo
+        // momento ya pasó.
+        lyricLine = new TextView(context);
+        lyricLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
+        lyricLine.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        lyricLine.setGravity(Gravity.CENTER);
+        lyricLine.setMaxLines(3);
+        lyricLine.setEllipsize(TextUtils.TruncateAt.END);
+        lyricLine.setVisibility(View.GONE);
+        addDetails(lyricLine, DesignTokens.GAP);
+
         // ---- transport: previous, the one control that matters, next ----
         LinearLayout transport = row(context, Gravity.CENTER);
         int target = DesignTokens.dp(DesignTokens.CONTROL_TARGET);
@@ -241,12 +291,44 @@ final class NowPlayingView {
         downloadParams.leftMargin = DesignTokens.dp(DesignTokens.GAP);
         actionRow.addView(download, downloadParams);
         addDetails(actionRow, 0f);
+
+        // "A continuación": la cola que el reproductor va a soltar. Sólo cuando hay
+        // algo detrás — una lista puesta desde el reparto o una cola vaciada no
+        // merecen un encabezado con nada debajo.
+        upNext = new LinearLayout(context);
+        upNext.setOrientation(LinearLayout.VERTICAL);
+        upNext.setVisibility(View.GONE);
+        addDetails(upNext, DesignTokens.BLOCK_GAP);
+
+        // The cover decides whether the card splits, so the card listens to the cover
+        // — LAST, because `register` hands the listener the current palette straight
+        // away, and this card has to be able to answer that before it has built
+        // anything to compose.
+        ArtworkTheme.register(this);
     }
 
     View view() { return root; }
 
-    /** Whether the surface is composed as two regions, where the cover sits beside. */
-    boolean twoColumn() { return window != null && window.twoColumnPlayer(); }
+    /** Quién oye un toque en una fila de "sigue". */
+    void setQueuedTrackChosen(QueuedTrackChosen chosen) { queuedTrackChosen = chosen; }
+
+    /**
+     * Lo que viene detrás de lo que suena, ya sin la pista actual.
+     *
+     * <p>Se quita la que está sonando en el reproductor y no aquí: el reproductor es
+     * quien sabe cuál es, y hacer las dos cosas aquí obligaría a esta clase a volver a
+     * preguntar por la posición del cursor en cada fila.
+     */
+    void setUpNextFrom(PlaybackQueue queue, TrackKey current) {
+        List<MediaTrack> next = new ArrayList<>();
+        int from = current == null ? 0 : queue.indexOfKey(current);
+        if (from < 0) from = 0;
+        for (int index = from + 1; index < queue.size() && next.size() < UP_NEXT_ROWS + 1; index++) {
+            MediaTrack track = queue.at(index);
+            if (track != null) next.add(track);
+        }
+        setUpNext(next);
+    }
 
     /** The cover's side, already clamped to what is left of the window. */
     void fitArtworkTo(int side) { applyArtworkSide(side); }
@@ -281,6 +363,10 @@ final class NowPlayingView {
         private int fitHeight = -1;
         /** Measured height of the details subtree, reused while nothing moved. */
         private int detailsHeight;
+        /** El relleno de la tarjeta, sin el aire repartido que se le añade luego. */
+        private int basePaddingTop;
+        private int basePaddingBottom;
+        private boolean paddingRemembered;
 
         Surface(Context context, NowPlayingView owner) {
             super(context);
@@ -291,9 +377,14 @@ final class NowPlayingView {
             int width = MeasureSpec.getSize(widthSpec);
             int available = MeasureSpec.getSize(heightSpec);
             // Two regions are fitted by width, not by height: there the cover is
-            // beside its details, so it gives up width, and the height guard is the
-            // window's own business.
+            // beside its details, so it gives up width, and the height guard is
+            // the window's own business.
             if (!owner.twoColumn() && width > 0 && available > 0) {
+                if (!paddingRemembered) {
+                    basePaddingTop = getPaddingTop();
+                    basePaddingBottom = getPaddingBottom();
+                    paddingRemembered = true;
+                }
                 int inner = Math.max(0, width - getPaddingLeft() - getPaddingRight());
                 if (inner != fitWidth || available != fitHeight) {
                     View details = owner.details;
@@ -312,8 +403,25 @@ final class NowPlayingView {
                         - detailsHeight - gaps;
                 // El suelo es el mínimo del token: por debajo, una portada ya no es
                 // una portada y el problema pasa a ser de ventana, no de proporción.
-                int wanted = Math.max(DesignTokens.dp(DesignTokens.ARTWORK_MIN), spare);
-                if (wanted < art.height) owner.fitArtworkTo(wanted);
+                // El techo es el lado que la ventana pidió, para que la portada no
+                // se coma la pantalla cuando los datos son pocos.
+                int wanted = Math.min(owner.preferredArtworkSidePx(),
+                        Math.max(DesignTokens.dp(DesignTokens.ARTWORK_MIN), spare));
+                // Crecer Y encogerse. Sólo encogerse dejaba la portada pegada a su
+                // mínimo para siempre: un momento con la cola larga —«Sigue» con sus
+                // filas, o una letra de tres líneas— la encogía, y al vaciarse la
+                // cola ya no volvía a su tamaño. La pantalla se quedaba con un hueco
+                // de tres dedos abajo y la portada pequeña en un rincón.
+                if (wanted != art.height) owner.fitArtworkTo(wanted);
+                // El aire que sobra ni con la portada a su tamaño se reparte a mitades
+                // arriba y abajo. Amontonado abajo, el reproductor parecía no estar
+                // centrado; era el mismo aire, pero todo en un solo lado.
+                int air = spare - wanted;
+                int top = basePaddingTop + Math.max(0, air) / 2;
+                int bottom = basePaddingBottom + Math.max(0, air) / 2;
+                if (getPaddingTop() != top || getPaddingBottom() != bottom) {
+                    setPadding(getPaddingLeft(), top, getPaddingRight(), bottom);
+                }
             }
             super.onMeasure(widthSpec, heightSpec);
         }
@@ -572,6 +680,132 @@ final class NowPlayingView {
     void setPosition(TrackKey key, long positionMs, long durationMs) {
         if (key == null) return;
         progress.setPosition(key, positionMs, durationMs);
+        showLyricAt(positionMs);
+    }
+
+    /**
+     * The lines of what is playing, or {@code null} when there is none.
+     *
+     * <p>Comes late: the lyric arrives after the song started, and re-setting it moves
+     * the caret straight to the line being sung right now instead of replaying the
+     * song from its first line.
+     */
+    void setLyrics(LyricTrack track) {
+        lyricTrack = track;
+        lyricPositionMs = -1L;
+        if (track == null || track.isEmpty()) {
+            lyricLine.setVisibility(View.GONE);
+            return;
+        }
+        lyricLine.setVisibility(View.VISIBLE);
+        lyricLine.setText(DesignTokens.LYRICS_SILENCE);
+        lyricLine.setAlpha(LYRICS_SILENCE_ALPHA);
+        showLyricAt(lyricPositionMs >= 0L ? lyricPositionMs : 0L);
+    }
+
+    /**
+     * Which "next" rows to offer, in order, already starting after what is playing.
+     *
+     * <p>Tapping one is the whole point: the list is a queue you can act on, not a
+     * label. Rows are rebuilt only when the identity of the list changes, so the
+     * twenty-hertz tick never touches this.
+     */
+    void setUpNext(List<MediaTrack> tracks) {
+        java.util.List<MediaTrack> wanted = tracks == null
+                ? java.util.Collections.<MediaTrack>emptyList() : tracks;
+        if (wanted.isEmpty()) {
+            if (upNext.getVisibility() != View.GONE) {
+                upNext.removeAllViews();
+                upNext.setVisibility(View.GONE);
+                queuedKey = null;
+            }
+            return;
+        }
+        StringBuilder identity = new StringBuilder();
+        for (int index = 0; index < wanted.size(); index++) {
+            TrackKey key = wanted.get(index).key();
+            identity.append(key == null ? "" : key.toString()).append('\u0001');
+        }
+        String stamp = identity.toString();
+        if (stamp.equals(queuedKey)) return;
+        queuedKey = stamp;
+        upNext.removeAllViews();
+        upNext.addView(queueHeader());
+        int shown = Math.min(wanted.size(), UP_NEXT_ROWS);
+        for (int index = 0; index < shown; index++) {
+            upNext.addView(queueRow(wanted.get(index), index));
+        }
+        if (wanted.size() > shown) {
+            upNext.addView(moreRow(wanted.size() - shown));
+        }
+        upNext.setVisibility(View.VISIBLE);
+    }
+
+    private TextView queueHeader() {
+        TextView header = new TextView(context);
+        header.setText("SIGUE");
+        header.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_CAPTION_SIZE);
+        header.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        header.setLetterSpacing(0.12f);
+        header.setGravity(Gravity.CENTER);
+        header.setFocusable(false);
+        return header;
+    }
+
+    private View queueRow(MediaTrack track, int index) {
+        TextView row = new TextView(context);
+        row.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
+        row.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        row.setGravity(Gravity.CENTER);
+        row.setMaxLines(2);
+        row.setEllipsize(TextUtils.TruncateAt.END);
+        row.setMinHeight(DesignTokens.dp(DesignTokens.CONTROL_TARGET));
+        row.setText((index + 1) + ".  " + track.title);
+        row.setContentDescription(track.title + (track.artist.isEmpty() ? "" : " — " + track.artist)
+                + ". Play this track now");
+        row.setOnClickListener(ignored -> {
+            if (queuedTrackChosen != null) queuedTrackChosen.onQueuedTrackChosen(track);
+        });
+        return row;
+    }
+
+    private TextView moreRow(int hidden) {
+        TextView row = new TextView(context);
+        row.setText("+" + hidden + " más");
+        row.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_CAPTION_SIZE);
+        row.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        row.setGravity(Gravity.CENTER);
+        row.setFocusable(false);
+        return row;
+    }
+
+    /**
+     * Paints the line being sung, if it changed.
+     *
+     * <p>Twenty times a second, so the comparison is a long against a long: with the
+     * same line still in the view there is no {@code setText}, no measure and no
+     * layout. Silence keeps whatever was last written instead of blanking the space
+     * on every gap between phrases.
+     */
+    private void showLyricAt(long positionMs) {
+        LyricTrack current = lyricTrack;
+        if (current == null || current.isEmpty()) return;
+        lyricPositionMs = positionMs;
+        LyricTrack.Line line = current.activeAt(positionMs);
+        if (line == null) {
+            lyricLine.setVisibility(View.GONE);
+            return;
+        }
+        lyricLine.setVisibility(View.VISIBLE);
+        String text = line.text.trim();
+        boolean singing = !text.isEmpty();
+        String shown = singing ? text : DesignTokens.LYRICS_SILENCE;
+        if (shown.equals(lyricLine.getText().toString())
+                && lyricLine.getAlpha() == (singing ? 1f : LYRICS_SILENCE_ALPHA)) {
+            return;
+        }
+        lyricLine.setText(shown);
+        lyricLine.setAlpha(singing ? 1f : LYRICS_SILENCE_ALPHA);
     }
 
     // -------------------------------------------------------------- geometry
@@ -592,16 +826,26 @@ final class NowPlayingView {
      *   <li><b>One column</b> (portrait phone): cover above, details below, both
      *       centred — the cover is the loudest thing and everything else is what is
      *       left.</li>
-     *   <li><b>Two regions</b> (landscape, or any window wide enough): cover on the
-     *       left owning its share of the width, details on the right taking the rest
-     *       and vertically centred. Landscape is not the portrait layout with less
-     *       height — it is a different composition.</li>
+     *   <li><b>Two regions</b> (wide window, <em>and</em> a cover with more than one
+     *       colour): cover on the left owning its share of the width, details on the
+     *       right taking the rest, and the two sharing one vertical centre so they
+     *       read as one composition instead of two blocks that happen to sit on the
+     *       same row.</li>
      *   <li><b>Maximum width</b> (tablet): the column stops growing at
      *       {@link LayoutRules#CONTENT_MAX_DP} and centres, so the composition is
      *       comfortable instead of merely wide.</li>
      *   <li><b>Short window</b>: the sound bars give up the height they can spare, so
      *       the transport is never the thing that falls off the bottom.</li>
      * </ul>
+     *
+     * <p><b>Why the cover decides.</b> A two-region composition is a composition
+     * about contrast: a cover here, the words there. A cover that is one colour — a
+     * monochrome sleeve, a very dark frame — offers no contrast to build that on, and
+     * the split only makes the screen look like two unrelated halves. So the split is
+     * taken only when {@link ArtworkTheme#duoTone()} says the cover really brought two
+     * tones; otherwise everything composes in one column, which is the calmer and
+     * more legible arrangement for a single-colour cover. The cover decides, because
+     * the cover is the loudest thing on the screen.
      *
      * @param profile     the window, already read from the configuration
      * @param innerWidthDp  width the card has inside the page gutter, in dp
@@ -611,8 +855,6 @@ final class NowPlayingView {
         if (profile == null) return;
         String key = profile.key() + "/" + innerWidthDp + "x" + innerHeightDp;
         if (key.equals(windowKey)) return;
-        boolean columns = profile.twoColumnPlayer();
-        boolean wasColumns = window != null && window.twoColumnPlayer();
         windowKey = key;
         window = profile;
         applySpacing(profile);
@@ -625,12 +867,68 @@ final class NowPlayingView {
         // window too small for the composition is a window problem, not a deformed
         // cover. Both numbers are decided here, once, and every listener downstream
         // reads the result instead of recomputing it.
-        setArtworkSidePx(DesignTokens.dp(profile.artworkSideDp(innerWidthDp, innerHeightDp)));
+        preferredArtworkSidePx = clampArtworkSide(
+                DesignTokens.dp(profile.artworkSideDp(innerWidthDp, innerHeightDp)));
+        setArtworkSidePx(preferredArtworkSidePx);
+        applyComposition();
+    }
 
-        if (columns == wasColumns) return;
+    /**
+     * One column or two, for the window this card was given.
+     *
+     * <p>Wide enough is necessary and not sufficient: the cover has to bring a second
+     * tone for the split to mean anything. See {@link #setWindow}.
+     */
+    private boolean twoColumn() {
+        return twoColumnFor(window != null && window.twoColumnPlayer(),
+                ArtworkTheme.paletteDerived());
+    }
+
+    /**
+     * The composition rule, as a pure function of the two facts it reads.
+     *
+     * <p>Wide enough is necessary and not sufficient: the cover has to have lent its
+     * colour. A grey, black or white cover offers no contrast for a split composition
+     * to be about, so that one composes in a single column — calmer and more legible
+     * than two halves carrying the same ink.
+     *
+     * <p>It does <em>not</em> require two distinct hues. That was the first rule and
+     * it was wrong: most sleeves are dominated by one hue with a neighbour inside the
+     * 25° the palette calls "the same tone", so requiring two hues meant the split
+     * almost never appeared — the feature existed and nobody ever saw it. What makes
+     * the two regions worth having is a cover that is not grey.
+     *
+     * @param windowAllows whether the window is wide enough for two regions
+     * @param coverHasColour whether the cover lent a palette of its own
+     */
+    static boolean twoColumnFor(boolean windowAllows, boolean coverHasColour) {
+        return windowAllows && coverHasColour;
+    }
+
+    /**
+     * Lays the two regions out, in whichever composition the window and the cover
+     * between them ask for.
+     *
+     * <p>Separate from {@link #setWindow} because the cover can change its mind
+     * without the window moving: the palette arrives with the artwork, and a track
+     * change is not a configuration change. Idempotent on the pair, so a repeated
+     * notification costs one string comparison.
+     */
+    private void applyComposition() {
+        // A listener is registered at the very end of this constructor precisely so
+        // this is unreachable, and it stays a guard rather than a fix: a card asked to
+        // compose before it has built anything to compose with has nothing to say, and
+        // a half-composed card is worse than a card that has not composed yet.
+        if (stage == null || details == null || artwork == null) return;
+        boolean columns = twoColumn();
+        String key = (window == null ? "-" : window.key()) + "/" + columns
+                + "/" + ArtworkTheme.duoTone();
+        if (key.equals(compositionKey)) return;
+        compositionKey = key;
         stage.setOrientation(columns ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
-        // The cover is centred in the row it shares, and so is the region it shares
-        // it with: a short window must not leave the controls stranded at the bottom.
+        // One vertical centre for the whole composition: in two regions the cover and
+        // the words start from the same height and are centred against each other, so
+        // neither can look like something that fell into place beside the other.
         stage.setGravity(columns
                 ? Gravity.CENTER_HORIZONTAL | Gravity.CENTER_VERTICAL
                 : Gravity.CENTER_HORIZONTAL);
@@ -639,17 +937,40 @@ final class NowPlayingView {
         LinearLayout.LayoutParams detailsParams =
                 (LinearLayout.LayoutParams) details.getLayoutParams();
         detailsParams.width = columns ? 0 : -1;
-        detailsParams.height = columns ? -1 : -2;
+        // Always wrap content, in one region and in two. A details column told to
+        // fill the row is measured at the row's height — the cover's height — and a
+        // LinearLayout squeezed to that height drops its LAST children, which are the
+        // transport and the secondary actions: the two things the user came for. The
+        // column grows to what it needs and the cover centres against it instead.
+        detailsParams.height = -2;
         detailsParams.weight = columns ? 1f : 0f;
         detailsParams.leftMargin = columns
                 ? DesignTokens.dp(DesignTokens.ARTWORK_GUTTER_LANDSCAPE) : 0;
-        // Vertically centred in two regions so a short window does not leave the
-        // transport stranded at the bottom of a tall column.
-        details.setGravity(columns
-                ? Gravity.CENTER_HORIZONTAL | Gravity.CENTER_VERTICAL
-                : Gravity.CENTER_HORIZONTAL);
+        details.setGravity(Gravity.CENTER_HORIZONTAL
+                | (columns ? Gravity.CENTER_VERTICAL : 0));
         details.setLayoutParams(detailsParams);
+        // The cover's own margin depends on which composition it is in, so the
+        // memoised side has to be re-applied rather than trusted.
+        artworkSideKey = "";
+        setArtworkSidePx(artworkSidePx);
     }
+
+    @Override public void onPaletteChanged(int barsPrimary, int barsSecondary) {
+        // The cover decided the composition; it has just answered.
+        applyComposition();
+    }
+
+    /**
+     * The accent colour moved.
+     *
+     * <p>Nothing here: the card does not paint itself with the accent, its controls
+     * do, and each of them is already listening. This card only cares about whether
+     * the cover brought two tones, which is {@link #onPaletteChanged}.
+     */
+    @Override public void onAccentChanged(int accent) { }
+
+    /** Unhooks this card from the palette it listens to; called with the screen. */
+    void release() { ArtworkTheme.unregister(this); }
 
     /** The window this surface is laid out for, or {@code null} before the first one. */
     LayoutRules.Profile window() { return window; }
@@ -663,13 +984,24 @@ final class NowPlayingView {
      * Repeated calls with the same side and the same composition cost one comparison.
      */
     void setArtworkSidePx(int requestedPx) {
-        int side = Math.max(DesignTokens.dp(DesignTokens.ARTWORK_MIN),
-                Math.min(DesignTokens.dp(window == null
-                                ? DesignTokens.ARTWORK_MAX : window.artworkMaxDp()),
-                        requestedPx));
+        int side = clampArtworkSide(requestedPx);
         String key = side + "/" + twoColumn();
         if (key.equals(artworkSideKey)) return;
         applyArtworkSide(side);
+    }
+
+    /** El lado pedido, dentro de los límites de la ventana y del mínimo del token. */
+    private int clampArtworkSide(int requestedPx) {
+        return Math.max(DesignTokens.dp(DesignTokens.ARTWORK_MIN),
+                Math.min(DesignTokens.dp(window == null
+                                ? DesignTokens.ARTWORK_MAX : window.artworkMaxDp()),
+                        requestedPx));
+    }
+
+    /** El lado que la ventana pidió, para el reparto del aire que sobra. */
+    int preferredArtworkSidePx() {
+        return preferredArtworkSidePx > 0
+                ? preferredArtworkSidePx : clampArtworkSide(artworkSidePx);
     }
 
     /** The cover's side, applied and remembered; {@code side} is already clamped. */

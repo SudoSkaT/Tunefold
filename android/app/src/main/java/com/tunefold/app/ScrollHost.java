@@ -127,11 +127,31 @@ final class ScrollHost extends FrameLayout {
         updateWindows();
     }
 
+    /**
+     * Lays the content out once, at its own origin.
+     *
+     * <p>Moving it is {@link #scrollTo}'s job and nothing else's: a scroll offset is a
+     * draw-time translation applied by {@code View.scrollTo}, and this method does not
+     * even run while the user is dragging. Offsetting the content here as well gave it
+     * the offset twice, which is what made the whole surface feel broken:
+     *
+     * <ul>
+     *   <li>the content travelled at twice the finger's speed, so a drag that should
+     *       have moved 200&nbsp;px moved 400;</li>
+     *   <li>every layout pass re-applied the offset <em>on top of</em> the one already
+     *       in force, so the content jumped by the entire scroll distance and snapped
+     *       backwards. A windowed list calls {@code requestLayout()} every time it
+     *       rebinds a row — which is every few pixels of scroll — so the jump was not
+     *       an edge case, it was the normal feel of the screen;</li>
+     *   <li>the bound-row window is computed from the logical offset, so a doubled
+     *       content offset left the list binding the rows for a completely different
+     *       part of the data: blank stretches and duplicated rows while dragging.</li>
+     * </ul>
+     */
     @Override protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
         if (getChildCount() == 0) return;
-        int childHeight = getChildAt(0).getMeasuredHeight();
-        int childWidth = getChildAt(0).getMeasuredWidth();
-        getChildAt(0).layout(0, -scrollY, childWidth, childHeight - scrollY);
+        View content = getChildAt(0);
+        content.layout(0, 0, content.getMeasuredWidth(), content.getMeasuredHeight());
         updateWindows();
     }
 
@@ -150,7 +170,13 @@ final class ScrollHost extends FrameLayout {
         int next = clampScroll(value);
         if (next == scrollY) return;
         scrollY = next;
-        scrollTo(0, -scrollY);
+        // Positive, like every scrolling container on the platform: the framework
+        // draws a child at `childTop - mScrollY`, so a positive offset draws the
+        // content further up, and a growing offset is a finger travelling up. The
+        // sign is not a convention here, it is arithmetic: with the sign the other
+        // way round a 400px drag moved the content 400px the wrong way, which is
+        // exactly what "the scroll is inverted" is.
+        scrollTo(0, scrollY);
         updateWindows();
         if (listener != null) listener.onScrolled(scrollY, maxScroll);
     }
@@ -181,21 +207,35 @@ final class ScrollHost extends FrameLayout {
      * content holds buttons, and a host that takes every touch before the child sees
      * it turns them all into dead pixels. So the host watches first and decides at the
      * first move that passes the slop.
+     *
+     * <p>The velocity tracker is started here rather than in {@link #onTouchEvent},
+     * because this hook is where the gesture is claimed: once it returns {@code true}
+     * the child is cancelled and {@code onTouchEvent} begins at the {@code MOVE} that
+     * claimed it, never at the {@code DOWN}. A tracker obtained down there was
+     * therefore never obtained at all, and without it no gesture could ever be
+     * released into a fling — the screen simply stopped where the finger stopped.
      */
     @Override public boolean onInterceptTouchEvent(MotionEvent event) {
         if (!canScroll) return false;
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 scroller.abortAnimation();
-                downTouchY = lastTouchY = (int) event.getY();
-                dragging = false;
+                beginGesture(event);
                 return false;
-            case MotionEvent.ACTION_MOVE:
-                int delta = (int) event.getY() - downTouchY;
-                if (!dragging && Math.abs(delta) > touchSlop) dragging = true;
+            case MotionEvent.ACTION_MOVE: {
+                track(event);
+                int y = (int) event.getY();
+                if (!dragging && Math.abs(y - downTouchY) > touchSlop) {
+                    dragging = true;
+                    // The slop is spent, not applied: without this the first movement of
+                    // the scroll jumps the content by everything the finger travelled
+                    // to get here.
+                    lastTouchY = anchorAfterSlop(downTouchY, y - downTouchY, touchSlop);
+                }
                 // The list only takes the gesture once it is a drag, so a tap on a
                 // row is a tap and not the first pixel of a scroll.
                 return dragging;
+            }
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
                 dragging = false;
@@ -210,43 +250,97 @@ final class ScrollHost extends FrameLayout {
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 scroller.abortAnimation();
-                downTouchY = lastTouchY = (int) event.getY();
-                if (velocityTracker == null) {
-                    velocityTracker = VelocityTracker.obtain();
-                } else {
-                    velocityTracker.clear();
-                }
-                velocityTracker.addMovement(event);
-                dragging = true;
+                // Only reached when no child took the {@code DOWN} — which is why this
+                // branch exists at all: a ViewGroup is not asked to intercept again
+                // once no child holds the gesture, so the slop has to be decided here.
+                beginGesture(event);
                 return true;
             case MotionEvent.ACTION_MOVE: {
-                if (velocityTracker != null) velocityTracker.addMovement(event);
+                track(event);
                 int y = (int) event.getY();
+                if (!dragging) {
+                    if (Math.abs(y - downTouchY) <= touchSlop) return true;
+                    dragging = true;
+                    lastTouchY = anchorAfterSlop(downTouchY, y - downTouchY, touchSlop);
+                }
                 scrollTo(clampScroll(scrollY + lastTouchY - y));
                 lastTouchY = y;
                 return true;
             }
-            case MotionEvent.ACTION_UP: {
-                if (velocityTracker != null) {
-                    velocityTracker.addMovement(event);
-                    velocityTracker.computeCurrentVelocity(1000, maximumFlingVelocity);
-                    int velocity = (int) velocityTracker.getYVelocity();
-                    velocityTracker.recycle();
-                    velocityTracker = null;
-                    if (Math.abs(velocity) > minimumFlingVelocity) {
-                        scroller.fling(0, scrollY, 0, -velocity, 0, 0, 0, maxScroll);
-                        postInvalidateOnAnimation();
-                    }
-                }
+            case MotionEvent.ACTION_UP:
+                track(event);
+                releaseIntoFling();
                 dragging = false;
                 return true;
-            }
             case MotionEvent.ACTION_CANCEL:
                 dragging = false;
+                releaseTracker();
                 return true;
             default:
                 return dragging;
         }
+    }
+
+    /** Starts a gesture: one anchor, one empty drag, one fresh velocity history. */
+    private void beginGesture(MotionEvent event) {
+        downTouchY = lastTouchY = (int) event.getY();
+        dragging = false;
+        releaseTracker();
+        velocityTracker = VelocityTracker.obtain();
+        velocityTracker.addMovement(event);
+    }
+
+    /** Feeds one movement into the gesture's velocity history. */
+    private void track(MotionEvent event) {
+        if (velocityTracker == null) velocityTracker = VelocityTracker.obtain();
+        velocityTracker.addMovement(event);
+    }
+
+    /**
+     * Turns a finger leaving the screen into momentum, when it was going fast enough.
+     *
+     * <p>A drag that never became one throws its history away instead of flinging: a
+     * tap next to a row must not send the list flying.
+     */
+    private void releaseIntoFling() {
+        VelocityTracker tracker = velocityTracker;
+        velocityTracker = null;
+        if (tracker == null) return;
+        int velocity = 0;
+        try {
+            tracker.computeCurrentVelocity(1000, maximumFlingVelocity);
+            velocity = (int) tracker.getYVelocity();
+        } finally {
+            tracker.recycle();
+        }
+        if (!dragging || Math.abs(velocity) <= minimumFlingVelocity) {
+            return;
+        }
+        // The scroller moves the offset, so a finger travelling down (a positive
+        // velocity) must scroll the offset back up: the content follows the finger.
+        scroller.fling(0, scrollY, 0, -velocity, 0, 0, 0, maxScroll);
+        postInvalidateOnAnimation();
+    }
+
+    private void releaseTracker() {
+        if (velocityTracker == null) return;
+        velocityTracker.recycle();
+        velocityTracker = null;
+    }
+
+    /**
+     * The drag anchor once the touch slop has been crossed.
+     *
+     * <p>The slop is movement the user did not mean, so it is subtracted rather than
+     * played back: anchoring {@code slop} past the point the gesture started at means
+     * the content resumes exactly where the finger already is instead of snapping
+     * forward by the distance it took to be recognised as a scroll.
+     *
+     * <p>Pure, and unit tested, because it is the difference between a list that
+     * tracks the finger and one that lurches at the start of every drag.
+     */
+    static int anchorAfterSlop(int downY, int delta, int slop) {
+        return delta >= 0 ? downY + slop : downY - slop;
     }
 
     @Override public boolean performClick() {

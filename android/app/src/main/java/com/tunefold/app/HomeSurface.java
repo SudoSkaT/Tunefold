@@ -7,57 +7,90 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Home: what to play next, not what is playing now.
+ * Home: what to play next, in the order a person reaches for it.
  *
- * <p>Three groups, in the order a person uses them — keep going, then the music they
- * already said yes to, then something they did not choose — and a documented seam for
- * whatever comes after. The player is deliberately <b>not</b> here: it is one tap away
- * in the strip at the bottom, always, and embedding it would make Home a screen whose
- * main content is a control the user already has.
+ * <p><b>The order is the design.</b> There is exactly one thing the screen is for:
+ * starting something, or continuing what is already started. So the screen is
+ * <ol>
+ *   <li><b>Continue listening</b>, when something is playing — the queue as a list,
+ *       which the user can edit, not a picture of one;</li>
+ *   <li><b>Start here</b>, when nothing is: what can be played right now, which is
+ *       either what they saved or the one action that can produce something to save;</li>
+ *   <li><b>L1K3D</b>, as a <em>preview</em> — a handful of the most recent, with the
+ *       heading leading to all of them;</li>
+ *   <li><b>Recommended</b>, asked for once per track.</li>
+ * </ol>
+ *
+ * <p><b>Nothing is shown twice.</b> A block that previews something the user can
+ * already open is not a second copy of it, it is a way in; and the count in the
+ * heading is the true count, not the number of rows that survived the preview. Before
+ * this, Home carried the whole of L1K3D and nothing anywhere led out of it.
  *
  * <h3>Reload policy</h3>
  * Recommendations are a provider round trip, so they are asked for once per track, not
- * once per render. Continue listening is local (the session already knows the queue) and
- * is re-derived whenever the current track moves. L1K3D is local too and re-derives
- * when membership changes.
+ * once per render. The local blocks are local and re-derive when their input moves —
+ * membership for L1K3D, the queue for "continue listening" — and not one time in
+ * between. The session notifies its observers twice a second for every reason at
+ * once, and a screen that rebuilds itself on each of those notifications is rebuilding
+ * the same rows to show the same picture while the user reads it.
  *
- * <h3>Why there is a revision here</h3>
- * The session notifies its observers twice a second, for every reason at once. This
- * surface used to re-derive both local groups on every one of those notifications,
- * which meant building two lists, walking seventeen identities and asking two
- * {@link TrackList}s to drop and rebuild every row they had — twice a second, to
- * arrive at the picture already on screen. It is the classic cost of not asking
- * whether the answer would change: the screen was redrawing itself while the user
- * read it. The two guards below turn that into two integer comparisons.
- *
- * <h3>The fourth slot</h3>
- * There is room for one more group and no placeholder for it: a heading with nothing
- * under it is a promise the product has not made yet. Future content adds a
- * {@link TrackGroup} here and nothing else changes.
+ * <p>The player is deliberately <b>not</b> here: it is one tap away in the strip at
+ * the bottom, always, and embedding it would make Home a screen whose main content is
+ * a control the user already has.
  */
 @android.annotation.SuppressLint("ViewConstructor")
 final class HomeSurface extends SectionSurface {
 
+    /** Where the blocks lead; the screen owns navigation, the surface owns content. */
+    interface Navigation {
+        void openSearch();
+        void openLiked();
+        void openDownloads();
+    }
+
+    /**
+     * How much of L1K3D a preview shows.
+     *
+     * <p>Enough to recognise what it is and enough to start from; the rest is one tap
+     * away on the heading. A preview that is the whole list is not a preview, and a
+     * library of five hundred rows on the discovery screen is a list the user has to
+     * scroll past to reach anything else.
+     */
+    private static final int PREVIEW_ROWS = 6;
+
     private final TrackGroup continueListening;
+    private final TrackGroup startHere;
     private final TrackGroup liked;
     private final TrackGroup recommended;
+    private final Navigation navigation;
 
     /** Identity the recommendations were asked for; {@code null} for "never". */
     private String recommendationsFor = null;
     private boolean built;
 
-    /** Last inputs the local groups were derived from; see the note above. */
+    /** Last inputs the local blocks were derived from; see the note above. */
     private TrackKey renderedActiveKey;
     private int renderedQueueSize = -1;
     private int renderedLikedRevision = -1;
+    /** Download set as it was last derived; see the note at its use. */
+    private int renderedDownloadsRevision = -1;
 
-    HomeSurface(Context context, Host host) {
+    HomeSurface(Context context, Host host, Navigation navigation) {
         super(context, host);
-        continueListening = group("Continue listening");
+        this.navigation = navigation;
+        // The order this screen is read in.
+        continueListening = group("Sigue escuchando");
+        startHere = group("Empieza aquí");
         liked = group("L1K3D");
-        recommended = group("Recommended");
+        recommended = group("Recomendado");
         recommended.state().setActionHost(() -> loadRecommendations(force = true));
-        for (TrackGroup candidate : new TrackGroup[] {continueListening, liked, recommended}) {
+
+        // The previews lead to the whole list; the queue does not, because the rest of
+        // it is the player and the player is one tap away in the strip.
+        liked.setAction("Ver todo", () -> navigation.openLiked());
+
+        for (TrackGroup candidate : new TrackGroup[] {continueListening, startHere, liked,
+                recommended}) {
             candidate.setRangeListener((first, count) -> requestArtwork(candidate));
         }
     }
@@ -85,7 +118,7 @@ final class HomeSurface extends SectionSurface {
     @Override void onSessionChanged() { render(false); }
 
     /**
-     * Re-derives the local groups and asks for recommendations if they are stale.
+     * Re-derives the local blocks and asks for recommendations if they are stale.
      *
      * @param force re-derive even if no input moved; used on arrival
      */
@@ -99,28 +132,56 @@ final class HomeSurface extends SectionSurface {
         continueListening.setActiveTrack(active);
         liked.setActiveTrack(active);
         recommended.setActiveTrack(active);
+        startHere.setActiveTrack(active);
+
+        // Exactly one of the two top blocks is ever on screen: what is playing, or
+        // what could be. Both at once would be the same information twice, which is
+        // what this screen is being reorganised to stop doing.
+        boolean playing = snapshot.currentTrack != null;
+        continueListening.setVisibleGroup(playing);
+        startHere.setVisibleGroup(!playing);
 
         // "Keep going" is the queue from the current track onwards: it changes when
-        // the track or the queue does, and not one single time in between.
-        boolean queueMoved = active != renderedActiveKey
-                ? active != null || renderedActiveKey != null
+        // the track or the queue does, and not one single time in between. The
+        // downloads revision is in the guard because the store scan lands after the
+        // first render — without it the block is drawn once, empty, and stays empty,
+        // which is the same bug the downloads view had and the same fix.
+        int downloadsRevision = session.downloadsRevision();
+        boolean queueMoved = active != null ? active != renderedActiveKey
                 : snapshot.queue.size() != renderedQueueSize;
-        if (force || queueMoved) {
+        boolean downloadsMoved = downloadsRevision != renderedDownloadsRevision;
+        renderedDownloadsRevision = downloadsRevision;
+        if (force || playing != (renderedActiveKey != null) || queueMoved || downloadsMoved) {
             renderedActiveKey = active;
             renderedQueueSize = snapshot.queue.size();
-            continueListening.show(continuing(), false);
+            if (playing) {
+                continueListening.setTitle("Sigue escuchando", snapshot.queue.size());
+                continueListening.show(continuing(), false);
+            } else {
+                renderStartHere(session, force);
+            }
         }
 
         // L1K3D is a membership set, and a membership set has a revision.
         if (force || likedRevision != renderedLikedRevision) {
             renderedLikedRevision = likedRevision;
+            List<TrackKey> keys = session.likedKeys();
             List<MediaTrack> mine = new ArrayList<>();
-            for (TrackKey key : session.likedKeys()) {
-                MediaTrack track = session.describeLiked(key);
+            // The whole membership, described: a row may need the track's own
+            // metadata to be playable, and the preview is applied after.
+            for (TrackKey key : keys) {
+                MediaTrack track = session.describeRemembered(key);
                 if (track != null) mine.add(track);
             }
-            liked.setTitle("L1K3D", mine.size());
-            liked.show(mine, false);
+            liked.setTitle("L1K3D", keys.size());
+            // The heading counts what exists, not what is previewed.
+            // The way out exists whenever the preview is a preview. Comparing the
+            // preview against what was described would hide it exactly when the list
+            // is long enough to need it.
+            liked.setAction(keys.size() > PREVIEW_ROWS ? "Ver todo" : null,
+                    () -> navigation.openLiked());
+            if (mine.isEmpty()) liked.showEmpty("Todavía no hay nada en L1K3D.");
+            else liked.show(preview(mine, PREVIEW_ROWS), false);
         }
 
         MediaTrack current = snapshot.currentTrack;
@@ -130,6 +191,59 @@ final class HomeSurface extends SectionSurface {
             return;
         }
         loadRecommendations(force = false);
+    }
+
+    /**
+     * What can be played right now, for someone who has not played anything yet.
+     *
+     * <p>One block, and one idea: <b>what they saved to disk</b>. Not the whole
+     * library — L1K3D is right below and a discovery screen that shows the same tracks
+     * twice is not a discovery screen, it is a list with a heading on it. Downloads are
+     * the part that is genuinely different from a taste: they are playable with no
+     * network, which is exactly what somebody opening the app for the first time
+     * needs.
+     *
+     * <p>And when there is nothing downloaded, there is nothing to offer but the one
+     * action that can produce something: a recommendation is a function of something
+     * played, and nothing has been played, so inventing one would mean inventing
+     * tracks the app has never been told about.
+     */
+    private void renderStartHere(PlaybackSession session, boolean force) {
+        List<MediaTrack> saved = new ArrayList<>(session.downloadedTracks());
+        if (saved.isEmpty()) {
+            startHere.setTitle("Empieza aquí", SectionHeader.NO_COUNT);
+            startHere.setAction(null, null);
+            // No tracks, no tracks: the block is the way in, not a list.
+            startHere.showAction("Todavía no hay nada que reproducir. Busca algo y "
+                    + "empieza por ahí.", "Abre la búsqueda", Icon.SEARCH,
+                    () -> navigation.openSearch());
+            return;
+        }
+        startHere.setTitle("Empieza aquí", saved.size());
+        startHere.setAction(saved.size() > PREVIEW_ROWS ? "Ver descargas" : null,
+                () -> navigation.openDownloads());
+        startHere.show(preview(saved, PREVIEW_ROWS), false);
+    }
+
+    /**
+     * The rows a preview shows: the most recent ones, in order.
+     *
+     * <p>The tail, not the head: L1K3D is membership in the order it was built, and
+     * what somebody wants from a preview of their own library is what they added last —
+     * which is also the only part of the list that is not already old enough to have
+     * been heard on Home before.
+     *
+     * @param all   the whole list, in membership order
+     * @param limit how many rows the preview may show
+     */
+    static java.util.List<MediaTrack> preview(java.util.List<MediaTrack> all, int limit) {
+        java.util.List<MediaTrack> source = all == null ? java.util.Collections.emptyList()
+                : all;
+        // A block that shows nothing is empty; it is not a block that shows
+        // everything because someone asked for zero rows.
+        if (limit <= 0) return java.util.Collections.emptyList();
+        if (source.size() <= limit) return source;
+        return new ArrayList<>(source.subList(source.size() - limit, source.size()));
     }
 
     /** The queue from the current track onwards: what "keep going" means. */
@@ -171,7 +285,7 @@ final class HomeSurface extends SectionSurface {
                 return;
             }
             List<MediaTrack> tracks = candidates == null ? new ArrayList<>() : candidates;
-            recommended.setTitle("Recommended", tracks.size());
+            recommended.setTitle("Recomendado", tracks.size());
             recommended.show(tracks, false);
         });
     }
@@ -184,12 +298,14 @@ final class HomeSurface extends SectionSurface {
 
     @Override void setActiveKey(TrackKey key) {
         continueListening.setActiveTrack(key);
+        startHere.setActiveTrack(key);
         liked.setActiveTrack(key);
         recommended.setActiveTrack(key);
     }
 
     @Override void refresh() {
         continueListening.refresh();
+        startHere.refresh();
         liked.refresh();
         recommended.refresh();
     }

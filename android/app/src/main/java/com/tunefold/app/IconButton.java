@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.res.ColorStateList;
 import android.graphics.drawable.RippleDrawable;
 import android.text.TextUtils;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.ImageView;
 
@@ -212,7 +213,28 @@ class IconButton extends ImageView implements ArtworkTheme.AccentListener {
         setMinimumWidth(0);
         setMinimumHeight(0);
         setPadding(0, 0, 0, 0);
+        // Un glifo no es un control, y aquí se newfound la diferencia: un hijo que
+        // declara cualquier estado pulsable se queda con el gesto entero, y el
+        // destino que lo contiene deja de responder justo en la zona del icono,
+        // que es donde apunta el dedo. `setClickable(false)` no bastaba: con texto
+        // emergente el glifo seguía siendo «pulsable» y consumía el toque.
+        glyph = true;
+        setClickable(false);
+        setLongClickable(false);
+        setFocusable(false);
+        setTooltipText(null);
+        // El estado (incluido la selección) lo cuenta el padre, que es el control.
+        setDuplicateParentStateEnabled(true);
     }
+
+    /** Un glifo jamás queda con el gesto: se lo pasa entero a quien lo contiene. */
+    @Override public boolean onTouchEvent(MotionEvent event) {
+        if (glyph) return false;
+        return super.onTouchEvent(event);
+    }
+
+    /** Cierto cuando esta vista es sólo el dibujo de un control mayor. */
+    private boolean glyph;
 
     /** Colour of the glyph in the current state. */
     int resolveGlyphColor() {

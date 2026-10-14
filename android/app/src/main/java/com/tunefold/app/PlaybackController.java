@@ -298,7 +298,14 @@ final class PlaybackController implements AudioTrackOutput.Listener {
             // stops. Adopting the engine's STOPPED afterwards would clobber
             // whatever it just decided and briefly show "Stopped" mid-playback.
             if (listener != null) {
-                listener.onTrackFinished(operation.get());
+                long attempt = operation.get();
+                // ON THE MAIN THREAD. This runs on the commands thread, and what it
+                // starts is a chain that ends in views: an end of track advances the
+                // queue, the session tells its observers, and a row changes its
+                // activation state. A drawable state change off the main thread is
+                // an `AndroidRuntimeException`, and with a queue that advances by
+                // itself every track hit it.
+                MainThread.run(() -> listener.onTrackFinished(attempt));
                 return;
             }
         }

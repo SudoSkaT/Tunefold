@@ -79,11 +79,11 @@ final class Library {
         synchronized (lock) {
             changed = value ? liked.add(key) : liked.remove(key);
             // Same bookkeeping as toggleLiked, or a programmatic like would lose
-            // the label that L1K3D shows after a restart.
-            if (changed && value && track.title != null && !track.title.isEmpty()) {
-                labels.put(key, track.title);
+            // everything L1K3D needs to render the member after a restart.
+            if (changed && value) {
+                remember(key, track);
             } else if (changed) {
-                labels.remove(key);
+                forget(key);
             }
         }
         if (changed) {
@@ -103,12 +103,10 @@ final class Library {
             nowLiked = !liked.contains(key);
             if (nowLiked) {
                 liked.add(key);
-                // Keep a label so L1K3D can show a title after a restart instead
-                // of a bare provider id, which is all the identity survives.
-                if (track.title != null && !track.title.isEmpty()) labels.put(key, track.title);
+                remember(key, track);
             } else {
                 liked.remove(key);
-                labels.remove(key);
+                forget(key);
             }
         }
         // Durable, unlike {@link #markPlayed}: a like is a decision the user made, and
@@ -118,6 +116,55 @@ final class Library {
         persistNow();
         notifyChanged();
         return nowLiked;
+    }
+
+    /**
+     * Keeps what L1K3D needs to render a member that nothing else knows about.
+     *
+     * <p>Membership is an identity, and an identity has no cover, no title and no
+     * playable source. After a restart the only real track objects left are the ones in
+     * the queue, so every member that is not playing is a row synthesised from the
+     * library alone — and a row with no remembered cover asks for nothing and shows the
+     * placeholder for ever. What is kept here is therefore exactly what a row cannot
+     * derive from the key: a label to read, a cover to ask for, a URL to play from.
+     *
+     * <p>Blank values are not stored, so "unknown" stays unknown instead of becoming an
+     * empty string that is then asked for and never resolves.
+     */
+    private void remember(TrackKey key, MediaTrack track) {
+        if (track == null) return;
+        if (track.title != null && !track.title.trim().isEmpty()) {
+            labels.put(key, track.title);
+        }
+        if (track.thumbnail != null && !track.thumbnail.trim().isEmpty()) {
+            thumbnails.put(key, track.thumbnail.trim());
+        }
+        if (track.providerUrl != null && !track.providerUrl.trim().isEmpty()) {
+            sources.put(key, track.providerUrl.trim());
+        }
+    }
+
+    /**
+     * Keeps what the provider has just taught us about a member.
+     *
+     * <p>Asynchronous on purpose, unlike a like: this is learnable data about a
+     * decision the user already made, not the decision itself, so losing the last few
+     * writes costs one more provider round trip and nothing else.
+     *
+     * @return whether there was anything to learn
+     */
+    boolean learnMetadata(TrackKey key, MediaTrack track) {
+        if (key == null || track == null || !isLiked(key)) return false;
+        synchronized (lock) { remember(key, track); }
+        persistAsync();
+        return true;
+    }
+
+    /** Drops everything remembered about an identity that is no longer a member. */
+    private void forget(TrackKey key) {
+        labels.remove(key);
+        thumbnails.remove(key);
+        sources.remove(key);
     }
 
     /** Number of L1K3D members. */
@@ -222,10 +269,24 @@ final class Library {
     /**
      * Parses the on-disk representation into the in-memory sets.
      *
-     * <p>Format: one record per line, {@code <l|r>|<provider>|<id>}, where the
-     * leading letter says whether the line is L1K3D membership or a
-     * recently-played entry. Unparseable lines are ignored rather than fatal, so
-     * one bad record cannot cost the user their whole library.
+     * <p>Format: one record per line, {@code <kind>|<provider>|<id>|<value…>}, where
+     * the leading letter says what the record is:
+     *
+     * <ul>
+     *   <li>{@code l} — L1K3D membership, with an optional label running to the end
+     *       of the line;</li>
+     *   <li>{@code t} — the cover URL remembered for a member;</li>
+     *   <li>{@code u} — the provider URL remembered for a member;</li>
+     *   <li>{@code r} — a recently-played entry.</li>
+     * </ul>
+     *
+     * <p>{@code t} and {@code u} are separate records rather than extra fields on
+     * {@code l} precisely because the label owns the rest of its line: a title may
+     * contain the separator, so anything appended after it would be indistinguishable
+     * from part of the title in a file written before these records existed.
+     *
+     * <p>Unparseable lines are ignored rather than fatal, so one bad record cannot cost
+     * the user their whole library.
      */
     private void parse(String text) {
         for (String line : text.split("\n")) {
@@ -245,15 +306,29 @@ final class Library {
             if (provider.isEmpty() || id.isEmpty()) continue;
             TrackKey key = TrackKey.of(provider, id);
             if (key == null) continue;
+            String value = idEnd < 0 || idEnd == rest.length() - 1
+                    ? "" : rest.substring(idEnd + 1);
             if (kind == 'l') {
                 liked.add(key);
-                if (idEnd > 0 && idEnd < rest.length() - 1) {
-                    labels.put(key, rest.substring(idEnd + 1));
-                }
+                if (!value.isEmpty()) labels.put(key, value);
+            } else if (kind == 't') {
+                if (!value.isEmpty()) thumbnails.put(key, value);
+            } else if (kind == 'u') {
+                if (!value.isEmpty()) sources.put(key, value);
             } else if (kind == 'r') {
                 recent.add(key);
             }
         }
+        // Cover and source records describe members, and only members are ever
+        // described. Dropping the orphans after the fact — rather than while parsing —
+        // keeps the rule independent of the order the records happen to be written in.
+        dropUnremembered(thumbnails);
+        dropUnremembered(sources);
+    }
+
+    /** Forgets a remembered field whose identity is not a member any more. */
+    private void dropUnremembered(java.util.Map<TrackKey, String> fields) {
+        fields.keySet().removeIf(key -> !liked.contains(key));
     }
 
     private void persist() { writeAtomically(serialize()); }
@@ -358,6 +433,9 @@ final class Library {
         synchronized (lock) {
             liked.clear();
             recent.clear();
+            labels.clear();
+            thumbnails.clear();
+            sources.clear();
             liked.addAll(likedKeys);
             recent.addAll(recentKeys);
             loaded = true;
@@ -368,6 +446,10 @@ final class Library {
     /** The persisted representation; the single writer and parser agree on it. */
     /** Display label per liked identity; empty for files written before this. */
     private final java.util.Map<TrackKey, String> labels = new java.util.HashMap<>();
+    /** Cover URL per liked identity, so a member that is not playing still has a cover. */
+    private final java.util.Map<TrackKey, String> thumbnails = new java.util.HashMap<>();
+    /** Provider URL per liked identity, so a member that is not playing is still playable. */
+    private final java.util.Map<TrackKey, String> sources = new java.util.HashMap<>();
 
     /**
      * One-line title.
@@ -386,6 +468,30 @@ final class Library {
         synchronized (lock) { return labels.get(key); }
     }
 
+    /**
+     * Cover URL remembered for a liked identity, or {@code null} when unknown.
+     *
+     * <p>This is what turns an L1K3D row from a grey square into a cover after a
+     * restart: identity alone cannot be drawn, and the session has no track object for
+     * a member that is not playing.
+     */
+    String thumbnailFor(TrackKey key) {
+        if (key == null) return null;
+        synchronized (lock) { return thumbnails.get(key); }
+    }
+
+    /**
+     * Provider URL remembered for a liked identity, or {@code null} when unknown.
+     *
+     * <p>What makes a member that nothing else knows about playable: resolution needs
+     * provider metadata, and the only thing that survives the process is what this
+     * library kept.
+     */
+    String sourceFor(TrackKey key) {
+        if (key == null) return null;
+        synchronized (lock) { return sources.get(key); }
+    }
+
     String serialize() {
         StringBuilder text = new StringBuilder();
         synchronized (lock) {
@@ -399,6 +505,11 @@ final class Library {
                     text.append(SEPARATOR).append(oneLine(label));
                 }
                 text.append('\n');
+                // Written as their own records, in membership order, so the document
+                // stays deterministic and so a file written before they existed keeps
+                // parsing exactly as it did.
+                appendField(text, 't', key, thumbnails.get(key));
+                appendField(text, 'u', key, sources.get(key));
             }
             for (TrackKey key : recent) {
                 text.append('r').append(SEPARATOR).append(key.provider()).append(SEPARATOR)
@@ -408,11 +519,22 @@ final class Library {
         return text.toString();
     }
 
+    /** One whole-line record, or nothing at all when the value is unknown. */
+    private static void appendField(StringBuilder text, char kind, TrackKey key, String value) {
+        if (value == null || value.isEmpty()) return;
+        text.append(kind).append(SEPARATOR).append(key.provider()).append(SEPARATOR)
+                .append(key.providerTrackId()).append(SEPARATOR)
+                .append(oneLine(value)).append('\n');
+    }
+
     /** Test hook: parses a serialized representation into a fresh library. */
     void loadFromForTest(String text) {
         synchronized (lock) {
             liked.clear();
             recent.clear();
+            labels.clear();
+            thumbnails.clear();
+            sources.clear();
             loaded = true;
             // Delegates to the one parser so tests cannot drift from disk.
             parse(text);

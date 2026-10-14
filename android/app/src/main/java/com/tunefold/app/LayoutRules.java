@@ -69,12 +69,19 @@ final class LayoutRules {
     static final int ARTWORK_MAX_MEDIUM_DP = 480;
     static final int ARTWORK_MAX_EXPANDED_DP = 540;
 
-    /** Extra air per step, as a fraction, on the screens that have room for it. */
-    static final float SPACING_STEP = 0.25f;
-    /** Air added between blocks on a medium or expanded window, in {@code dp}. */
+    /** Air added between blocks per step, on the screens that have room for it. */
     static final float SPACING_STEP_DP = 4f;
     /** How much the page gutter grows per step, in {@code dp}. */
     static final float GUTTER_STEP_DP = 8f;
+    /**
+     * Narrowest the metadata region may get beside the cover, in {@code dp}.
+     *
+     * <p>In two regions the cover and the details share one row, and the cover is
+     * computed first — so without a floor the cover could claim the whole column and
+     * leave the details with nothing, which is a screen that shows a cover and no
+     * way to control it. The floor is what makes the second region a region.
+     */
+    static final int DETAILS_MIN_DP = 280;
 
     private LayoutRules() { }
 
@@ -208,6 +215,12 @@ final class LayoutRules {
             // that does not (the first layout, before anything has been measured)
             // gets the width rule alone, which is the safer of the two errors.
             if (innerHeightDp > 0) side = Math.min(side, Math.round(innerHeightDp * heightShare));
+            // Two regions share one row: the cover yields enough of it for the
+            // metadata to exist at all. This is the rule that keeps "cover on the
+            // left, everything else on the right" true at every width.
+            if (twoColumnPlayer()) {
+                side = Math.min(side, width - DETAILS_MIN_DP);
+            }
             return Math.max(Math.round(DesignTokens.ARTWORK_MIN),
                     Math.min(artworkMaxDp(), side));
         }

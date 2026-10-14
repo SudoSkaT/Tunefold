@@ -173,7 +173,15 @@ enum Icon {
     WARNING(false, "M 12 4 L 21 19.5 L 3 19.5 Z M 12 10 L 12 14.4 M 12 16.4 L 12 16.6"),
 
     /** Cross: dismiss. */
-    CLOSE(false, "M 6.4 6.4 L 17.6 17.6 M 17.6 6.4 L 6.4 17.6");
+    CLOSE(false, "M 6.4 6.4 L 17.6 17.6 M 17.6 6.4 L 6.4 17.6"),
+
+    /** A remote control: the player over a locked screen. */
+    REMOTE(false,
+            "M 6.5 4.5 L 17.5 4.5 C 18.6 4.5 19.5 5.4 19.5 6.5 L 19.5 15.5"
+                    + " C 19.5 16.6 18.6 17.5 17.5 17.5 L 6.5 17.5"
+                    + " C 5.4 17.5 4.5 16.6 4.5 15.5 L 4.5 6.5"
+                    + " C 4.5 5.4 5.4 4.5 6.5 4.5 Z"
+                    + " M 9 11 L 9 14 M 12 9.5 L 12 14 M 15 12.5 L 15 14");
 
     private final boolean filled;
     private final String geometry;

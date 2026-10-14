@@ -244,6 +244,63 @@ public class DownloadRegistryTest {
         assertEquals(null, registry.titleOf(null));
     }
 
+    // ------------------------------------------------------------- remembered covers
+
+    /**
+     * The cover a file was downloaded with has to come back with the file.
+     *
+     * <p>The sidecar is written with the artwork the track had when it was saved, and
+     * this is the only copy of it left: {@code Descargadas} renders from identities in
+     * memory, so a row that cannot be handed a cover URL asks for nothing and stays a
+     * grey square — which is how the list the user saved their music into came back
+     * without a single cover on it.
+     */
+    @Test public void aSeededCoverIsReadableFromMemory() {
+        registry.seedStored(java.util.Collections.singletonList(
+                new LocalMediaStore.Entry(key("dl"), 42, null, "Nice Title",
+                        "https://img.example/dl.jpg")));
+        assertEquals("https://img.example/dl.jpg", registry.thumbnailOf(key("dl")));
+    }
+
+    /** The commit path remembers the cover too, not just the scan. */
+    @Test public void aCommittedCoverIsReadableFromMemory() {
+        registry.rememberThumbnail(key("dl"), "https://img.example/dl.jpg");
+        assertEquals("https://img.example/dl.jpg", registry.thumbnailOf(key("dl")));
+    }
+
+    /** A blank or missing cover is "unknown", never an empty URL to fetch. */
+    @Test public void aBlankCoverIsNotRemembered() {
+        assertFalse(registry.rememberThumbnail(key("dl"), "   "));
+        assertFalse(registry.rememberThumbnail(key("dl"), ""));
+        assertFalse(registry.rememberThumbnail(key("dl"), null));
+        assertEquals(null, registry.thumbnailOf(key("dl")));
+    }
+
+    /** Covers are trimmed exactly like titles. */
+    @Test public void aCoverIsTrimmedOnce() {
+        registry.rememberThumbnail(key("dl"), "  https://img.example/dl.jpg\n");
+        assertEquals("https://img.example/dl.jpg", registry.thumbnailOf(key("dl")));
+    }
+
+    @Test public void anUnknownTrackHasNoCover() {
+        assertEquals(null, registry.thumbnailOf(key("never-seen")));
+        assertEquals(null, registry.thumbnailOf(null));
+    }
+
+    /** Deleting the file must delete the cover that described it. */
+    @Test public void forgettingATrackForgetsItsCover() {
+        registry.rememberThumbnail(key("gone"), "https://img.example/gone.jpg");
+        registry.forget(key("gone"));
+        assertEquals(null, registry.thumbnailOf(key("gone")));
+    }
+
+    /** A sidecar written without a cover must not invent one. */
+    @Test public void aSidecarWithoutACoverRemembersNothing() {
+        registry.seedStored(java.util.Collections.singletonList(
+                new LocalMediaStore.Entry(key("dl"), 42, null, "Nice Title", null)));
+        assertEquals(null, registry.thumbnailOf(key("dl")));
+    }
+
     /** Deleting the file must delete the label that described it. */
     @Test public void forgettingATrackForgetsItsTitle() {
         registry.complete(key("gone"), 100, "Nice Title");
