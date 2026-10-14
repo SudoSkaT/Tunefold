@@ -53,6 +53,7 @@ public final class LockScreenControlsActivity extends Activity {
     private ForegroundPlaybackService.LocalBinder binder;
     private PlaybackSession session;
     private PlaybackController controller;
+    private ProviderRegistry providers;
     private TrackDownloader downloader;
     private boolean bound;
     private boolean destroyed;
@@ -62,6 +63,7 @@ public final class LockScreenControlsActivity extends Activity {
         @Override public void onServiceConnected(ComponentName name, IBinder service) {
             binder = (ForegroundPlaybackService.LocalBinder) service;
             controller = binder.controller();
+            providers = binder.providers();
             session = binder.session();
             downloader = binder.downloader();
             bars = new LiveAudioBars(controller);
@@ -76,6 +78,7 @@ public final class LockScreenControlsActivity extends Activity {
         @Override public void onServiceDisconnected(ComponentName name) {
             session = null;
             controller = null;
+            providers = null;
             downloader = null;
             binder = null;
         }
@@ -150,8 +153,10 @@ public final class LockScreenControlsActivity extends Activity {
             unbindService(connection);
             bound = false;
         }
+        if (deviceInteractive() && !isFinishing()) finish();
         session = null;
         controller = null;
+        providers = null;
         downloader = null;
         binder = null;
     }
@@ -211,7 +216,35 @@ public final class LockScreenControlsActivity extends Activity {
         controls.applyDownloadState(snapshot);
         controls.applyError(snapshot);
         controls.setUpNextFrom(snapshot.queue, snapshot.currentKey);
+        loadArtwork(snapshot.currentTrack);
         requestLyrics(snapshot);
+    }
+
+    /**
+     * La portada de lo que suena, decodificada al tamaño que la tarjeta está usando.
+     *
+     * <p>El mismo camino que la pantalla principal: una vez por pista, desde la caché,
+     * y el resultado se entrega con la identidad a la que pertenece para que una
+     * respuesta que llega tarde no pinte la portada de la canción anterior.
+     */
+    private void loadArtwork(MediaTrack track) {
+        if (providers == null || track == null || track.thumbnail.isEmpty()) return;
+        String identity = identityOf(track);
+        if (identity.isEmpty() || identity.equals(coverIdentity)) return;
+        coverIdentity = identity;
+        controls.expectArtwork(identity);
+        providers.loadArtwork(track, controls.artworkSidePx(), (bitmap, error) -> {
+            if (destroyed || bitmap == null) return;
+            controls.setArtwork(identity, bitmap);
+        });
+    }
+
+    /** La portada que hay en pantalla, para no decodificarla dos veces. */
+    private String coverIdentity = "";
+
+    private static String identityOf(MediaTrack track) {
+        TrackKey key = track.key();
+        return key == null ? "" : key.toString();
     }
 
     /** One lyric asked per track, exactly as the main screen does. */
@@ -229,12 +262,22 @@ public final class LockScreenControlsActivity extends Activity {
 
     private String lyricsRequestedFor;
 
-    @Override public void onWindowFocusChanged(boolean hasFocus) {
-        super.onWindowFocusChanged(hasFocus);
-        // Locked again: this screen is not something to leave behind on the lock
-        // screen, and a screen that stays there is a screen the user cannot get rid
-        // of without uninstalling the app.
-        if (!hasFocus && !isFinishing()) finish();
+    /**
+     * Se cierra cuando deja de estar delante, y no antes.
+     *
+     * <p>La regla es "parada <b>y</b> pantalla encendida". Parada sola no vale: al
+     * apagar la pantalla el sistema la esconde detrás del candado y esta actividad se
+     * detiene; cerrarse ahí dejaba al usuario sin controles al encender el móvil otra
+     * vez, cuando es justo entonces cuando los quiere. Y encendida sola tampoco: abrir
+     * la sombra de notificaciones quita el foco sin pararla, y cerrarse en ese momento
+     * era cerrar la pantalla del reproductor por mirar la hora.
+     *
+     * <p>Encendida y parada a la vez es una cosa sola: el usuario ha desbloqueado y
+     * ha seguido con su vida. Ahí esta pantalla ya hizo su trabajo.
+     */
+    private boolean deviceInteractive() {
+        android.os.PowerManager power = getSystemService(android.os.PowerManager.class);
+        return power != null && power.isInteractive();
     }
 
     @Override public void onBackPressed() {
