@@ -106,6 +106,22 @@ final class SoundBarsView extends View implements ArtworkTheme.AccentListener {
     }
 
     /**
+     * Drops whatever is painted without detaching the source.
+     *
+     * <p>For track changes and stops: the previous track's envelope must not
+     * linger frozen while the next one resolves, and a stopped surface rests
+     * empty rather than showing audio that is no longer there. Pauses keep
+     * their frozen frame (see {@link #refresh}), which is why this is a
+     * separate, explicit call and not part of it.
+     */
+    void clearPainted() {
+        bars.rewind();
+        paintedBars = 0;
+        peak = 0f;
+        invalidate();
+    }
+
+    /**
      * Lee la ventana en vivo y, sólo si hay audio nuevo, reconstruye y repinta.
      *
      * <p>Es el único punto donde estas barras hacen trabajo. Devuelve {@code false}
@@ -194,7 +210,13 @@ final class SoundBarsView extends View implements ArtworkTheme.AccentListener {
         peak = 0f;
         int count = Math.min(current.bars(), LiveAudioBars.MAX_BARS);
         float[] data = current.values();
-        float scale = laneHeight;
+        // Half the lane per unit amplitude: full-scale (±1) reaches exactly the
+        // lane edge. The previous scale (a whole lane per unit) drew peaks at
+        // twice the available height, clipping everything loud. The stroke's
+        // round caps extend half a bar width past the endpoints, so that is
+        // reserved up front.
+        float halfStroke = barPaint.getStrokeWidth() / 2f;
+        float scale = Math.max(0f, laneHeight / 2f - halfStroke);
         float middle = laneHeight / 2f;
         for (int bar = 0; bar < count; bar++) {
             int index = LiveAudioBars.BAR_VALUES * bar;

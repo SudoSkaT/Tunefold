@@ -18,15 +18,33 @@ final class ProviderRegistry implements AutoCloseable {
     private final ExecutorService worker = Executors.newSingleThreadExecutor(r ->
             new Thread(r, "tunefold-provider"));
     /**
-     * Source resolution runs on its own thread, never on {@link #worker}.
+     * Source resolution runs off {@link #worker}, never on it.
      *
      * <p>A resolution that never returns would otherwise occupy the single
      * provider thread and take search, metadata and recommendations down with
      * it: cancelling the download changes the UI but cannot unblock a call that
      * is already stuck inside the resolver.
+     *
+     * <p>Two threads, not one: skipping tracks queues one resolution per tap,
+     * and a stale call already inside the provider cannot be cancelled — with
+     * a single thread the live request waited behind every superseded one,
+     * which is what left playback stuck in buffering after a couple of quick
+     * track changes. Stale requests additionally skip their own network call
+     * on pickup (see {@link Freshness}), so the second thread is only ever
+     * needed while one stale call is still draining.
      */
-    private final ExecutorService resolutionWorker = Executors.newSingleThreadExecutor(r ->
-            new Thread(r, "tunefold-resolve"));
+    private final ExecutorService resolutionWorker = java.util.concurrent.Executors.newFixedThreadPool(
+            2, r -> new Thread(r, "tunefold-resolve"));
+    /**
+     * User-initiated search, on its own thread.
+     *
+     * <p>Search must never wait behind prefetch: lyrics, recommendations and
+     * learned metadata share {@link #worker} and each costs a network round
+     * trip, so after a couple of tracks the queue ahead of a search was
+     * seconds long and typing felt stuck.
+     */
+    private final ExecutorService searchWorker = Executors.newSingleThreadExecutor(r ->
+            new Thread(r, "tunefold-search"));
     private final ExecutorService artworkWorker = Executors.newSingleThreadExecutor(r ->
             new Thread(r, "tunefold-artwork-cache"));
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -60,6 +78,21 @@ final class ProviderRegistry implements AutoCloseable {
             return;
         }
         String identity = track.key() == null ? track.thumbnail : track.key().toString();
+        // Coalesce concurrent requests for the same cover: a fast scroll binds
+        // dozens of rows for a handful of tracks, and without this each bind
+        // queued its own download+decode of the same file behind the single
+        // artwork worker. The first request does the work; the rest join it.
+        synchronized (artworkInflight) {
+            java.util.List<Callback<android.graphics.Bitmap>> waiting =
+                    artworkInflight.get(identity);
+            if (waiting != null) {
+                waiting.add(callback);
+                return;
+            }
+            java.util.List<Callback<android.graphics.Bitmap>> started = new ArrayList<>(4);
+            started.add(callback);
+            artworkInflight.put(identity, started);
+        }
         artworkWorker.execute(() -> {
             long started = android.os.SystemClock.elapsedRealtimeNanos();
             // A memory hit still repaints, and still owns the accent: a cover that is
@@ -75,7 +108,7 @@ final class ProviderRegistry implements AutoCloseable {
             if (cached != null && cached.getWidth() < minSide(targetPx)) cached = null;
             if (cached != null) {
                 if (ownsPalette) applyDerivedAccent(cached);
-                deliver(callback, cached, null);
+                deliverArtwork(identity, cached, null);
                 return;
             }
             java.io.File file = cache.getOrDownload(track.thumbnail);
@@ -89,8 +122,30 @@ final class ProviderRegistry implements AutoCloseable {
                     + " elapsed_ms="
                     + ((android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000_000L));
             if (bitmap != null && ownsPalette) applyDerivedAccent(bitmap);
-            deliver(callback, bitmap, bitmap == null ? "Artwork unavailable" : null);
+            deliverArtwork(identity, bitmap, bitmap == null ? "Artwork unavailable" : null);
         });
+    }
+
+    /** In-flight artwork requests by identity, for request coalescing. */
+    private final java.util.Map<String, java.util.List<Callback<android.graphics.Bitmap>>>
+            artworkInflight = new java.util.HashMap<>();
+
+    /**
+     * Completes every request coalesced onto {@code identity}.
+     *
+     * <p>The list is taken under lock and delivered on the main thread, so a
+     * slow decode fans out to all rows waiting for the same cover with one
+     * download and one decode.
+     */
+    private void deliverArtwork(String identity, android.graphics.Bitmap bitmap, String error) {
+        java.util.List<Callback<android.graphics.Bitmap>> waiting;
+        synchronized (artworkInflight) {
+            waiting = artworkInflight.remove(identity);
+        }
+        if (waiting == null) return;
+        for (Callback<android.graphics.Bitmap> callback : waiting) {
+            deliver(callback, bitmap, error);
+        }
     }
 
     /**
@@ -163,6 +218,17 @@ final class ProviderRegistry implements AutoCloseable {
             deliver(callback, null, "Track has no title to look lyrics up by");
             return;
         }
+        // The lyrics native lives in the YouTube-gated module: without the
+        // feature the binary has no such function and the call below throws
+        // UnsatisfiedLinkError — an Error, not an Exception, so the catch
+        // around it cannot see it and the uncaught throw kills the whole
+        // process. That was the portrait-player crash on feature-less builds:
+        // opening the player asks for lyrics once per track, unconditionally.
+        String missing = youtubeMissingError(BuildConfig.YOUTUBE_ENABLED);
+        if (missing != null) {
+            deliver(callback, null, missing);
+            return;
+        }
         String who = !track.artist.isEmpty() ? track.artist : track.channel;
         worker.execute(() -> {
             long started = android.os.SystemClock.elapsedRealtimeNanos();
@@ -197,6 +263,21 @@ final class ProviderRegistry implements AutoCloseable {
     private static String identityOf(MediaTrack track) {
         TrackKey key = track.key();
         return key == null ? "" : key.toString();
+    }
+
+    /**
+     * Error when the YouTube natives are absent from a binary built with
+     * {@code youtubeEnabled}, or {@code null} when they are present.
+     *
+     * <p>Every YouTube-gated JNI entry must pass through here or through the
+     * equivalent {@code available} check before touching native code: calling
+     * a function the binary was compiled without throws
+     * {@link UnsatisfiedLinkError}, an {@link Error} that no
+     * {@code catch (Exception)} observes, and the uncaught throw takes the
+     * whole process down with it.
+     */
+    static String youtubeMissingError(boolean youtubeEnabled) {
+        return youtubeEnabled ? null : "YouTube provider is not initialized";
     }
 
     /**
@@ -290,15 +371,33 @@ final class ProviderRegistry implements AutoCloseable {
         return android.graphics.BitmapFactory.decodeFile(file.getAbsolutePath(), options);
     }
 
+    /**
+     * How long a search may take before it fails on the app side.
+     *
+     * <p>Backstop for a native call stuck on a dead network: without it a
+     * search on almost-no coverage hangs with no outcome and no way forward,
+     * because the late answer — if it ever arrives — is still delivered
+     * afterwards. With it, the timeout wins once and the late answer is
+     * dropped by the same guard.
+     */
+    private static final long SEARCH_TIMEOUT_MS = 20_000L;
+
     void search(String query, Callback<List<MediaTrack>> callback) {
-        worker.execute(() -> {
-            if (!available) { deliver(callback, null, "YouTube provider is not initialized"); return; }
+        java.util.concurrent.atomic.AtomicBoolean delivered = new java.util.concurrent.atomic.AtomicBoolean(false);
+        Callback<List<MediaTrack>> once = (value, error) -> {
+            if (delivered.compareAndSet(false, true)) deliver(callback, value, error);
+        };
+        searchWorker.execute(() -> {
+            if (!available) { once.complete(null, "YouTube provider is not initialized"); return; }
             long start = android.os.SystemClock.elapsedRealtimeNanos();
             String response = TunefoldBridge.searchYoutube(query, 20);
             android.util.Log.i("TunefoldPerf", "event=search_complete elapsed_ms="
                     + ((android.os.SystemClock.elapsedRealtimeNanos() - start) / 1_000_000L));
-            parseTracks(response, callback);
+            parseTracks(response, once);
         });
+        main.postDelayed(() -> once.complete(null,
+                "Search timed out. Check your connection and try again."),
+                SEARCH_TIMEOUT_MS);
     }
 
     void resolve(String url, PlaybackTrace trace, Callback<MediaTrack> callback) {
@@ -329,7 +428,24 @@ final class ProviderRegistry implements AutoCloseable {
      * whose file was removed — the URL is resolved back into full metadata first
      * and the source is resolved from that.
      */
+    /**
+     * Answers whether a queued resolution is still wanted when a thread picks
+     * it up.
+     *
+     * <p>Checked after the cheap local-store hit and before any blocking
+     * provider call: a request superseded while waiting must not spend a
+     * network round trip that only delays the track the user actually chose.
+     * Skipped requests complete nothing — their owner already moved on and
+     * ignores late answers by construction.
+     */
+    interface Freshness { boolean isFresh(); }
+
     void playableSource(MediaTrack track, PlaybackTrace trace, Callback<PlayableSource> callback) {
+        playableSource(track, trace, null, callback);
+    }
+
+    void playableSource(MediaTrack track, PlaybackTrace trace, Freshness fresh,
+                        Callback<PlayableSource> callback) {
         resolutionWorker.execute(() -> {
             LocalMediaStore local = localMediaStore;
             java.io.File localFile = local == null ? null : local.get(track.provider, track.providerId);
@@ -339,6 +455,11 @@ final class ProviderRegistry implements AutoCloseable {
                 if (trace != null) trace.mark(PlaybackTrace.PLAYABLE_SOURCE_AVAILABLE,
                         "kind=local_media");
                 deliver(callback, new PlayableSource(localFile.toURI().toString(), "[]"), null);
+                return;
+            }
+            if (fresh != null && !fresh.isFresh()) {
+                android.util.Log.i("TunefoldPerf", "event=RESOLVE_SUPERSEDED id="
+                        + track.provider + "/" + track.providerId);
                 return;
             }
             if (trace != null) trace.mark(PlaybackTrace.SOURCE_RESOLUTION_START, "hit=none");
@@ -493,6 +614,7 @@ final class ProviderRegistry implements AutoCloseable {
     @Override public void close() {
         worker.shutdownNow();
         resolutionWorker.shutdownNow();
+        searchWorker.shutdownNow();
         artworkWorker.shutdownNow();
         available = false;
     }

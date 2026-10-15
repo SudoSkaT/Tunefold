@@ -116,6 +116,45 @@ final class PlaybackSession {
     private boolean autoplayInFlight;
     /** True once autoplay has been considered for the current EOF. */
     private boolean eofHandled;
+    /**
+     * Radio mode: the queue belongs to a generated station, refilled from
+     * related tracks while it plays.
+     */
+    private boolean radioOn;
+    /** What the station was built from, for the "Radio de X" label. */
+    private String radioSeedTitle = "";
+    /**
+     * Artist the station was built from, or "" for a track station.
+     *
+     * <p>Labels the station ("Radio: X") and seeds it once; refills keep
+     * following related tracks so the station never stalls waiting for one
+     * more search page.
+     */
+    private String radioSeedArtist = "";
+    /** Guards against two concurrent radio refills. */
+    private boolean radioRefillInFlight;
+    /**
+     * Display recommendations remembered per track, newest five.
+     *
+     * <p>The player's shelf already fetched these, so when the queue runs out
+     * the next track can start instantly instead of buffering a fresh fetch.
+     * Bounded and identity-keyed: a shelf belongs to exactly one track.
+     */
+    private final java.util.Map<TrackKey, java.util.List<MediaTrack>> displayCache =
+            new java.util.LinkedHashMap<TrackKey, java.util.List<MediaTrack>>(16, 0.75f, true) {
+                @Override protected boolean removeEldestEntry(
+                        java.util.Map.Entry<TrackKey, java.util.List<MediaTrack>> eldest) {
+                    return size() > 5;
+                }
+            };
+    /**
+     * Tracks already reached through the fallback, in order.
+     *
+     * <p>Bounds it: two shelves can point at each other, and without a memory
+     * the fallback would ping-pong between them forever without touching the
+     * network. A manual play starts a new intent and clears it.
+     */
+    private final java.util.LinkedHashSet<TrackKey> fallbackPlayed = new java.util.LinkedHashSet<>();
 
     PlaybackSession(PlaybackController controller, ProviderRegistry providers, Library library) {
         this.controller = controller;
@@ -150,9 +189,14 @@ final class PlaybackSession {
     Snapshot snapshot() {
         MediaTrack track = queue.current();
         TrackKey key = track == null ? null : track.key();
+        // Memory only: a snapshot is taken twice a second for the notification
+        // plus on every render, all on the main thread. The probing read would
+        // do a file stat plus JSON parse plus a last-modified write per tick
+        // before the store scan; the seed notification corrects the view once
+        // the scan lands.
         DownloadState download = downloader == null || key == null
                 ? DownloadState.idle(key)
-                : downloader.stateOf(key);
+                : downloader.stateOfCached(key);
         // One engine read per snapshot: the previous code asked twice, once to decide
         // whether Previous can act and once to report, and the two could disagree if
         // the position advanced between them.
@@ -202,6 +246,8 @@ final class PlaybackSession {
                     "Track has no identity"));
             return;
         }
+        // An explicit pick ends the radio: the user chose, the station stops.
+        endRadioForManualPlay();
         // One track is a list of one: playing something replaces the queue rather than
         // appending to whatever was there, so "continue listening" is what the user
         // last chose to play and not an accumulation of everything they ever tapped.
@@ -229,7 +275,11 @@ final class PlaybackSession {
             return;
         }
         if (tracks == null || queue.replaceWith(tracks, selected.key()) < 0) play(selected);
-        else startCurrent();
+        else {
+            // An explicit list ends the radio like an explicit track does.
+            endRadioForManualPlay();
+            startCurrent();
+        }
     }
 
     /** Appends to the queue without interrupting playback. */
@@ -283,6 +333,7 @@ final class PlaybackSession {
     /** Resolves a pasted URL and plays it. */
     void playUrl(String url) {
         if (url == null || url.trim().isEmpty()) return;
+        endRadioForManualPlay();
         beginTrace("url");
         state = PlaybackState.RESOLVING_METADATA;
         error = null;
@@ -306,12 +357,12 @@ final class PlaybackSession {
 
     /** Runs a catalog search and reports the results to {@code callback}. */
     void search(String query, ProviderRegistry.Callback<List<MediaTrack>> callback) {
-        state = PlaybackState.SEARCHING;
-        error = null;
-        notifyChanged();
+        // Searching never touches playback state: it is a catalog question, not a
+        // transport change. The previous code set SEARCHING then IDLE around the
+        // round trip, which replaced PLAYING/PAUSED/BUFFERING on the surface
+        // while a track kept playing underneath. The search surface already
+        // shows its own "searching" affordance.
         providers.search(query, (tracks, failure) -> {
-            // Searching must not disturb what is playing.
-            if (state == PlaybackState.SEARCHING) state = PlaybackState.IDLE;
             notifyChanged();
             if (callback != null) callback.complete(tracks, failure);
         });
@@ -339,13 +390,22 @@ final class PlaybackSession {
         if (state == PlaybackState.PLAYING) controller.pause();
     }
 
-    /** Skips to the next queued item, or stops when there is none. */
+    /** Skips to the next queued item, or continues from recommendations. */
     void next() {
         MediaTrack target = queue.peekNext();
         if (target == null) {
-            // The button stays enabled with an empty queue when autoplay is on,
-            // because it then routes to a recommendation instead of stopping
-            // (§13). With autoplay off there is nothing Next can honestly do.
+            // Queue exhausted. In radio the generated list owns what is next;
+            // otherwise the shelf already on screen goes first because it
+            // starts instantly, and only then does autoplay fetch.
+            if (radioOn) {
+                refillRadioIfNeeded();
+                if (playCachedFirst()) return;
+                radioOn = false;
+                state = PlaybackState.STOPPED;
+                notifyChanged();
+                return;
+            }
+            if (playCachedFirst()) return;
             if (queue.isAutoplayEnabled() && attemptAutoplay(queue.current())) return;
             state = PlaybackState.STOPPED;
             notifyChanged();
@@ -354,6 +414,7 @@ final class PlaybackSession {
         PlaybackTrace.markCurrent(PlaybackTrace.QUEUE_NEXT,
                 "to=" + target.key());
         queue.advance();
+        if (radioOn) refillRadioIfNeeded();
         startCurrent();
     }
 
@@ -407,6 +468,9 @@ final class PlaybackSession {
         controller.stop();
         state = PlaybackState.STOPPED;
         error = null;
+        radioOn = false;
+        radioRefillInFlight = false;
+        radioSeedArtist = "";
         // No engine reading may be reported after a stop.
         clock.release();
         endTrace();
@@ -793,7 +857,7 @@ final class PlaybackSession {
 
         TrackKey key = track.key();
         PlaybackTrace active = trace;
-        providers.playableSource(track, active, (source, failure) -> {
+        providers.playableSource(track, active, () -> clock.isCurrent(generation), (source, failure) -> {
             // A newer track was selected while this one was still resolving.
             if (!clock.isCurrent(generation)) return;
             if (source == null) {
@@ -855,6 +919,7 @@ final class PlaybackSession {
 
         if (outcome.decision == AutoplayPolicy.Decision.PLAY_NEXT) {
             queue.advance();
+            if (radioOn) refillRadioIfNeeded();
             startCurrent();
             return;
         }
@@ -865,6 +930,16 @@ final class PlaybackSession {
             return;
         }
         if (outcome.decision == AutoplayPolicy.Decision.STOP) {
+            // Queue exhausted. Radio refills and continues from its shelf; a
+            // plain queue continues once from the shelf on screen (instant, no
+            // fetch) and only then falls through to autoplay or stops.
+            if (radioOn) {
+                refillRadioIfNeeded();
+                if (playCachedFirst()) return;
+                radioOn = false;
+            } else if (playCachedFirst()) {
+                return;
+            }
             state = PlaybackState.STOPPED;
             endTrace();
             notifyChanged();
@@ -873,6 +948,9 @@ final class PlaybackSession {
 
         // Autoplay: fetch a candidate. Bounded and single-flight.
         if (!attemptAutoplay(finished)) {
+            // A failed autoplay still gets one instant chance from the shelf
+            // before the queue is declared finished.
+            if (!radioOn && playCachedFirst()) return;
             state = PlaybackState.STOPPED;
             endTrace();
             notifyChanged();
@@ -920,6 +998,217 @@ final class PlaybackSession {
             return;
         }
         recommendations.forTrack(origin, callback);
+    }
+
+    /**
+     * Discovery candidates for the player's shelf; failure yields an empty
+     * list, never an error.
+     *
+     * <p>Display filtering only (current and queued are out): the shelf is for
+     * picking associated tracks, not for enforcing the autoplay policy. The
+     * answer is also remembered per track so a queue that runs out can
+     * continue instantly from what is already on screen.
+     */
+    void recommendationsForDisplay(MediaTrack origin, Recommendations.Callback callback) {
+        if (origin == null) {
+            if (callback != null) callback.onRecommendations(new ArrayList<>(), null);
+            return;
+        }
+        TrackKey key = origin.key();
+        recommendations.forDisplay(origin, (candidates, error) -> {
+            if (key != null) {
+                displayCache.put(key, candidates == null
+                        ? new ArrayList<>() : new ArrayList<>(candidates));
+            }
+            if (callback != null) callback.onRecommendations(candidates, error);
+        });
+    }
+
+    /** Whether the queue currently belongs to a generated radio station. */
+    boolean radioOn() { return radioOn; }
+
+    /** "Radio de X" (track) or "Radio: Y" (artist), or "" when radio is off. */
+    String radioLabel() {
+        if (!radioOn) return "";
+        return radioSeedArtist.isEmpty()
+                ? "Radio de " + radioSeedTitle
+                : "Radio: " + radioSeedArtist;
+    }
+
+    /**
+     * Starts or stops the radio station built from the current track.
+     *
+     * <p>Enabling replaces the queue with the current track plus its
+     * recommendations <em>without restarting the audio</em>: the engine keeps
+     * playing what it was playing. Refills arrive as the queue drains (see
+     * {@link #refillRadioIfNeeded}). Disabling keeps the queue as it stands.
+     */
+    void setRadioEnabled(boolean enabled) {
+        if (!enabled) {
+            if (!radioOn) return;
+            stopRadio();
+            notifyChanged();
+            return;
+        }
+        // Same track station already on: nothing to rebuild.
+        if (radioOn && radioSeedArtist.isEmpty()) return;
+        MediaTrack current = queue.current();
+        TrackKey key = current == null ? null : current.key();
+        if (key == null) return;
+        // Switching stations: the old one goes quietly, the notify at the end
+        // covers the whole change.
+        radioOn = false;
+        radioRefillInFlight = false;
+        radioSeedTitle = current.title;
+        radioSeedArtist = "";
+        java.util.List<MediaTrack> seed = new java.util.ArrayList<>();
+        seed.add(current);
+        java.util.List<MediaTrack> cached = displayCache.get(key);
+        if (cached != null) {
+            for (MediaTrack candidate : cached) {
+                if (candidate == null) continue;
+                TrackKey candidateKey = candidate.key();
+                if (candidateKey == null || candidateKey.equals(key)) continue;
+                boolean dup = false;
+                for (MediaTrack known : seed) {
+                    if (candidateKey.equals(known.key())) { dup = true; break; }
+                }
+                if (!dup) seed.add(candidate);
+            }
+        }
+        queue.replaceWith(seed, key);
+        radioOn = true;
+        recovery.resetForNextTrack();
+        notifyChanged();
+        refillRadioIfNeeded();
+    }
+
+    /**
+     * Starts or stops the radio station built from an artist.
+     *
+     * <p>Like {@link #setRadioEnabled} but seeded by a catalog search for the
+     * artist instead of by related tracks: the station plays that artist's
+     * catalog slice, current track first so the audio never restarts. Refills
+     * keep following related tracks once the slice drains.
+     *
+     * @param artist artist name; ignored when blank
+     */
+    void setArtistRadioEnabled(boolean enabled, String artist) {
+        if (!enabled) {
+            if (!radioOn) return;
+            stopRadio();
+            notifyChanged();
+            return;
+        }
+        MediaTrack current = queue.current();
+        TrackKey key = current == null ? null : current.key();
+        String who = artist == null ? "" : artist.trim();
+        if (key == null || who.isEmpty()) return;
+        // Same artist station already on: nothing to rebuild.
+        if (radioOn && who.equals(radioSeedArtist)) return;
+        // Switching stations: the old one goes quietly.
+        radioOn = false;
+        radioRefillInFlight = false;
+        radioSeedArtist = who;
+        radioSeedTitle = current.title;
+        providers.search(who, (tracks, failure) -> {
+            if (!radioSeedArtist.equals(who)) return;
+            java.util.List<MediaTrack> seed = new java.util.ArrayList<>();
+            seed.add(current);
+            if (tracks != null) {
+                java.util.List<MediaTrack> filtered =
+                        recommendations.filterForDisplay(key, tracks);
+                for (MediaTrack candidate : filtered) {
+                    if (seed.size() >= 20) break;
+                    seed.add(candidate);
+                }
+            }
+            // The search may have landed after the user moved on: only a live
+            // session may adopt it, and the audio is never restarted by it.
+            if (queue.current() == null || !key.equals(queue.current().key())) return;
+            queue.replaceWith(seed, key);
+            radioOn = true;
+            recovery.resetForNextTrack();
+            notifyChanged();
+            refillRadioIfNeeded();
+        });
+    }
+
+    /** Stops the station; the queue stays as it stands. */
+    private void stopRadio() {
+        radioOn = false;
+        radioRefillInFlight = false;
+        radioSeedArtist = "";
+    }
+
+    /**
+     * Refills the radio queue from tracks related to its tail.
+     *
+     * <p>Single-flight and strictly filtered (queued and known tracks are out),
+     * so a refill can neither duplicate the queue nor spin the provider: one
+     * request per drain, answered once.
+     */
+    private void refillRadioIfNeeded() {
+        if (!radioOn || radioRefillInFlight) return;
+        int ahead;
+        MediaTrack tail;
+        synchronized (queue.lock()) {
+            ahead = queue.size() - queue.currentIndex() - 1;
+            tail = queue.size() == 0 ? null : queue.at(queue.size() - 1);
+        }
+        if (ahead > 2 || tail == null || tail.key() == null) return;
+        radioRefillInFlight = true;
+        PlaybackTrace.markCurrent(PlaybackTrace.AUTOPLAY_TRIGGER, "radio=" + tail.key());
+        recommendations.forTrack(tail, (candidates, failure) -> {
+            radioRefillInFlight = false;
+            if (!radioOn) return;
+            if (candidates == null || candidates.isEmpty()) return;
+            if (queue.appendAll(candidates) > 0) notifyChanged();
+        });
+    }
+
+    /**
+     * Continues from the remembered shelf of {@code finished}, if any.
+     *
+     * <p>The shelf was already fetched for display, so this starts instantly
+     * with no network. Skips anything already reached through the fallback so
+     * two shelves pointing at each other terminate instead of ping-ponging.
+     *
+     * @return {@code true} when a track was started
+     */
+    private boolean playCachedFirst() {
+        MediaTrack finished = queue.current();
+        TrackKey key = finished == null ? null : finished.key();
+        java.util.List<MediaTrack> cached = key == null ? null : displayCache.get(key);
+        if (cached == null) return false;
+        for (MediaTrack candidate : cached) {
+            TrackKey candidateKey = candidate == null ? null : candidate.key();
+            if (candidateKey == null || candidateKey.equals(key)) continue;
+            synchronized (fallbackPlayed) {
+                if (fallbackPlayed.contains(candidateKey)) continue;
+            }
+            queue.setCurrent(candidate);
+            synchronized (fallbackPlayed) {
+                fallbackPlayed.add(candidateKey);
+                while (fallbackPlayed.size() > 50) {
+                    java.util.Iterator<TrackKey> oldest = fallbackPlayed.iterator();
+                    if (!oldest.hasNext()) break;
+                    oldest.next();
+                    oldest.remove();
+                }
+            }
+            startCurrent();
+            return true;
+        }
+        return false;
+    }
+
+    /** A manual play starts a new intent: radio ends and the fallback forgets. */
+    private void endRadioForManualPlay() {
+        radioOn = false;
+        radioRefillInFlight = false;
+        radioSeedArtist = "";
+        synchronized (fallbackPlayed) { fallbackPlayed.clear(); }
     }
 
     // -------------------------------------------------------------- plumbing

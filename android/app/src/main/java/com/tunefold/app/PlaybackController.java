@@ -288,7 +288,6 @@ final class PlaybackController implements AudioTrackOutput.Listener {
     private void refreshOnCommands() {
         long handle = engine;
         if (handle == 0 || released) return;
-        diagnostics = TunefoldBridge.getRuntimeDiagnostics(handle);
 
         // End-of-track is a distinct signal from a user stop; it is consumed
         // here so the queue/autoplay policy sees each EOF exactly once.
@@ -312,23 +311,33 @@ final class PlaybackController implements AudioTrackOutput.Listener {
 
         int nativeState = TunefoldBridge.getPlaybackState(handle);
         if (nativeState == ERROR) {
-            error = readError(handle, "Playback failed");
+            String nextError = readError(handle, "Playback failed");
+            // Steady error, already reported: re-reading diagnostics and
+            // re-notifying twice a second would rebuild the notification and
+            // re-render the surface for no new information.
+            if (state == ERROR && nextError.equals(error)) return;
+            error = nextError;
+            diagnostics = TunefoldBridge.getRuntimeDiagnostics(handle);
             output.requestStop();
             output.awaitStopped();
             TunefoldBridge.stopAudio(handle);
             state = ERROR;
             notifyChanged();
         } else if (nativeState == STOPPED && state != STOPPED) {
+            diagnostics = TunefoldBridge.getRuntimeDiagnostics(handle);
             output.requestStop();
             output.awaitStopped();
             TunefoldBridge.stopAudio(handle);
             state = STOPPED;
             notifyChanged();
-        } else {
-            state = nativeState;
+        } else if (nativeState != state) {
             diagnostics = TunefoldBridge.getRuntimeDiagnostics(handle);
+            state = nativeState;
             notifyChanged();
         }
+        // Steady state: no diagnostics re-read, no notify, no session churn.
+        // Position keeps moving, but position is read through the cheap path
+        // (session.readPosition), never through a snapshot.
     }
 
     int state() { return state; }

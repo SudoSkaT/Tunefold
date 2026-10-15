@@ -74,6 +74,41 @@ public class RecommendationsTest {
         assertEquals("c", TrackKey.of(kept.get(0)).providerTrackId());
     }
 
+    // ------------------------------------------------- display (discovery) filter
+
+    /**
+     * The shelf is for discovery, not for the autoplay policy: liked and
+     * recently played tracks stay visible, only the current track, the queue
+     * and duplicates go.
+     */
+    @Test public void displayKeepsLikedAndRecentButDropsCurrentQueuedAndDupes() {
+        library.setLiked(track("b"), true);
+        library.markPlayed(TrackKey.of("YouTube", "c"));
+        queue.playNow(track("a"));
+        queue.append(track("d"));
+        List<MediaTrack> shown = recommendations.filterForDisplay(TrackKey.of("YouTube", "a"),
+                list(track("a"), track("b"), track("c"), track("d"), track("d"), track("e")));
+        assertEquals(3, shown.size());
+        assertEquals("b", TrackKey.of(shown.get(0)).providerTrackId());
+        assertEquals("c", TrackKey.of(shown.get(1)).providerTrackId());
+        assertEquals("e", TrackKey.of(shown.get(2)).providerTrackId());
+    }
+
+    @Test public void displayDropsUnidentifiableCandidates() {
+        List<MediaTrack> shown = recommendations.filterForDisplay(TrackKey.of("YouTube", "a"),
+                list(track("b"), new MediaTrack("", "", "No id", "", "", "", "artist",
+                        -1, "", "", "{}")));
+        assertEquals(1, shown.size());
+        assertEquals("b", TrackKey.of(shown.get(0)).providerTrackId());
+    }
+
+    @Test public void displayOnEmptyStaysEmpty() {
+        assertTrue(recommendations.filterForDisplay(TrackKey.of("YouTube", "a"),
+                new ArrayList<>()).isEmpty());
+        assertTrue(recommendations.filterForDisplay(TrackKey.of("YouTube", "a"), null)
+                .isEmpty());
+    }
+
     @Test public void aProviderThatAlwaysAnswersTheSamePairCannotLoop() {
         // A provider that keeps answering with the same two tracks must not make
         // autoplay oscillate between them forever. Each pass offers something

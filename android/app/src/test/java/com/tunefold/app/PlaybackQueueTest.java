@@ -299,4 +299,21 @@ public class PlaybackQueueTest {
         assertEquals("and Next still walks forward through the list",
                 "b", TrackKey.of(queue.peekNext()).providerTrackId());
     }
+
+    /** Bulk appends for the radio refill share the admission rules. */
+    @Test public void appendAllSkipsDuplicatesIdentitiesAndBounds() {
+        PlaybackQueue queue = new PlaybackQueue();
+        queue.append(TestTracks.of("YouTube", "a"));
+        ArrayList<MediaTrack> batch = new ArrayList<>();
+        batch.add(TestTracks.of("YouTube", "b"));
+        batch.add(TestTracks.of("YouTube", "b"));
+        batch.add(null);
+        batch.add(TestTracks.of("YouTube", ""));
+        batch.add(TestTracks.of("YouTube", "a"));
+        batch.add(TestTracks.of("YouTube", "c"));
+        assertEquals(2, queue.appendAll(batch));
+        assertEquals(3, queue.size());
+        assertEquals(0, queue.appendAll(null));
+        assertEquals(0, queue.appendAll(new ArrayList<>()));
+    }
 }

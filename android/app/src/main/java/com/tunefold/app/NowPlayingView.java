@@ -55,7 +55,18 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         void onRetryPlayback();
         void onSkipToNext();
         void onToggleAutoplay();
+        /** Appends a recommended track to the queue without interrupting playback. */
+        void onEnqueueRecommended(MediaTrack track);
+        /** Starts a radio station from the current track. */
+        void onCreateRadio();
+        /** Starts a radio station from the current artist. */
+        void onCreateArtistRadio();
+        /** Stops the radio station; the queue stays as it stands. */
+        void onStopRadio();
     }
+
+    /** Which shelf the player shows below the transport. */
+    enum Tab { QUEUE, RECOMMENDED, RADIO }
 
     /** What the error action offers; decides its glyph, its description and its effect. */
     private enum ErrorAction { NONE, RETRY, SKIP }
@@ -63,6 +74,8 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
     /** Told when a row of "next" is tapped. */
     interface QueuedTrackChosen {
         void onQueuedTrackChosen(MediaTrack track);
+        /** Takes a queued track out of the queue. */
+        void onQueuedTrackRemoved(MediaTrack track);
     }
 
     /** How many tracks the player shows as coming next. */
@@ -92,6 +105,52 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
     private String queuedKey;
     /** What the "next" rows do; the screen owns the queue, this owns the buttons. */
     private QueuedTrackChosen queuedTrackChosen;
+    /** Row holders of the current Sigue window, for cover delivery. */
+    private final java.util.List<QueueRow> queueRows = new ArrayList<>();
+
+    /** One queue row: cover and track, rebuilt with the window. */
+    private static final class QueueRow {
+        final MediaTrack track;
+        final ArtworkView cover;
+        String shownCoverId = "";
+
+        QueueRow(MediaTrack track, ArtworkView cover) {
+            this.track = track;
+            this.cover = cover;
+        }
+    }
+    /**
+     * Lo recomendado para lo que suena, ya filtrado por la pantalla.
+     *
+     * <p>Su propio espacio al final, con filas de lista —portada, título,
+     * artista y un añadir— como los seleccionables de una playlist: la fila
+     * entera mete la pista en la cola y la fila sale de la oferta.
+     */
+    private final LinearLayout recommended;
+    /** How many recommended rows the player offers; Sigue shows the same count. */
+    private static final int RECOMMENDED_ROWS = 4;
+    private final java.util.List<RecommendedRow> recommendedRows = new ArrayList<>();
+    /** Identity of the recommendations on screen; rebuilt only on change. */
+    private String recommendedKey;
+    /**
+     * Las dos repisas —cola y descubrimiento— bajo un selector.
+     *
+     * <p>La vista no decide qué suena, solo qué lista se mira: la cola que va
+     * a sonar, los recomendados para elegir o la radio. La radio es un modo de
+     * la sesión con segmento propio siempre visible: apagada ofrece armar una
+     * estación; encendida enseña la cola que está armando.
+     */
+    private Tab selectedTab = Tab.QUEUE;
+    private boolean radioOn;
+    private String radioLabel = "";
+    private LinearLayout tabBar;
+    private TextView queueTab;
+    private TextView recommendedTab;
+    private TextView radioTab;
+    /** Radio apagada: armar estación por canción o por artista. */
+    private LinearLayout radioPane;
+    /** What an empty shelf says, instead of blank space. */
+    private TextView emptyHint;
     private final IconButton previous;
     private final PrimaryPlaybackButton playPause;
     private final IconButton next;
@@ -300,6 +359,62 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         upNext.setVisibility(View.GONE);
         addDetails(upNext, DesignTokens.BLOCK_GAP);
 
+        // Recomendados: su propio espacio al final, con filas de lista —
+        // portada, título, artista y un añadir — como los seleccionables de
+        // una playlist: la fila entera mete la pista en la cola y la fila sale
+        // de la oferta.
+        recommended = new LinearLayout(context);
+        recommended.setOrientation(LinearLayout.VERTICAL);
+        recommended.setVisibility(View.GONE);
+        addDetails(recommended, DesignTokens.BLOCK_GAP);
+
+        // El selector de repisas, delante de las listas: Siguiente,
+        // Recomendados y siempre Radio — apagada para armarla, encendida para
+        // mirar la cola que está armando.
+        tabBar = new LinearLayout(context);
+        tabBar.setOrientation(LinearLayout.HORIZONTAL);
+        tabBar.setGravity(Gravity.CENTER);
+        queueTab = tabButton("Siguiente");
+        queueTab.setOnClickListener(ignored -> selectTab(Tab.QUEUE));
+        tabBar.addView(queueTab, tabParams());
+        recommendedTab = tabButton("Recomendados");
+        recommendedTab.setOnClickListener(ignored -> selectTab(Tab.RECOMMENDED));
+        tabBar.addView(recommendedTab, tabParams());
+        radioTab = tabButton("Radio");
+        radioTab.setOnClickListener(ignored -> selectTab(Tab.RADIO));
+        tabBar.addView(radioTab, tabParams());
+        details.addView(tabBar, details.indexOfChild(upNext),
+                new LinearLayout.LayoutParams(-1, -2));
+
+        // Armar radio: por la canción que suena o por su artista, por separado.
+        radioPane = new LinearLayout(context);
+        radioPane.setOrientation(LinearLayout.VERTICAL);
+        radioPane.setVisibility(View.GONE);
+        radioPane.addView(radioStarter("Radio de esta canción",
+                "Create a radio station from the current track",
+                () -> actions.onCreateRadio()));
+        radioPane.addView(radioStarter("Radio del artista",
+                "Create a radio station from the current artist",
+                () -> actions.onCreateArtistRadio()));
+        details.addView(radioPane, details.indexOfChild(upNext),
+                new LinearLayout.LayoutParams(-1, -2));
+
+        // Lo que dice una repisa vacía, en vez de un hueco mudo.
+        emptyHint = new TextView(context);
+        emptyHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_CAPTION_SIZE);
+        emptyHint.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        emptyHint.setGravity(Gravity.CENTER);
+        emptyHint.setVisibility(View.GONE);
+        details.addView(emptyHint, details.indexOfChild(upNext),
+                new LinearLayout.LayoutParams(-1, -2));
+
+        // Deslizar sobre las listas cambia de repisa: el gesto horizontal manda
+        // y el vertical sigue siendo del scroll. Solo observa, nunca consume,
+        // así que los toques y el desplazamiento no cambian.
+        upNext.setOnTouchListener(tabSwipe);
+        recommended.setOnTouchListener(tabSwipe);
+        paintTabs();
+
         // The cover decides whether the card splits, so the card listens to the cover
         // — LAST, because `register` hands the listener the current palette straight
         // away, and this card has to be able to answer that before it has built
@@ -416,9 +531,15 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
                 // El aire que sobra ni con la portada a su tamaño se reparte a mitades
                 // arriba y abajo. Amontonado abajo, el reproductor parecía no estar
                 // centrado; era el mismo aire, pero todo en un solo lado.
+                //
+                // Reparto óptico 60/40 en vez de 50/50: la mitad matemática deja la
+                // composición visualmente alta (la portada pesa arriba), así que el
+                // héroe —portada, datos, estado, barras y transporte— se asienta un
+                // poco más abajo y respira como centro de la vista.
                 int air = spare - wanted;
-                int top = basePaddingTop + Math.max(0, air) / 2;
-                int bottom = basePaddingBottom + Math.max(0, air) / 2;
+                int free = Math.max(0, air);
+                int top = basePaddingTop + free * 3 / 5;
+                int bottom = basePaddingBottom + free - free * 3 / 5;
                 if (getPaddingTop() != top || getPaddingBottom() != bottom) {
                     setPadding(getPaddingLeft(), top, getPaddingRight(), bottom);
                 }
@@ -504,6 +625,7 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
             setText(title, NOTHING_PLAYING);
             setText(subtitle, "");
             progress.clear();
+            progress.clearSound();
             // No track means no accent: leaving the last cover's colour behind would
             // mean the surface keeps advertising a song that is no longer there.
             ArtworkTheme.reset();
@@ -512,6 +634,13 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
             return;
         }
         TrackKey key = track.key();
+        boolean identityChanged = !equal(activeTrackKey, key);
+        if (identityChanged) {
+            // New track: the previous envelope must go now, not when the new
+            // audio first arrives. Otherwise the old track's bars sit frozen
+            // behind the new title for the whole resolution.
+            progress.clearSound();
+        }
         // Identity guards the cover, but not the words: the same track can be resolved
         // again with corrected metadata, and a title that never refreshes after that is
         // worse than the extra comparison it costs.
@@ -552,6 +681,13 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         soundPlayable = state == PlaybackState.BUFFERING
                 || state == PlaybackState.PLAYING
                 || state == PlaybackState.PAUSED;
+        if (!soundPlayable && (state == PlaybackState.STOPPED
+                || state == PlaybackState.IDLE || state == PlaybackState.ERROR)) {
+            // Terminal states rest empty: a frozen envelope after stop reads as
+            // activity where there is none. Pauses and resolutions keep their
+            // frame (frozen by refresh, cleared by applyTrack on change).
+            progress.clearSound();
+        }
         // El control principal también dice en qué estado está: un aro mientras
         // espera, como el punto de estado y sin palabras nuevas.
         applyBusy(state == PlaybackState.BUFFERING
@@ -714,11 +850,12 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         java.util.List<MediaTrack> wanted = tracks == null
                 ? java.util.Collections.<MediaTrack>emptyList() : tracks;
         if (wanted.isEmpty()) {
-            if (upNext.getVisibility() != View.GONE) {
+            if (queuedKey != null) {
                 upNext.removeAllViews();
-                upNext.setVisibility(View.GONE);
+                queueRows.clear();
                 queuedKey = null;
             }
+            refreshTabContent();
             return;
         }
         StringBuilder identity = new StringBuilder();
@@ -730,15 +867,39 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         if (stamp.equals(queuedKey)) return;
         queuedKey = stamp;
         upNext.removeAllViews();
-        upNext.addView(queueHeader());
+        queueRows.clear();
+        TextView header = queueHeader();
+        header.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        upNext.addView(header);
         int shown = Math.min(wanted.size(), UP_NEXT_ROWS);
         for (int index = 0; index < shown; index++) {
-            upNext.addView(queueRow(wanted.get(index), index));
+            MediaTrack track = wanted.get(index);
+            QueueRow row = new QueueRow(track, new ArtworkView(context));
+            queueRows.add(row);
+            upNext.addView(buildQueueRow(row, index));
         }
         if (wanted.size() > shown) {
-            upNext.addView(moreRow(wanted.size() - shown));
+            TextView more = moreRow(wanted.size() - shown);
+            more.setLayoutParams(new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT));
+            upNext.addView(more);
         }
-        upNext.setVisibility(View.VISIBLE);
+        refreshTabContent();
+    }
+
+    /**
+     * Tracks currently shown in Sigue, in order.
+     *
+     * <p>Lets the screen load their covers once per window instead of once per
+     * render: the view owns the window, the screen owns the loading.
+     */
+    List<MediaTrack> queuedShown() {
+        List<MediaTrack> shown = new ArrayList<>(queueRows.size());
+        for (QueueRow row : queueRows) shown.add(row.track);
+        return shown;
     }
 
     private TextView queueHeader() {
@@ -752,21 +913,98 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         return header;
     }
 
-    private View queueRow(MediaTrack track, int index) {
-        TextView row = new TextView(context);
-        row.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
-        row.setTextColor(DesignTokens.Palette.ON_SURFACE);
-        row.setGravity(Gravity.CENTER);
-        row.setMaxLines(2);
-        row.setEllipsize(TextUtils.TruncateAt.END);
-        row.setMinHeight(DesignTokens.dp(DesignTokens.CONTROL_TARGET));
-        row.setText((index + 1) + ".  " + track.title);
-        row.setContentDescription(track.title + (track.artist.isEmpty() ? "" : " — " + track.artist)
-                + ". Play this track now");
-        row.setOnClickListener(ignored -> {
+    /**
+     * One queue row, playlist style: cover, title, artist and a remove control.
+     *
+     * <p>Same visual language as the recommended rows: left-aligned,
+     * informative at a glance, one tap away from its action. Tapping the row
+     * plays it now; the cross takes it out of the queue. The cover arrives
+     * through {@link #setQueueArtwork} with the identity it was requested for.
+     */
+    private View buildQueueRow(QueueRow row, int index) {
+        MediaTrack track = row.track;
+        TrackKey key = track.key();
+        String identity = key == null ? "" : key.toString();
+
+        LinearLayout item = new LinearLayout(context);
+        item.setOrientation(LinearLayout.HORIZONTAL);
+        item.setGravity(Gravity.CENTER_VERTICAL);
+        item.setMinimumHeight(DesignTokens.dp(DesignTokens.ROW_HEIGHT));
+        item.setClickable(true);
+        item.setFocusable(true);
+        int rowPadding = DesignTokens.dp(DesignTokens.ROW_PADDING_HORIZONTAL);
+        item.setPadding(rowPadding, 0, rowPadding, 0);
+
+        ArtworkView cover = row.cover;
+        cover.setCornerRadiusDp(DesignTokens.RADIUS_ARTWORK_THUMB);
+        int side = DesignTokens.dp(DesignTokens.ARTWORK_THUMB);
+        LinearLayout.LayoutParams coverParams =
+                new LinearLayout.LayoutParams(side, side);
+        coverParams.rightMargin = DesignTokens.dp(DesignTokens.ROW_GAP);
+        item.addView(cover, coverParams);
+        cover.expectCover(identity);
+        row.shownCoverId = identity;
+
+        LinearLayout text = new LinearLayout(context);
+        text.setOrientation(LinearLayout.VERTICAL);
+        text.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        textParams.rightMargin = DesignTokens.dp(DesignTokens.GAP);
+        item.addView(text, textParams);
+
+        TextView title = new TextView(context);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
+        title.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        title.setMaxLines(1);
+        title.setEllipsize(TextUtils.TruncateAt.END);
+        title.setIncludeFontPadding(false);
+        title.setText(track.title);
+        text.addView(title, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        TextView subtitle = new TextView(context);
+        subtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_CAPTION_SIZE);
+        subtitle.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        subtitle.setMaxLines(1);
+        subtitle.setEllipsize(TextUtils.TruncateAt.END);
+        subtitle.setIncludeFontPadding(false);
+        subtitle.setText(recommendedInfo(track));
+        text.addView(subtitle, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        int target = DesignTokens.dp(DesignTokens.CONTROL_TARGET);
+        IconButton remove = new IconButton(context);
+        remove.setAction(Icon.CLOSE, "Remove from queue");
+        remove.setOnClickListener(ignored -> {
+            if (queuedTrackChosen != null) queuedTrackChosen.onQueuedTrackRemoved(track);
+        });
+        item.addView(remove, new LinearLayout.LayoutParams(target, target));
+
+        String who = track.artist.isEmpty() ? track.channel : track.artist;
+        item.setContentDescription((index + 1) + ". " + track.title
+                + (who.isEmpty() ? "" : ", " + who)
+                + ". Double tap to play this track now.");
+        item.setOnTouchListener(tabSwipe);
+        item.setOnClickListener(ignored -> {
             if (queuedTrackChosen != null) queuedTrackChosen.onQueuedTrackChosen(track);
         });
-        return row;
+        return item;
+    }
+
+    /**
+     * Shows a decoded cover on the queue row waiting for {@code identity}.
+     *
+     * <p>Refuses any other identity, so a decode that finishes after the
+     * window moved on cannot paint the wrong cover.
+     */
+    void setQueueArtwork(String identity, android.graphics.Bitmap bitmap) {
+        if (identity == null || identity.isEmpty() || bitmap == null) return;
+        for (QueueRow row : queueRows) {
+            if (identity.equals(row.shownCoverId)) row.cover.setCover(identity, bitmap);
+        }
     }
 
     private TextView moreRow(int hidden) {
@@ -777,6 +1015,428 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         row.setGravity(Gravity.CENTER);
         row.setFocusable(false);
         return row;
+    }
+
+    /** One tab segment: full-width third, 48dp target, selected in accent. */
+    private TextView tabButton(String text) {
+        TextView tab = new TextView(context);
+        tab.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_LABEL_SIZE);
+        tab.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        tab.setGravity(Gravity.CENTER);
+        tab.setMinHeight(DesignTokens.dp(DesignTokens.CONTROL_TARGET));
+        tab.setText(text);
+        tab.setContentDescription(text);
+        tab.setClickable(true);
+        tab.setFocusable(true);
+        return tab;
+    }
+
+    private LinearLayout.LayoutParams tabParams() {
+        return new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+    }
+
+    /**
+     * Shows one shelf. Tapping Cola while the radio plays stops the station:
+     * choosing the manual queue is choosing it over the generated one.
+     */
+    private void selectTab(Tab tab) {
+        if (tab == null) return;
+        if (tab == Tab.QUEUE && radioOn) {
+            actions.onStopRadio();
+            return;
+        }
+        if (tab == selectedTab) return;
+        selectedTab = tab;
+        paintTabs();
+        refreshTabContent();
+    }
+
+    /**
+     * Radio state from the session.
+     *
+     * <p>Turning on jumps to the radio shelf; turning off falls back to the
+     * queue shelf when the radio one was showing. The segment itself never
+     * hides: with no station it offers to build one.
+     */
+    void applyRadio(boolean on, String label) {
+        boolean moved = on != radioOn;
+        radioOn = on;
+        radioLabel = label == null ? "" : label;
+        if (moved) {
+            selectedTab = on ? Tab.RADIO : Tab.QUEUE;
+            paintTabs();
+            refreshTabContent();
+        } else {
+            paintTabs();
+        }
+    }
+
+    /** The selected tab, for the swipe handler. */
+    Tab selectedTab() { return selectedTab; }
+
+    /** Paints the three segments; only the radio label changes over time. */
+    private void paintTabs() {
+        paintTab(queueTab, "Siguiente", selectedTab == Tab.QUEUE);
+        paintTab(recommendedTab, "Recomendados", selectedTab == Tab.RECOMMENDED);
+        paintTab(radioTab, radioOn && !radioLabel.isEmpty() ? radioLabel : "Radio",
+                selectedTab == Tab.RADIO);
+    }
+
+    private static void paintTab(TextView tab, String text, boolean selected) {
+        if (!TextUtils.equals(tab.getText(), text)) tab.setText(text);
+        int color = selected ? DesignTokens.Palette.ACCENT
+                : DesignTokens.Palette.ON_SURFACE_MUTED;
+        if (tab.getCurrentTextColor() != color) tab.setTextColor(color);
+        tab.setContentDescription(text + (selected ? ", selected" : ""));
+    }
+
+    /**
+     * Shows exactly one shelf plus the empty hint when it has nothing.
+     *
+     * <p>The single place visibility is decided: builders fill containers and
+     * this decides which one is on screen, so a repeated notification costs
+     * comparisons instead of layout passes. The radio shelf shows the queue
+     * while a station plays and the station builders while it does not.
+     */
+    private void refreshTabContent() {
+        boolean showRecs = selectedTab == Tab.RECOMMENDED;
+        boolean showRadioPane = selectedTab == Tab.RADIO && !radioOn;
+        boolean showQueue = !showRecs && !showRadioPane;
+        boolean queueEmpty = upNext.getChildCount() == 0;
+        boolean recsEmpty = recommended.getChildCount() == 0;
+        setVisible(upNext, showQueue && !queueEmpty);
+        setVisible(recommended, showRecs && !recsEmpty);
+        setVisible(radioPane, showRadioPane);
+        if ((showQueue && queueEmpty) || (showRecs && recsEmpty)) {
+            setText(emptyHint, showRecs
+                    ? "Nada recomendado por aquí todavía."
+                    : "La cola está vacía.");
+            setVisible(emptyHint, true);
+        } else {
+            setVisible(emptyHint, false);
+        }
+        paintTabs();
+    }
+
+    /** One station builder: full-width, 48dp target, accent action. */
+    private TextView radioStarter(String text, String description, Runnable action) {
+        TextView starter = new TextView(context);
+        starter.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
+        starter.setTextColor(DesignTokens.Palette.ACCENT);
+        starter.setGravity(Gravity.CENTER);
+        starter.setMinHeight(DesignTokens.dp(DesignTokens.CONTROL_TARGET));
+        starter.setText(text);
+        starter.setContentDescription(description);
+        starter.setClickable(true);
+        starter.setFocusable(true);
+        starter.setOnTouchListener(tabSwipe);
+        starter.setOnClickListener(ignored -> action.run());
+        return starter;
+    }
+
+    private static void setVisible(View view, boolean visible) {
+        int wanted = visible ? View.VISIBLE : View.GONE;
+        if (view.getVisibility() != wanted) view.setVisibility(wanted);
+    }
+
+    /**
+     * Which tab a horizontal fling on the shelves moves to.
+     *
+     * <p>Pure so the gesture is a unit test instead of a device rehearsal:
+     * left goes forward (Siguiente → Recomendados → Radio) and back again,
+     * and anything vertical or short stays where it is.
+     */
+    static Tab swipeTab(Tab current, float dx, float dy) {
+        if (current == null) return Tab.QUEUE;
+        if (Math.abs(dx) < DesignTokens.dp(96f) || Math.abs(dx) < 2f * Math.abs(dy)) {
+            return current;
+        }
+        boolean forward = dx < 0f;
+        switch (current) {
+            case QUEUE: return forward ? Tab.RECOMMENDED : Tab.QUEUE;
+            case RECOMMENDED: return forward ? Tab.RADIO : Tab.QUEUE;
+            default: return forward ? Tab.RADIO : Tab.RECOMMENDED;
+        }
+    }
+
+    /**
+     * Observes flings over the shelves without ever consuming touches.
+     *
+     * <p>One instance shared by the shelf containers and every row: a
+     * container only sees gestures that land on no clickable child, so rows
+     * need it fitted directly or swipes starting on a row never arrive.
+     */
+    private final View.OnTouchListener tabSwipe = new TabSwipe();
+
+    /** Observes flings over the shelves without ever consuming touches. */
+    private final class TabSwipe implements View.OnTouchListener {
+        private float downX;
+        private float downY;
+        private float lastX;
+        private float lastY;
+
+        @Override public boolean onTouch(View view, android.view.MotionEvent event) {
+            switch (event.getActionMasked()) {
+                case android.view.MotionEvent.ACTION_DOWN:
+                    downX = event.getX();
+                    downY = event.getY();
+                    lastX = downX;
+                    lastY = downY;
+                    break;
+                case android.view.MotionEvent.ACTION_MOVE:
+                    lastX = event.getX();
+                    lastY = event.getY();
+                    break;
+                case android.view.MotionEvent.ACTION_UP:
+                    selectTab(swipeTab(selectedTab, event.getX() - downX,
+                            event.getY() - downY));
+                    break;
+                case android.view.MotionEvent.ACTION_CANCEL:
+                    // The scroll container stole the gesture mid-way (a mostly
+                    // horizontal swipe with enough vertical noise still scrolls
+                    // a little): judge it by where it got to, not by the
+                    // missing UP that never arrives.
+                    selectTab(swipeTab(selectedTab, lastX - downX,
+                            lastY - downY));
+                    break;
+                default:
+                    break;
+            }
+            return false;
+        }
+    }
+
+    /** One recommended row: cover, text and add control for one track. */
+    private static final class RecommendedRow {
+        final MediaTrack track;
+        final ArtworkView cover;
+        String shownCoverId = "";
+
+        RecommendedRow(MediaTrack track, ArtworkView cover) {
+            this.track = track;
+            this.cover = cover;
+        }
+    }
+
+    /**
+     * Offers recommended tracks for {@code forIdentity}, already filtered.
+     *
+     * <p>Rebuilds only when the identity or the content moved: the tick never
+     * touches this. Rows are playlist selectables — cover, title, artist and
+     * an add control, all visible — and tapping anywhere on one puts it in the
+     * queue, where Sigue picks it up.
+     */
+    void setRecommendations(String forIdentity, List<MediaTrack> tracks) {
+        java.util.List<MediaTrack> wanted = tracks == null
+                ? java.util.Collections.<MediaTrack>emptyList() : tracks;
+        StringBuilder identity = new StringBuilder(forIdentity == null ? "" : forIdentity);
+        identity.append('\u0002');
+        int shown = Math.min(wanted.size(), RECOMMENDED_ROWS);
+        for (int index = 0; index < shown; index++) {
+            TrackKey key = wanted.get(index).key();
+            identity.append(key == null ? "" : key.toString()).append('\u0001');
+        }
+        String stamp = identity.toString();
+        if (stamp.equals(recommendedKey)) return;
+        recommendedKey = stamp;
+        recommendedRows.clear();
+        recommended.removeAllViews();
+        if (shown == 0) {
+            refreshTabContent();
+            return;
+        }
+        recommended.addView(recommendedHeader());
+        for (int index = 0; index < shown; index++) {
+            MediaTrack track = wanted.get(index);
+            RecommendedRow row = new RecommendedRow(track, new ArtworkView(context));
+            recommendedRows.add(row);
+            recommended.addView(buildRecommendedRow(row));
+        }
+        refreshTabContent();
+    }
+
+    /** The section header, shared by fresh builds and removals. */
+    private View recommendedHeader() {
+        LinearLayout header = new LinearLayout(context);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView caption = queueHeader();
+        caption.setText("RECOMENDADOS");
+        caption.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        caption.setTextAlignment(View.TEXT_ALIGNMENT_VIEW_START);
+        header.addView(caption, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        TextView create = new TextView(context);
+        create.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_LABEL_SIZE);
+        create.setTextColor(DesignTokens.Palette.ACCENT);
+        create.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        create.setMinHeight(DesignTokens.dp(DesignTokens.CONTROL_TARGET));
+        create.setText("Crear radio");
+        create.setContentDescription("Create a radio station from the current track");
+        create.setClickable(true);
+        create.setFocusable(true);
+        create.setOnClickListener(ignored -> actions.onCreateRadio());
+        header.addView(create, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        header.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        return header;
+    }
+
+    /** Drops the recommendations, e.g. when the track changed. */
+    void clearRecommendations() {
+        recommendedKey = null;
+        recommendedRows.clear();
+        if (recommended.getChildCount() > 0) recommended.removeAllViews();
+        refreshTabContent();
+    }
+
+    /**
+     * Takes one track out of the recommendations, after it joined the queue.
+     *
+     * <p>What is in Sigue is not offered again: the row goes and the rest stay
+     * exactly where they were.
+     */
+    void removeRecommended(TrackKey key) {
+        if (key == null || recommendedRows.isEmpty()) return;
+        boolean removed = false;
+        for (int index = recommendedRows.size() - 1; index >= 0; index--) {
+            if (key.equals(recommendedRows.get(index).track.key())) {
+                recommendedRows.remove(index);
+                removed = true;
+            }
+        }
+        if (!removed) return;
+        recommendedKey = null;
+        recommended.removeAllViews();
+        if (recommendedRows.isEmpty()) {
+            refreshTabContent();
+            return;
+        }
+        recommended.addView(recommendedHeader());
+        StringBuilder identity = new StringBuilder();
+        for (RecommendedRow row : recommendedRows) {
+            recommended.addView(buildRecommendedRow(row));
+            TrackKey rowKey = row.track.key();
+            identity.append(rowKey == null ? "" : rowKey.toString()).append('\u0001');
+        }
+        recommendedKey = identity.toString();
+        refreshTabContent();
+    }
+
+    /**
+     * One playlist-style selectable: cover, title, artist and an add control.
+     *
+     * <p>Left-aligned and fully informative, like the songs inside a playlist:
+     * tapping anywhere on the row puts the track in the queue. The row's cover
+     * arrives through {@link #setRecommendedArtwork} with the identity it was
+     * requested for, so a late decode can never paint the wrong track.
+     */
+    private View buildRecommendedRow(RecommendedRow row) {
+        MediaTrack track = row.track;
+        TrackKey key = track.key();
+        String identity = key == null ? "" : key.toString();
+
+        LinearLayout item = new LinearLayout(context);
+        item.setOrientation(LinearLayout.HORIZONTAL);
+        item.setGravity(Gravity.CENTER_VERTICAL);
+        // The list standard height; compactness comes from the single-line
+        // content (no status lines, no inline actions) rather than from
+        // shrinking the touch target below what the rest of the app uses.
+        item.setMinimumHeight(DesignTokens.dp(DesignTokens.ROW_HEIGHT));
+        item.setClickable(true);
+        item.setFocusable(true);
+        int rowPadding = DesignTokens.dp(DesignTokens.ROW_PADDING_HORIZONTAL);
+        item.setPadding(rowPadding, 0, rowPadding, 0);
+
+        ArtworkView cover = row.cover;
+        // Detached from whatever item held it before: rebuilds reuse the row
+        // (and its already-decoded cover) instead of decoding again, but a
+        // View with a parent cannot be added to another one — removeAllViews
+        // on the section only detaches the items, not what is inside them, and
+        // re-adding the cover blindly died here with IllegalStateException.
+        android.view.ViewParent previousParent = cover.getParent();
+        if (previousParent instanceof android.view.ViewGroup) {
+            ((android.view.ViewGroup) previousParent).removeView(cover);
+        }
+        cover.setCornerRadiusDp(DesignTokens.RADIUS_ARTWORK_THUMB);
+        int side = DesignTokens.dp(DesignTokens.ARTWORK_THUMB);
+        LinearLayout.LayoutParams coverParams =
+                new LinearLayout.LayoutParams(side, side);
+        coverParams.rightMargin = DesignTokens.dp(DesignTokens.ROW_GAP);
+        item.addView(cover, coverParams);
+        cover.expectCover(identity);
+        row.shownCoverId = identity;
+
+        LinearLayout text = new LinearLayout(context);
+        text.setOrientation(LinearLayout.VERTICAL);
+        text.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        textParams.rightMargin = DesignTokens.dp(DesignTokens.GAP);
+        item.addView(text, textParams);
+
+        TextView title = new TextView(context);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
+        title.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        title.setMaxLines(1);
+        title.setEllipsize(TextUtils.TruncateAt.END);
+        title.setIncludeFontPadding(false);
+        title.setText(track.title);
+        text.addView(title, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        TextView subtitle = new TextView(context);
+        subtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_CAPTION_SIZE);
+        subtitle.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        subtitle.setMaxLines(1);
+        subtitle.setEllipsize(TextUtils.TruncateAt.END);
+        subtitle.setIncludeFontPadding(false);
+        subtitle.setText(recommendedInfo(track));
+        text.addView(subtitle, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        int target = DesignTokens.dp(DesignTokens.CONTROL_TARGET);
+        IconButton add = new IconButton(context);
+        add.setAction(Icon.ADD, "Add to queue");
+        add.setOnClickListener(ignored -> actions.onEnqueueRecommended(track));
+        item.addView(add, new LinearLayout.LayoutParams(target, target));
+
+        String who = track.artist.isEmpty() ? track.channel : track.artist;
+        item.setContentDescription(track.title
+                + (who.isEmpty() ? "" : ", " + who)
+                + ". Double tap to add to the queue.");
+        item.setOnTouchListener(tabSwipe);
+        item.setOnClickListener(ignored -> actions.onEnqueueRecommended(track));
+        return item;
+    }
+
+    /**
+     * Shows a decoded cover on the recommended row waiting for {@code identity}.
+     *
+     * <p>Refuses any other identity, so a decode that finishes after the list
+     * moved on cannot paint the wrong cover.
+     */
+    void setRecommendedArtwork(String identity, android.graphics.Bitmap bitmap) {
+        if (identity == null || identity.isEmpty() || bitmap == null) return;
+        for (RecommendedRow row : recommendedRows) {
+            if (identity.equals(row.shownCoverId)) row.cover.setCover(identity, bitmap);
+        }
+    }
+
+    /** Attribution and duration for a recommended row, or "" when unknown. */
+    private static String recommendedInfo(MediaTrack track) {
+        String who = track.artist.isEmpty() ? track.channel : track.artist;
+        if (track.durationMs > 0L) {
+            String duration = TimeFormat.time(track.durationMs);
+            return who.isEmpty() ? duration : who + " • " + duration;
+        }
+        return who;
     }
 
     /**

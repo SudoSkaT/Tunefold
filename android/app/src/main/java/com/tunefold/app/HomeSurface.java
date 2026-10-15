@@ -63,6 +63,8 @@ final class HomeSurface extends SectionSurface {
     private final TrackGroup liked;
     private final TrackGroup recommended;
     private final Navigation navigation;
+    /** Time-of-day greeting, the first thing the screen says. */
+    private final android.widget.TextView greeting;
 
     /** Identity the recommendations were asked for; {@code null} for "never". */
     private String recommendationsFor = null;
@@ -78,6 +80,14 @@ final class HomeSurface extends SectionSurface {
     HomeSurface(Context context, Host host, Navigation navigation) {
         super(context, host);
         this.navigation = navigation;
+        greeting = new android.widget.TextView(context);
+        greeting.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+                DesignTokens.TYPE_TITLE_SIZE);
+        greeting.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        greeting.setIncludeFontPadding(false);
+        greeting.setFocusable(false);
+        addView(greeting, new LayoutParams(LayoutParams.MATCH_PARENT,
+                LayoutParams.WRAP_CONTENT));
         // The order this screen is read in.
         continueListening = group("Sigue escuchando");
         startHere = group("Empieza aquí");
@@ -125,6 +135,7 @@ final class HomeSurface extends SectionSurface {
     void render(boolean force) {
         PlaybackSession session = session();
         if (session == null) return;
+        applyGreeting();
         PlaybackSession.Snapshot snapshot = session.snapshot();
         TrackKey active = snapshot.currentKey;
         int likedRevision = session.libraryRevision();
@@ -224,6 +235,26 @@ final class HomeSurface extends SectionSurface {
                 () -> navigation.openDownloads());
         startHere.show(preview(saved, PREVIEW_ROWS), false);
     }
+
+    /**
+     * Time-of-day greeting, written only when the part of day moved.
+     *
+     * <p>Cheap on purpose: the hour is read on every render and the label only
+     * moves three times a day, so arriving with the same word costs one
+     * comparison instead of a layout pass.
+     */
+    private void applyGreeting() {
+        int hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
+        String word = hour < 6 ? "Buenas noches" : hour < 13 ? "Buenos días" : hour < 21
+                ? "Buenas tardes" : "Buenas noches";
+        if (!word.equals(renderedGreeting)) {
+            renderedGreeting = word;
+            greeting.setText(word);
+        }
+    }
+
+    /** Part of day the greeting was last written for; "" before the first. */
+    private String renderedGreeting = "";
 
     /**
      * The rows a preview shows: the most recent ones, in order.

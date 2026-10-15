@@ -33,6 +33,21 @@ final class PlaybackNotification {
     static final String ACTION_NEXT = "com.tunefold.app.NEXT";
     static final String ACTION_PREVIOUS = "com.tunefold.app.PREVIOUS";
     static final String ACTION_STOP = "com.tunefold.app.STOP";
+    /** Toggles L1K3D membership of the session's current track. */
+    static final String ACTION_LIKE = "com.tunefold.app.LIKE";
+    /**
+     * Advances the session's current track download by one step: start, cancel
+     * or retry, decided from live state at action time — never from a track
+     * captured when the notification was built.
+     */
+    static final String ACTION_DOWNLOAD = "com.tunefold.app.DOWNLOAD";
+    /**
+     * Track identity the notification was built for, carried for staleness
+     * detection only. The action always applies to the session's current
+     * track; when this differs, the notification was stale and the service
+     * re-publishes after acting.
+     */
+    static final String EXTRA_TRACK_KEY = "com.tunefold.app.TRACK_KEY";
 
     /** Typed as the concrete service so commands reach the session directly. */
     private final ForegroundPlaybackService service;
@@ -97,29 +112,58 @@ final class PlaybackNotification {
                 .build();
         session.setMetadata(metadata);
 
-        // Position is published so lock screen and system controls show the right
-        // time; PlaybackState is rebuilt only when the status actually changes.
-        long position = snapshot.currentTrack == null ? 0 : positionMs;
-        android.media.session.PlaybackState platformState =
-                new android.media.session.PlaybackState.Builder()
-                        .setActions(platformActions())
-                        .setState(toSystemStatus(snapshot.state), position,
-                                snapshot.currentTrack == null ? 0f : 1f)
-                        .build();
-        session.setPlaybackState(platformState);
+        long position = snapshot.currentTrack == null ? 0 : Math.max(0L, snapshot.positionMs);
+        session.setPlaybackState(new android.media.session.PlaybackState.Builder()
+                .setActions(platformActions())
+                .setState(toSystemStatus(snapshot.state), position, 1f)
+                .build());
         session.setActive(true);
 
+        // Content (title, actions, icons) only re-notifies when something the
+        // user can see changed. The poll used to rebuild and re-notify twice a
+        // second for a position that the notification never even shows; the
+        // lock screen reads the MediaSession state above, which is updated
+        // every time for free.
+        String key = contentKey(snapshot);
+        if (key.equals(lastContentKey)) return;
+        lastContentKey = key;
         if (notifications != null) notifications.notify(NOTIFICATION_ID, build(snapshot, diagnostics));
     }
 
-    private long positionMs;
-    private float playbackSpeed = 1f;
-
-    /** Kept current by the service poll so published positions are real. */
-    void updatePosition(long positionMs, float speed) {
-        this.positionMs = Math.max(0, positionMs);
-        this.playbackSpeed = speed <= 0 ? 1f : speed;
+    /**
+     * Position-only tick between publishes: moves the lock-screen playhead
+     * without rebuilding or re-notifying anything.
+     *
+     * <p>Called at the service cadence while audio is advancing; paused and
+     * stopped positions are static and were already published with the state
+     * change that made them so.
+     */
+    void refreshPosition(PlaybackState state, long positionMs) {
+        session.setPlaybackState(new android.media.session.PlaybackState.Builder()
+                .setActions(platformActions())
+                .setState(toSystemStatus(state), Math.max(0L, positionMs), 1f)
+                .build());
+        session.setActive(true);
     }
+
+    /**
+     * Identity of everything {@link #build} can show, for the notify throttle.
+     *
+     * <p>Download percent is deliberately excluded: the notification shows the
+     * download as a state (active/retryable/done), never as a number, so a
+     * 200ms progress tick must not re-notify.
+     */
+    static String contentKey(PlaybackSession.Snapshot snapshot) {
+        DownloadState.Phase downloadPhase = snapshot.download == null
+                ? DownloadState.Phase.IDLE : snapshot.download.phase;
+        return (snapshot.currentKey == null ? "-" : snapshot.currentKey.toString())
+                + "|" + snapshot.state
+                + "|liked=" + snapshot.liked
+                + "|dl=" + downloadPhase;
+    }
+
+    /** Last content actually notified; reset when the notification goes away. */
+    private String lastContentKey = "";
 
     private static String attribution(MediaTrack track) {
         return track.artist.isEmpty() ? track.channel : track.artist;
@@ -183,34 +227,78 @@ final class PlaybackNotification {
         // Swipe-away on a paused notification stops the service: without a delete
         // intent the swipe is swallowed and the service stays foreground with
         // nothing playing.
-        builder.setDeleteIntent(actionIntent(ACTION_STOP, 9));
+        builder.setDeleteIntent(actionIntent(ACTION_STOP, 9, trackKeyOf(snapshot)));
 
         // Previous and Play/Pause flanking Next matches the platform convention.
+        // These three stay in the compact view; Like and Download live in the
+        // expanded view, where there is room without hiding the transport.
+        String trackKey = trackKeyOf(snapshot);
         builder.addAction(action(notificationIcon(Icon.PREVIOUS), "Previous",
-                actionIntent(ACTION_PREVIOUS, 1)));
+                actionIntent(ACTION_PREVIOUS, 1, trackKey)));
         builder.addAction(action(notificationIcon(paused ? Icon.PLAY : Icon.PAUSE),
-                paused ? "Play" : "Pause", actionIntent(ACTION_TOGGLE, 2)));
+                paused ? "Play" : "Pause", actionIntent(ACTION_TOGGLE, 2, trackKey)));
         builder.addAction(action(notificationIcon(Icon.NEXT), "Next",
-                actionIntent(ACTION_NEXT, 3)));
-        // Los controles grandes, para cuando el móvil está bloqueado: es la misma
-        // pantalla del reproductor, puesta delante del candado.
-        builder.addAction(action(notificationIcon(Icon.REMOTE), "Controls",
-                PendingIntent.getActivity(service, 10,
-                        new Intent(service, LockScreenControlsActivity.class),
-                        pendingIntentFlags())));
+                actionIntent(ACTION_NEXT, 3, trackKey)));
+        builder.addAction(action(notificationIcon(likeIconFor(snapshot.liked)),
+                snapshot.liked ? "Unlike" : "Like",
+                actionIntent(ACTION_LIKE, 4, trackKey)));
+        builder.addAction(action(notificationIcon(downloadIconFor(downloadPhaseOf(snapshot))),
+                downloadTitleFor(downloadPhaseOf(snapshot)),
+                actionIntent(ACTION_DOWNLOAD, 5, trackKey)));
 
         // MediaStyle es lo que convierte esto en una notificación de medios: la
-        //趟 que dibuja el sistema en la pantalla de bloqueo, en el panel rápido, en
+        // que dibuja el sistema en la pantalla de bloqueo, en el panel rápido, en
         // el coche y en los auriculares. Con addAction a secas era una notificación
         // normal con tres botones y no aparecía en ninguno de esos sitios.
+        // NOTE: the dedicated "Controls" (REMOTE) action was removed to make room
+        // for Like/Download: tapping the notification body already routes to the
+        // lock-screen controls when locked and to the app when interactive
+        // (see contentIntent), so the button duplicated the tap.
         builder.setStyle(new Notification.MediaStyle()
                 .setMediaSession(session.getSessionToken())
-                // Expandida se ven los cuatro; en la versión corta caben tres y el
-                // que se quita es el de los controles grandes, que en pantalla
-                // bloqueada no se puede tocar sin desbloquear.
+                // Compact shows the transport; expanded adds Like and Download.
                 .setShowActionsInCompactView(0, 1, 2));
 
         return builder.build();
+    }
+
+    /** Track identity the snapshot was built for, or "" when there is none. */
+    private static String trackKeyOf(PlaybackSession.Snapshot snapshot) {
+        return snapshot.currentKey == null ? "" : snapshot.currentKey.toString();
+    }
+
+    /** Download phase the snapshot reports, or IDLE when there is none. */
+    static DownloadState.Phase downloadPhaseOf(PlaybackSession.Snapshot snapshot) {
+        return snapshot.download == null
+                ? DownloadState.Phase.IDLE : snapshot.download.phase;
+    }
+
+    /** Like glyph for the notification: filled when the track is liked. */
+    static Icon likeIconFor(boolean liked) { return liked ? Icon.HEART_FILLED : Icon.HEART; }
+
+    /**
+     * Download glyph for a phase: cancel while active, retry when retryable,
+     * done when stored, plain download otherwise.
+     */
+    static Icon downloadIconFor(DownloadState.Phase phase) {
+        if (phase == DownloadState.Phase.RESOLVING_SOURCE
+                || phase == DownloadState.Phase.DOWNLOADING) return Icon.CLOSE;
+        if (phase == DownloadState.Phase.FAILED
+                || phase == DownloadState.Phase.CANCELLED) return Icon.RETRY;
+        if (phase == DownloadState.Phase.COMPLETED
+                || phase == DownloadState.Phase.ALREADY_DOWNLOADED) return Icon.DOWNLOADED;
+        return Icon.DOWNLOAD;
+    }
+
+    /** Download action title for a phase, mirroring the in-app control. */
+    static String downloadTitleFor(DownloadState.Phase phase) {
+        if (phase == DownloadState.Phase.RESOLVING_SOURCE
+                || phase == DownloadState.Phase.DOWNLOADING) return "Cancel download";
+        if (phase == DownloadState.Phase.FAILED
+                || phase == DownloadState.Phase.CANCELLED) return "Retry download";
+        if (phase == DownloadState.Phase.COMPLETED
+                || phase == DownloadState.Phase.ALREADY_DOWNLOADED) return "Downloaded";
+        return "Download";
     }
 
     /**
@@ -364,11 +452,17 @@ final class PlaybackNotification {
         return BitmapFactory.decodeFile(path, options);
     }
 
-    private PendingIntent actionIntent(String action, int requestCode) {
+    private PendingIntent actionIntent(String action, int requestCode, String trackKey) {
         // Explicit component: the service declares no intent-filter, so an implicit
-        // intent could never be delivered to it.
-        return PendingIntent.getService(service, requestCode,
-                new Intent(service, ForegroundPlaybackService.class).setAction(action),
+        // intent could never be delivered to it. Distinct request codes keep the
+        // six actions distinct; the track key is staleness metadata only — the
+        // service always acts on its session's current track.
+        android.content.Intent intent =
+                new Intent(service, ForegroundPlaybackService.class).setAction(action);
+        if (trackKey != null && !trackKey.isEmpty()) {
+            intent.putExtra(EXTRA_TRACK_KEY, trackKey);
+        }
+        return PendingIntent.getService(service, requestCode, intent,
                 pendingIntentFlags());
     }
 
@@ -394,6 +488,7 @@ final class PlaybackNotification {
 
     /** Enters the foreground, which playback requires on modern Android. */
     void startForeground(PlaybackSession.Snapshot snapshot) {
+        lastContentKey = contentKey(snapshot);
         Notification notification = build(snapshot, null);
         if (Build.VERSION.SDK_INT >= 29) {
             service.startForeground(NOTIFICATION_ID, notification,
@@ -404,6 +499,7 @@ final class PlaybackNotification {
     }
 
     void stopForeground() {
+        lastContentKey = "";
         if (Build.VERSION.SDK_INT >= 24) {
             service.stopForeground(Service.STOP_FOREGROUND_REMOVE);
         } else {

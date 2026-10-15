@@ -153,6 +153,14 @@ final class ProgressControl extends LinearLayout {
     /** El tick rápido de las barras: lee el audio en vivo. */
     void refreshSound(boolean playable) { bars.refresh(playable); }
 
+    /**
+     * Drops the painted envelope without detaching the source.
+     *
+     * <p>Track changes and stops paint through here: stale audio must not
+     * outlive its track.
+     */
+    void clearSound() { bars.clearPainted(); }
+
     /** Enlaza la fuente de audio en vivo. */
     void attach(LiveAudioBars source) { bars.attach(source); }
 

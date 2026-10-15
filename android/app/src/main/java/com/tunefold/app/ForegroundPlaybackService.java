@@ -83,7 +83,8 @@ public final class ForegroundPlaybackService extends Service {
         // they land on exactly the same session the UI drives (§17).
         String action = intent == null ? null : intent.getAction();
         if (action != null) {
-            dispatchCommand(action);
+            String expected = intent.getStringExtra(PlaybackNotification.EXTRA_TRACK_KEY);
+            dispatchCommand(action, expected);
             if (!foreground) startForegroundIfNeeded();
             return START_STICKY;
         }
@@ -99,7 +100,28 @@ public final class ForegroundPlaybackService extends Service {
      * reaches the same {@link PlaybackController} with no second playback path.
      */
     void dispatchCommand(String action) {
+        dispatchCommand(action, null);
+    }
+
+    /**
+     * Dispatches {@code action}, acting always on the session's current track.
+     *
+     * @param expectedKey track identity the notification was built for, or
+     *                    {@code null}; used only to detect (and log) a stale
+     *                    notification acting after a track change. The action
+     *                    itself never uses it: acting on a captured track is how
+     *                    a late tap likes or downloads the wrong song.
+     */
+    void dispatchCommand(String action, String expectedKey) {
         if (session == null || action == null) return;
+        if (expectedKey != null && !expectedKey.isEmpty()) {
+            PlaybackSession.Snapshot current = session.snapshot();
+            String actual = current.currentKey == null ? "" : current.currentKey.toString();
+            if (!expectedKey.equals(actual)) {
+                Log.i(TAG, "event=STALE_NOTIFICATION_ACTION action=" + action
+                        + " expected=" + expectedKey + " actual=" + actual);
+            }
+        }
         switch (action) {
             case PlaybackNotification.ACTION_TOGGLE: session.togglePause(); break;
             case PlaybackNotification.ACTION_PLAY: session.setPlaying(true); break;
@@ -107,8 +129,32 @@ public final class ForegroundPlaybackService extends Service {
             case PlaybackNotification.ACTION_NEXT: session.next(); break;
             case PlaybackNotification.ACTION_PREVIOUS: session.previous(); break;
             case PlaybackNotification.ACTION_STOP: session.stop(); break;
+            case PlaybackNotification.ACTION_LIKE: session.toggleLike(); break;
+            case PlaybackNotification.ACTION_DOWNLOAD: dispatchDownload(); break;
             default: break;
         }
+    }
+
+    /**
+     * Advances the current track's download by one step, from live state.
+     *
+     * <p>The same dispatch the in-app controls use: active downloads cancel,
+     * failed/cancelled ones retry, downloaded ones are respected (no second
+     * transfer), and only idle ones start. Read at action time, so a queued
+     * tap from before a track change cannot download the previous song.
+     */
+    private void dispatchDownload() {
+        if (session == null) return;
+        PlaybackSession.Snapshot snapshot = session.snapshot();
+        MediaTrack track = snapshot.currentTrack;
+        TrackDownloader downloads = downloader;
+        if (track == null || downloads == null) return;
+        DownloadState state = downloads.stateOf(track);
+        if (state.isActive()) downloads.cancel(track);
+        else if (state.isRetryable()) downloads.retry(track);
+        else if (state.isDownloaded()) {
+            Log.i(TAG, "event=DOWNLOAD_ALREADY_EXISTS id=" + track.key());
+        } else downloads.start(track);
     }
 
     @Override public IBinder onBind(Intent intent) { return binder; }
@@ -118,26 +164,50 @@ public final class ForegroundPlaybackService extends Service {
         @Override public void run() {
             if (controller == null) return;
             if (downloader == null) attachDownloader();
+            // One snapshot per tick decides the cadence below. It is the same
+            // cheap read the UI tick uses (no queue copy, memory-only download
+            // state, one engine position read).
+            PlaybackSession.Snapshot snapshot =
+                    session == null ? null : session.snapshot();
+            PlaybackState current = snapshot == null
+                    ? PlaybackState.IDLE : snapshot.state;
             controller.refresh();
-            if (notification != null) {
-                // The session owns the position, so the lock screen cannot drift
-                // away from what the app shows or inherit the previous track's time.
-                // This is the cheap read: a full snapshot here copied the whole queue
-                // every 500ms for the whole life of playback, to read one long.
-                notification.updatePosition(
-                        session == null ? 0L : session.readPosition(position).positionMs, 1f);
+            if (notification != null && snapshot != null
+                    && (current == PlaybackState.PLAYING
+                        || current == PlaybackState.BUFFERING)) {
+                // Position-only: moves the lock-screen playhead without
+                // rebuilding or re-notifying the notification (see publish).
+                notification.refreshPosition(snapshot.state, snapshot.positionMs);
             }
-            handler.postDelayed(this, DesignTokens.SESSION_REFRESH_INTERVAL_MS);
+            handler.postDelayed(this, intervalFor(current));
         }
     };
 
     /**
-     * Reused holder for the poll's position read.
+     * Service cadence for a playback state.
      *
-     * <p>Allocated once per service rather than once per tick: this runs for as long
-     * as playback lasts, from the moment it starts until it stops.
+     * <p>500ms while audio can be advancing (position has 1s display precision
+     * on the lock screen and buffering must flip to playing promptly);
+     * 2000ms otherwise. Paused/stopped/idle positions are static and were
+     * already published with the state change that made them so — polling
+     * faster would only re-read an unchanging engine and churn the session.
      */
-    private final PlaybackPosition position = new PlaybackPosition();
+    static long intervalFor(PlaybackState state) {
+        if (state == PlaybackState.PLAYING || state == PlaybackState.BUFFERING
+                || state == PlaybackState.RESOLVING_SOURCE
+                || state == PlaybackState.RESOLVING_METADATA) {
+            return DesignTokens.SESSION_REFRESH_INTERVAL_MS;
+        }
+        return IDLE_POLL_MS;
+    }
+
+    /**
+     * Cadence when nothing can be advancing: commands (play/pause/next) arrive
+     * as intents and drive transitions synchronously, so the poll is only
+     * liveness (downloader attach, engine EOF edge). 2s, not stopped entirely,
+     * so a missed transition still surfaces without a manual kick.
+     */
+    static final long IDLE_POLL_MS = 2_000L;
 
     /**
      * The engine changed state; feed it into the session so the product state,

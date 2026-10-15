@@ -53,6 +53,8 @@ public final class MainActivity extends Activity
     /** La pista cuya letra ya se pidió, y la que ya llegó: una comparación por repintado. */
     private String lyricsRequestedFor;
     private String lyricsDeliveredFor;
+    /** La pista para la que ya se pidieron recomendados; uno por pista. */
+    private String recsRequestedFor;
     /** Stable observer identity, so add/remove pair up across reconnects. */
     private final PlaybackSession.Observer sessionObserver = this::onSessionChanged;
     /** Reused across every tick, so polling the position allocates nothing. */
@@ -320,8 +322,40 @@ public final class MainActivity extends Activity
             @Override public void onToggleAutoplay() {
                 session.setAutoplayEnabled(!session.autoplayEnabled());
             }
+
+            @Override public void onEnqueueRecommended(MediaTrack track) {
+                if (session == null || track == null || track.key() == null) return;
+                session.enqueue(track);
+                // What joined Sigue is not offered again: the row goes and the
+                // rest stay exactly where they were.
+                nowPlaying.removeRecommended(track.key());
+            }
+
+            @Override public void onCreateRadio() {
+                if (session != null) session.setRadioEnabled(true);
+            }
+
+            @Override public void onCreateArtistRadio() {
+                if (session == null) return;
+                MediaTrack current = session.snapshot().currentTrack;
+                String who = current == null ? ""
+                        : (!current.artist.isEmpty() ? current.artist : current.channel);
+                if (!who.isEmpty()) session.setArtistRadioEnabled(true, who);
+            }
+
+            @Override public void onStopRadio() {
+                if (session != null) session.setRadioEnabled(false);
+            }
         });
-        nowPlaying.setQueuedTrackChosen(MainActivity.this::playFromUpNext);
+        nowPlaying.setQueuedTrackChosen(new NowPlayingView.QueuedTrackChosen() {
+            @Override public void onQueuedTrackChosen(MediaTrack track) {
+                playFromUpNext(track);
+            }
+
+            @Override public void onQueuedTrackRemoved(MediaTrack track) {
+                removeFromQueue(track);
+            }
+        });
 
         ScrollView playerScroller = new ScrollView(this);
         playerScroller.setFillViewport(true);
@@ -715,7 +749,9 @@ public final class MainActivity extends Activity
 
     @Override public DownloadState downloadOf(MediaTrack track) {
         if (downloader == null || track == null) return DownloadState.idle(null);
-        return downloader.stateOf(track);
+        // Memory only: one call per visible row per bind, on the main thread
+        // during scroll. The probing read would stat the disk per row.
+        return downloader.stateOfCached(track);
     }
 
     /**
@@ -924,6 +960,54 @@ public final class MainActivity extends Activity
         });
     }
 
+    /** Identity of the Sigue window whose covers are already loading. */
+    private String queueArtKey = "";
+
+    /**
+     * Covers of the Sigue window, once per window.
+     *
+     * <p>The view owns which tracks are shown; this owns loading their covers.
+     * Asked once per window identity rather than once per render, so a
+     * notification-heavy minute does not requeue the same four decodes.
+     */
+    private void loadQueueArtwork() {
+        if (session == null || providers == null) return;
+        java.util.List<MediaTrack> shown = nowPlaying.queuedShown();
+        StringBuilder identity = new StringBuilder(shown.size());
+        for (MediaTrack track : shown) {
+            TrackKey key = track.key();
+            identity.append(key == null ? "" : key.toString()).append('\u0001');
+        }
+        String stamp = identity.toString();
+        if (stamp.equals(queueArtKey)) return;
+        queueArtKey = stamp;
+        for (MediaTrack track : shown) loadThumbArtwork(track, nowPlaying::setQueueArtwork);
+    }
+
+    /**
+     * One row-size cover delivery.
+     *
+     * <p>Shared by the Sigue window and the recommendations: same size, same
+     * identity guard, different painter.
+     */
+    private void loadThumbArtwork(MediaTrack track,
+                                  ThumbArtworkDrop drop) {
+        if (providers == null || track == null || track.thumbnail.isEmpty()) return;
+        TrackKey key = track.key();
+        if (key == null) return;
+        String identity = key.toString();
+        providers.loadArtwork(track, DesignTokens.dp(DesignTokens.ARTWORK_THUMB),
+                (bitmap, error) -> {
+                    if (destroyed || bitmap == null) return;
+                    drop.set(identity, bitmap);
+                });
+    }
+
+    /** Where a decoded row cover lands. */
+    private interface ThumbArtworkDrop {
+        void set(String identity, android.graphics.Bitmap bitmap);
+    }
+
     /** Identity of the cover currently on screen, so it is decoded once per track. */
     private String playerCoverIdentity = "";
 
@@ -969,7 +1053,10 @@ public final class MainActivity extends Activity
             nowPlaying.applyDownloadState(snapshot);
             nowPlaying.applyError(snapshot);
             nowPlaying.setUpNextFrom(snapshot.queue, snapshot.currentKey);
+            nowPlaying.applyRadio(session.radioOn(), session.radioLabel());
+            loadQueueArtwork();
             requestLyrics(snapshot);
+            requestRecommendations(snapshot);
         }
         // One cover for both surfaces, decoded once at the size the player shows: the
         // strip is 40dp of it and the cache already holds it, so the strip costs
@@ -998,6 +1085,41 @@ public final class MainActivity extends Activity
                 nowPlaying.setLyrics(lyric);
             }
         });
+    }
+
+    /**
+     * Pide los recomendados de lo que suena, una vez por pista.
+     *
+     * <p>Descubrimiento, no autoplay: la sesión ya quita lo que suena y lo
+     * encolado. Lo encolado desde la repisa desaparece de la oferta en cuanto
+     * entra en Sigue.
+     */
+    private void requestRecommendations(PlaybackSession.Snapshot snapshot) {
+        TrackKey key = snapshot.currentKey;
+        String identity = key == null ? "" : key.toString();
+        if (identity.equals(recsRequestedFor)) return;
+        recsRequestedFor = identity;
+        nowPlaying.clearRecommendations();
+        if (key == null || session == null) return;
+        MediaTrack track = snapshot.currentTrack;
+        session.recommendationsForDisplay(track, (candidates, error) -> {
+            if (destroyed || !identity.equals(recsRequestedFor)) return;
+            List<MediaTrack> offered = candidates == null
+                    ? new ArrayList<>() : new ArrayList<>(candidates);
+            nowPlaying.setRecommendations(identity, offered);
+            for (MediaTrack candidate : offered) loadRecommendedArtwork(candidate);
+        });
+    }
+
+    /**
+     * The cover of one recommended row, at row size.
+     *
+     * <p>One request per row per list: the view refuses any identity it is not
+     * waiting for, so a decode that finishes after the list moved on cannot
+     * paint the wrong cover.
+     */
+    private void loadRecommendedArtwork(MediaTrack track) {
+        loadThumbArtwork(track, nowPlaying::setRecommendedArtwork);
     }
 
     private void renderDiagnostics() {
@@ -1042,7 +1164,9 @@ public final class MainActivity extends Activity
      * <p>The only periodic work left on the UI thread, and it reads through the cheap
      * path: no snapshot, no queue copy, no allocation, and the control skips the
      * {@code setText}/{@code setProgress} calls unless the second or the bar actually
-     * moved.
+     * moved. When the player is closed there is nothing position-driven on screen,
+     * so the tick runs at the service cadence and only checks the downloader
+     * attach — waking five times a second to do nothing would be pure battery.
      */
     private final Runnable poll = new Runnable() {
         @Override public void run() {
@@ -1067,8 +1191,10 @@ public final class MainActivity extends Activity
                 // The bars move at the pace of the sound, not at the pace of the
                 // clock: 20 Hz against the same consistent read the position uses.
                 nowPlaying.refreshSound();
+                mainHandler.postDelayed(this, DesignTokens.POSITION_INTERVAL_MS);
+            } else {
+                mainHandler.postDelayed(this, DesignTokens.SESSION_REFRESH_INTERVAL_MS);
             }
-            mainHandler.postDelayed(this, DesignTokens.POSITION_INTERVAL_MS);
         }
     };
 

@@ -92,8 +92,13 @@ final class ArtworkCache {
         private void trim() {
             java.util.Iterator<Map.Entry<String, android.graphics.Bitmap>> it =
                     entries.entrySet().iterator();
+            // `slots == 0` means "unbounded by count, bounded by bytes": the
+            // count check only applies when slots were configured. The previous
+            // condition (`size > 0` when slots == 0) evicted every thumbnail
+            // on every insert, so the thumbnail cache never held anything and
+            // every row decoded from disk on every pass.
             while (it.hasNext()
-                    && (entries.size() > slots || (slots == 0 && used > bytes))) {
+                    && ((slots > 0 && entries.size() > slots) || used > bytes)) {
                 Map.Entry<String, android.graphics.Bitmap> eldest = it.next();
                 used -= byteSize(eldest.getValue());
                 it.remove();

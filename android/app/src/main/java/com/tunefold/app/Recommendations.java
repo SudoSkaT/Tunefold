@@ -94,6 +94,64 @@ final class Recommendations {
     }
 
     /**
+     * Fetches discovery candidates for display, e.g. the player's shelf.
+     *
+     * <p>Deliberately <b>non-personalised</b>: unlike {@link #forTrack}, which
+     * feeds autoplay and must never repeat anything the user owns or just
+     * heard, this only removes what cannot be offered honestly — the track
+     * itself, what is already queued, and duplicates. Liked and recently
+     * played tracks stay visible: a shelf for discovery shows associated
+     * tracks to pick from, not a second copy of the autoplay policy.
+     *
+     * <p>Always completes, with an empty list on any failure.
+     */
+    void forDisplay(MediaTrack origin, Callback callback) {
+        TrackKey originKey = TrackKey.of(origin);
+        if (source == null || originKey == null) {
+            deliver(callback, new ArrayList<>(), null);
+            return;
+        }
+        telemetry.mark(PlaybackTrace.RECOMMENDATIONS_START, "id=" + originKey + " mode=display");
+        try {
+            source.related(originKey.providerTrackId(), (raw, error) -> {
+                List<MediaTrack> shown = filterForDisplay(originKey, raw);
+                telemetry.mark(PlaybackTrace.RECOMMENDATIONS_END,
+                        "kept=" + shown.size() + " raw=" + (raw == null ? 0 : raw.size())
+                                + (error == null ? "" : " error=" + error));
+                if (error != null) {
+                    Log.i(TAG, "event=RECOMMENDATIONS_FAILED " + error);
+                }
+                deliver(callback, shown, null);
+            });
+        } catch (Throwable failure) {
+            telemetry.mark(PlaybackTrace.RECOMMENDATIONS_END, "error=unavailable");
+            deliver(callback, new ArrayList<>(), null);
+        }
+    }
+
+    /**
+     * Display filtering: current track, queued tracks and duplicates go.
+     *
+     * <p>Package-visible and pure so the discovery rule is directly testable,
+     * next to {@link #filter}.
+     */
+    List<MediaTrack> filterForDisplay(TrackKey originKey, List<MediaTrack> raw) {
+        List<MediaTrack> result = new ArrayList<>();
+        if (raw == null || raw.isEmpty()) return result;
+        Set<TrackKey> blocked = new HashSet<>();
+        if (originKey != null) blocked.add(originKey);
+        if (queue != null) blocked.addAll(queue.queuedKeys());
+        for (MediaTrack candidate : raw) {
+            TrackKey key = TrackKey.of(candidate);
+            if (key == null) continue;
+            if (blocked.contains(key)) continue;
+            blocked.add(key);
+            result.add(candidate);
+        }
+        return result;
+    }
+
+    /**
      * Applies every deduplication rule (§15, §16).
      *
      * <p>Package-private and pure so the rules are directly testable.

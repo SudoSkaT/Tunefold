@@ -331,6 +331,25 @@ final class DownloadRegistry {
         return probe != null && probe.isStored(key);
     }
 
+    /**
+     * Current state for an identity, from memory alone; never {@code null}.
+     *
+     * <p>The hot-path read: snapshots (twice a second for the notification) and
+     * row binds (every scroll frame) come through here, and both run on the
+     * main thread, so this must never reach the filesystem. Before the store
+     * scan an unknown identity reports idle; the seed notification corrects
+     * every row once the scan lands.
+     */
+    DownloadState stateOfCached(TrackKey key) {
+        if (key == null) return DownloadState.idle(null);
+        synchronized (states) {
+            DownloadState known = states.get(key);
+            return known != null ? known : DownloadState.idle(key);
+        }
+    }
+
+    DownloadState stateOfCached(MediaTrack track) { return stateOfCached(TrackKey.of(track)); }
+
     private DownloadState put(TrackKey key, DownloadState next) {
         if (key == null) return next;
         synchronized (states) { states.put(key, next); }

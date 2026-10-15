@@ -193,6 +193,30 @@ final class PlaybackQueue {
         }
     }
 
+    /**
+     * Appends tracks, skipping identities that cannot play or are queued.
+     *
+     * <p>Same admission rules as {@link #replaceWith} (identity required, no
+     * duplicates, bounded): the radio refill shares them so a generated list
+     * can never duplicate or overflow the queue.
+     *
+     * @return how many entries were appended
+     */
+    int appendAll(List<MediaTrack> tracks) {
+        if (tracks == null || tracks.isEmpty()) return 0;
+        synchronized (mutex) {
+            int added = 0;
+            for (MediaTrack track : tracks) {
+                if (items.size() >= MAX_ENTRIES) break;
+                TrackKey key = TrackKey.of(track);
+                if (key == null || indexOf(key) >= 0) continue;
+                items.add(track);
+                added++;
+            }
+            return added;
+        }
+    }
+
     /** Removes one entry, keeping the current index pointing at the same track. */
     boolean remove(TrackKey key) {
         if (key == null) return false;

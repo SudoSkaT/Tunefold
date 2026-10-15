@@ -90,6 +90,10 @@ final class AudioTrackOutput {
         boolean firstWriteMarked = false;
         // Held in a local so firing it needs no locking; cleared after the call.
         Runnable began = onOutputBegan;
+        // Sample rate is fixed for a source: re-reading it from JNI on every
+        // 8ms iteration tripled the per-tick JNI cost (state + rate + frames).
+        // Read once per track creation instead.
+        int cachedRate = 0;
         ByteBuffer pcm = ByteBuffer.allocateDirect(CHUNK_FRAMES * 2 * Float.BYTES)
                 .order(ByteOrder.nativeOrder());
         try {
@@ -100,7 +104,19 @@ final class AudioTrackOutput {
                     return;
                 }
 
-                int sampleRate = TunefoldBridge.getSampleRate(engine);
+                if (state == PlaybackController.PAUSED) {
+                    // Paused: nothing can become writable until resume. Polling
+                    // at the active 8ms cadence woke the CPU ~125 times a
+                    // second for the whole pause; 50ms answers a resume
+                    // within a frame and costs a twentieth of the wakeups.
+                    sleepMillis(50);
+                    continue;
+                }
+                int sampleRate = cachedRate;
+                if (localTrack == null && sampleRate <= 0) {
+                    sampleRate = TunefoldBridge.getSampleRate(engine);
+                    cachedRate = sampleRate;
+                }
                 int available = TunefoldBridge.getAvailableFrames(engine);
                 if (sampleRate <= 0 || available <= 0) {
                     if (TunefoldBridge.isDecoderFinished(engine)) {
@@ -111,7 +127,7 @@ final class AudioTrackOutput {
                         }
                         return;
                     }
-                    sleepBriefly();
+                    sleepMillis(20);
                     continue;
                 }
 
@@ -130,7 +146,7 @@ final class AudioTrackOutput {
                     if (localTrack.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
                         localTrack.pause();
                     }
-                    sleepBriefly();
+                    sleepMillis(50);
                     continue;
                 }
                 if (state == PlaybackController.LOADING
@@ -142,7 +158,7 @@ final class AudioTrackOutput {
                 pcm.clear();
                 int frames = TunefoldBridge.readPcm(engine, pcm, Math.min(CHUNK_FRAMES, available));
                 if (frames <= 0) {
-                    sleepBriefly();
+                    sleepMillis(20);
                     continue;
                 }
                 int bytes = frames * 2 * Float.BYTES;
@@ -228,11 +244,15 @@ final class AudioTrackOutput {
         return error == null || error.isEmpty() ? fallback : error;
     }
 
-    private static void sleepBriefly() {
+    private static void sleepMillis(long millis) {
         try {
-            Thread.sleep(8);
+            Thread.sleep(millis);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    private static void sleepBriefly() {
+        sleepMillis(8);
     }
 }

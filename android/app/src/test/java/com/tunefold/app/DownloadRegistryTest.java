@@ -207,6 +207,40 @@ public class DownloadRegistryTest {
         assertFalse(registry.isDownloaded(key("z")));
     }
 
+    // ------------------------------------------------- memory-only hot path
+
+    /**
+     * The snapshot/row-bind read must never reach the filesystem: it runs on
+     * the main thread twice a second (notification) and per row per bind
+     * (scroll), and the probe is a file read plus JSON parse plus a
+     * last-modified write.
+     */
+    @Test public void cachedReadNeverConsultsTheDisk() {
+        DownloadRegistry guarded = new DownloadRegistry(key -> {
+            throw new AssertionError("disk consulted from the hot path: " + key);
+        });
+        assertEquals(DownloadState.Phase.IDLE, guarded.stateOfCached(key("a")).phase);
+        assertFalse(guarded.stateOfCached(key("a")).isDownloaded());
+        assertEquals(DownloadState.Phase.IDLE,
+                guarded.stateOfCached(TestTracks.of("YouTube", "a")).phase);
+    }
+
+    @Test public void cachedReadSeesMemoryState() {
+        TrackKey key = key("a");
+        registry.beginResolving(key);
+        assertEquals(DownloadState.Phase.RESOLVING_SOURCE,
+                registry.stateOfCached(key).phase);
+        registry.complete(key, 2000, null);
+        assertTrue(registry.stateOfCached(key).isDownloaded());
+    }
+
+    @Test public void cachedReadFollowsTheSeed() {
+        assertEquals(DownloadState.Phase.IDLE,
+                registry.stateOfCached(key("a")).phase);
+        registry.seedStored(entries(key("a")));
+        assertTrue(registry.stateOfCached(key("a")).isDownloaded());
+    }
+
     /**
      * The title a download was committed under must be readable again after a restart,
      * which is the whole reason it is remembered: identity alone renders a bare id.

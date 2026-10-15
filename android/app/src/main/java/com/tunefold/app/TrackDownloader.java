@@ -147,6 +147,16 @@ final class TrackDownloader implements AutoCloseable {
 
     DownloadState stateOf(TrackKey key) { return registry.stateOf(key); }
 
+    /**
+     * Hot-path read for snapshots and row binds (main thread, high frequency).
+     *
+     * <p>Memory only: unlike {@link #stateOf}, this never consults the store on
+     * disk, so a notification tick or a scroll frame cannot block on I/O.
+     */
+    DownloadState stateOfCached(MediaTrack track) { return registry.stateOfCached(track); }
+
+    DownloadState stateOfCached(TrackKey key) { return registry.stateOfCached(key); }
+
     /** True when a valid local file exists for this identity. */
     boolean isDownloaded(MediaTrack track) { return registry.isDownloaded(track); }
 
@@ -302,9 +312,17 @@ final class TrackDownloader implements AutoCloseable {
 
     /**
      * Polls the native download and registers the committed file when it ends.
+     *
+     * <p>Guarded by the live-job map: a cancel removes the job, and the already
+     * scheduled tick for the removed job becomes a no-op instead of finishing
+     * a download the user just cancelled.
      */
     private void poll(Job job) {
         if (closed || job.key == null) return;
+        synchronized (jobs) {
+            Job live = jobs.get(job.key);
+            if (live == null || live.id != job.id) return;
+        }
         String raw = TunefoldBridge.getDownloadProgress(engines.handle(), job.id);
         if (raw == null) {
             synchronized (jobs) { jobs.remove(job.key); }
@@ -339,6 +357,7 @@ final class TrackDownloader implements AutoCloseable {
      * atomic commit (§9).
      */
     private void finish(Job job) {
+        synchronized (jobs) { jobs.remove(job.key); }
         recovery.onDownloadFinished();
         TrackKey key = job.key;
         String committed = TunefoldBridge.localMediaPath(directory.getAbsolutePath(),

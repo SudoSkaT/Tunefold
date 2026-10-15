@@ -122,10 +122,39 @@ public final class LockScreenControlsActivity extends Activity {
             @Override public void onToggleAutoplay() {
                 if (session != null) session.setAutoplayEnabled(!session.autoplayEnabled());
             }
+            @Override public void onEnqueueRecommended(MediaTrack track) {
+                if (session == null || track == null || track.key() == null) return;
+                session.enqueue(track);
+                controls.removeRecommended(track.key());
+            }
+
+            @Override public void onCreateRadio() {
+                if (session != null) session.setRadioEnabled(true);
+            }
+
+            @Override public void onCreateArtistRadio() {
+                if (session == null) return;
+                MediaTrack current = currentTrack();
+                String who = current == null ? ""
+                        : (!current.artist.isEmpty() ? current.artist : current.channel);
+                if (!who.isEmpty()) session.setArtistRadioEnabled(true, who);
+            }
+
+            @Override public void onStopRadio() {
+                if (session != null) session.setRadioEnabled(false);
+            }
         });
-        controls.setQueuedTrackChosen(track -> {
-            if (session != null && track != null && track.key() != null) {
-                session.playQueued(track.key());
+        controls.setQueuedTrackChosen(new NowPlayingView.QueuedTrackChosen() {
+            @Override public void onQueuedTrackChosen(MediaTrack track) {
+                if (session != null && track != null && track.key() != null) {
+                    session.playQueued(track.key());
+                }
+            }
+
+            @Override public void onQueuedTrackRemoved(MediaTrack track) {
+                if (session != null && track != null) {
+                    session.removeFromQueue(track.key());
+                }
             }
         });
 
@@ -178,12 +207,17 @@ public final class LockScreenControlsActivity extends Activity {
      */
     private final Runnable tick = new Runnable() {
         @Override public void run() {
-            if (destroyed || session == null || !bound) return;
-            PlaybackPosition now = session.readPosition(position);
-            controls.setPosition(now.key, now.positionMs, now.durationMs);
-            controls.tick();
-            controls.refreshSound();
-            handler.postDelayed(this, DesignTokens.POSITION_INTERVAL_MS);
+            // Always rescheduled: the first tick can run before the service
+            // binds (session == null), and returning without scheduling then
+            // killed the loop forever — position and bars froze on the lock
+            // screen until the activity was recreated.
+            if (!destroyed && session != null && bound) {
+                PlaybackPosition now = session.readPosition(position);
+                controls.setPosition(now.key, now.positionMs, now.durationMs);
+                controls.tick();
+                controls.refreshSound();
+            }
+            if (!destroyed) handler.postDelayed(this, DesignTokens.POSITION_INTERVAL_MS);
         }
     };
 
@@ -216,8 +250,54 @@ public final class LockScreenControlsActivity extends Activity {
         controls.applyDownloadState(snapshot);
         controls.applyError(snapshot);
         controls.setUpNextFrom(snapshot.queue, snapshot.currentKey);
+        controls.applyRadio(session.radioOn(), session.radioLabel());
         loadArtwork(snapshot.currentTrack);
+        loadQueueArtwork();
         requestLyrics(snapshot);
+        requestRecommendations(snapshot);
+    }
+
+    /** Covers of the Sigue window, once per window; never on the UI thread. */
+    private String queueArtKey = "";
+
+    private void loadQueueArtwork() {
+        if (providers == null) return;
+        java.util.List<MediaTrack> shown = controls.queuedShown();
+        StringBuilder identity = new StringBuilder(shown.size());
+        for (MediaTrack track : shown) {
+            TrackKey key = track.key();
+            identity.append(key == null ? "" : key.toString()).append('\u0001');
+        }
+        String stamp = identity.toString();
+        if (stamp.equals(queueArtKey)) return;
+        queueArtKey = stamp;
+        for (MediaTrack track : shown) {
+            if (track == null || track.thumbnail.isEmpty()) continue;
+            TrackKey key = track.key();
+            if (key == null) continue;
+            String id = key.toString();
+            providers.loadArtwork(track, DesignTokens.dp(DesignTokens.ARTWORK_THUMB),
+                    (bitmap, error) -> {
+                        if (destroyed || bitmap == null) return;
+                        controls.setQueueArtwork(id, bitmap);
+                    });
+        }
+    }
+
+    /**
+     * The cover of one recommended row, at row size; refused on arrival unless
+     * the row is still waiting for it.
+     */
+    private void loadRecommendedArtwork(MediaTrack track) {
+        if (providers == null || track == null || track.thumbnail.isEmpty()) return;
+        TrackKey key = track.key();
+        if (key == null) return;
+        String identity = key.toString();
+        providers.loadArtwork(track, DesignTokens.dp(DesignTokens.ARTWORK_THUMB),
+                (bitmap, error) -> {
+                    if (destroyed || bitmap == null) return;
+                    controls.setRecommendedArtwork(identity, bitmap);
+                });
     }
 
     /**
@@ -261,6 +341,33 @@ public final class LockScreenControlsActivity extends Activity {
     }
 
     private String lyricsRequestedFor;
+
+    /** Track the recommendations were last asked for; one request per track. */
+    private String recsRequestedFor;
+
+    /**
+     * Discovery candidates for what is playing, like the main screen: the
+     * session already removes what is playing and what is queued, and what
+     * joins the queue leaves the offer at once.
+     */
+    private void requestRecommendations(PlaybackSession.Snapshot snapshot) {
+        if (session == null) return;
+        TrackKey key = snapshot.currentKey;
+        String identity = key == null ? "" : key.toString();
+        if (identity.equals(recsRequestedFor)) return;
+        recsRequestedFor = identity;
+        controls.clearRecommendations();
+        if (key == null) return;
+        MediaTrack track = snapshot.currentTrack;
+        session.recommendationsForDisplay(track, (candidates, error) -> {
+            if (destroyed || session == null || !identity.equals(recsRequestedFor)) return;
+            java.util.List<MediaTrack> offered = candidates == null
+                    ? new java.util.ArrayList<>()
+                    : new java.util.ArrayList<>(candidates);
+            controls.setRecommendations(identity, offered);
+            for (MediaTrack candidate : offered) loadRecommendedArtwork(candidate);
+        });
+    }
 
     /**
      * Se cierra cuando deja de estar delante, y no antes.

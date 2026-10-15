@@ -114,6 +114,9 @@ enum Icon {
     /** Three dots. */
     MORE(false, "M 12 5.3 L 12 5.7 M 12 11.9 L 12 12.3 M 12 18.3 L 12 18.7"),
 
+    /** Plus: offer to add one more, e.g. a recommended track into the queue. */
+    ADD(false, "M 12 5 L 12 19 M 5 12 L 19 12"),
+
     /** Rules plus a play marker: the upcoming-queue affordance. */
     QUEUE(false,
             "M 4 7 L 14.5 7 M 4 12 L 14.5 12 M 4 17 L 10 17 M 17.5 13.6 L 21.5 17 L 17.5 20.4 Z"),
