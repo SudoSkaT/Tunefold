@@ -21,6 +21,8 @@ pub struct RawFeatures {
     /// Centroid espectral normalizado por Nyquist (0..1).
     pub centroid_norm: f32,
     pub flux: f32,
+    /// Cromática del frame (12 clases de pica, suma 1; 0 sin contenido).
+    pub chroma: [f32; 12],
 }
 
 /// Snapshot suavizado publicado a los consumidores.
@@ -47,6 +49,11 @@ pub struct AudioFeatures {
     pub beat_confidence: f32,
     /// BPM estimado (0 = desconocido; se mantiene el último estable).
     pub bpm: f32,
+    /// Cromática del frame: 12 clases de pica normalizadas a suma 1
+    /// (0 si no hay contenido en el rango musical). CRUDA, sin suavizar:
+    /// el agregador acústico la promedia por track y el detector de cambios
+    /// armónicos necesita el valor por frame.
+    pub chroma: [f32; 12],
 }
 
 impl AudioFeatures {
@@ -67,6 +74,7 @@ impl AudioFeatures {
             beat: false,
             beat_confidence: 0.0,
             bpm: 0.0,
+            chroma: [0.0; 12],
         }
     }
 }

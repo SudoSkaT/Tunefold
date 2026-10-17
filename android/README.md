@@ -369,6 +369,35 @@ at 48dp, so a fling is not a re-decode from disk on every pass. Only a player-si
 request derives the palette — deriving colours from a 48dp row thumbnail would
 repaint the whole surface every time a different row scrolled past.
 
+## Recommendation ranking
+
+Autoplay and Home do not play the provider's raw "related" order. The same
+scoring engine the desktop TUI uses — acoustic similarity, harmonic distance,
+structure, then the local listening history — reorders candidates before they
+are offered; provider popularity decides only a small fraction of the result.
+The model is documented in [`docs/recommendations.md`](../docs/recommendations.md).
+
+* **One engine, via JNI.** `TunefoldBridge.rankRelated` (`src/platform/
+  android_rank.rs`) receives candidates, the recorded listening signals and —
+  once Android produces them — acoustic profiles in a single stateless JSON
+  request, and returns `{"ok":true,"order":[indices…]}` over that same input
+  array. The `.so` keeps no state; the app owns every byte of it.
+* **Fail-open, always.** No data, a bad parse, an `ok:false` envelope, a
+  non-permutation order, or any thrown `Throwable` (including the
+  `UnsatisfiedLinkError` of an older binary) all keep the provider order. The
+  ranker may make the list worse; it can never break playback.
+* **Filters stay in Java.** `Recommendations.filter*` still removes the
+  current track, what is queued, liked or just played; the native only
+  reorders. The player's shelf (`forDisplay`) is deliberately **not** ranked:
+  it is a discovery surface, not the autoplay policy.
+* **Listening feedback is app-owned.** `PlaybackSession` records `play`,
+  `skip` (only when abandoned by hand, never at end of track), `completed`
+  and `rec_click`, through `ListeningSignals`, into
+  `filesDir/listening-signals.txt` (tab-separated lines, newest 200, atomic
+  write). Deleting the file merely resets recommendation feedback — library,
+  queue and downloads live elsewhere. Nothing is ever uploaded; ranking is
+  computed in-process.
+
 ## Playback timing and cache
 
 Each play writes an ordered, per-play timeline to Logcat under the `TunefoldPerf`

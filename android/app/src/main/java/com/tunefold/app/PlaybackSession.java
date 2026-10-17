@@ -98,6 +98,18 @@ final class PlaybackSession {
     private TrackDownloader downloader;
     private PlaybackState state = PlaybackState.IDLE;
     /**
+     * Listening feedback persisted by the app (Fase 5); {@code null} only in
+     * tests that never record. Recording is best-effort around this reference.
+     */
+    private final ListeningSignals signals;
+    /**
+     * How the current track was started: {@code manual}, {@code queue},
+     * {@code autoplay} or {@code recommendation}. Feeds the shared ranker —
+     * a skip only counts against taste when it came from the user, not from
+     * the autoplay budget.
+     */
+    private String currentContext = "manual";
+    /**
      * Decides which track the reported position belongs to.
      *
      * <p>Single owner of the temporal state, shared by the app UI, the
@@ -156,15 +168,26 @@ final class PlaybackSession {
      */
     private final java.util.LinkedHashSet<TrackKey> fallbackPlayed = new java.util.LinkedHashSet<>();
 
-    PlaybackSession(PlaybackController controller, ProviderRegistry providers, Library library) {
+    PlaybackSession(PlaybackController controller, ProviderRegistry providers, Library library,
+                    ListeningSignals signals) {
         this.controller = controller;
         this.providers = providers;
         this.library = library;
+        this.signals = signals;
         this.recommendations = new Recommendations(
                 (videoId, callback) -> providers.related(videoId,
                         (tracks, error) -> callback.onRecommendations(tracks, error)),
                 library, queue,
-                (event, detail) -> PlaybackTrace.markCurrent(event, detail));
+                (event, detail) -> PlaybackTrace.markCurrent(event, detail),
+                candidates -> {
+                    if (signals == null) return null;
+                    String request = signals.buildRankRequest(candidates);
+                    if (request == null) return null;
+                    // Fails open inside applyRank: an ok:false envelope, a bad
+                    // parse or an UnsatisfiedLinkError from a binary without
+                    // this native all keep the provider order.
+                    return TunefoldBridge.rankRelated(request);
+                });
         controller.setTrackFinishedListener(this::onTrackFinished);
     }
 
@@ -392,6 +415,11 @@ final class PlaybackSession {
 
     /** Skips to the next queued item, or continues from recommendations. */
     void next() {
+        // Leaving a track by hand is feedback, whether or not anything
+        // follows: record it against the track being abandoned and the context
+        // it was started with. A track already completed at EOF was recorded
+        // as {@code completed} and never counts as a skip.
+        recordSkip();
         MediaTrack target = queue.peekNext();
         if (target == null) {
             // Queue exhausted. In radio the generated list owns what is next;
@@ -415,7 +443,7 @@ final class PlaybackSession {
                 "to=" + target.key());
         queue.advance();
         if (radioOn) refillRadioIfNeeded();
-        startCurrent();
+        startCurrent("queue");
     }
 
     /**
@@ -439,8 +467,22 @@ final class PlaybackSession {
             return;
         }
         PlaybackTrace.markCurrent(PlaybackTrace.QUEUE_PREVIOUS, "to=" + target.key());
+        recordSkip();
         queue.retreat();
-        startCurrent();
+        startCurrent("queue");
+    }
+
+    /**
+     * Records the outgoing track as skipped, when one was actually left.
+     *
+     * <p>Only when playback has not already ended (an EOF was recorded as
+     * {@code completed}, that is not a skip) and a track is current. The
+     * autoplay budget does not count: {@code currentContext} tells the
+     * ranker whether this was the user's decision.
+     */
+    private void recordSkip() {
+        if (signals == null || currentTrack == null || eofHandled) return;
+        signals.record(currentTrack, ListeningSignals.KIND_SKIP, currentContext);
     }
 
     /**
@@ -534,7 +576,7 @@ final class PlaybackSession {
         if (target == null) return false;
         PlaybackTrace.markCurrent(PlaybackTrace.QUEUE_NEXT, "jump=" + key);
         if (!queue.moveTo(index)) return false;
-        startCurrent();
+        startCurrent("queue");
         return true;
     }
 
@@ -840,6 +882,18 @@ final class PlaybackSession {
 
     /** Resolves the current queue item and hands it to the decoder. */
     private void startCurrent() {
+        startCurrent("manual");
+    }
+
+    /**
+     * Resolves the current queue item and hands it to the decoder.
+     *
+     * @param context how this track came to play: {@code manual},
+     *                {@code queue}, {@code autoplay} or {@code recommendation};
+     *                recorded as listening feedback and reused for the skip
+     *                that may follow it
+     */
+    private void startCurrent(String context) {
         MediaTrack track = queue.current();
         if (track == null) return;
         // Every track change opens a new generation. Callbacks and engine readings
@@ -847,9 +901,16 @@ final class PlaybackSession {
         // track's position, artwork or error from landing on the new track.
         long generation = clock.beginTrack();
         currentTrack = track;
+        currentContext = context;
         eofHandled = false;
         recovery.resetForNextTrack();
         library.markPlayed(track.key());
+        if (signals != null) {
+            // "recommendation" collapses into rec_click: one intent, the same
+            // way the console's signal weights treat it.
+            signals.record(track, "recommendation".equals(context)
+                    ? ListeningSignals.KIND_REC_CLICK : ListeningSignals.KIND_PLAY, context);
+        }
         beginTrace(track.key().toString());
         state = PlaybackState.RESOLVING_SOURCE;
         error = null;
@@ -914,19 +975,26 @@ final class PlaybackSession {
         traceEvent("EOF_ACCEPTED");
 
         MediaTrack finished = queue.current();
+        if (finished != null && signals != null) {
+            // A track that reached its own end was listened to: completion is
+            // the strongest positive signal. Duration comes from metadata when
+            // known, otherwise from the position the engine reported.
+            long listened = finished.durationMs > 0 ? finished.durationMs : positionMs();
+            signals.record(finished, ListeningSignals.KIND_COMPLETED, currentContext, listened);
+        }
         AutoplayPolicy.Outcome outcome = AutoplayPolicy.afterTrackFinished(
                 queue, queue.isAutoplayEnabled(), null);
 
         if (outcome.decision == AutoplayPolicy.Decision.PLAY_NEXT) {
             queue.advance();
             if (radioOn) refillRadioIfNeeded();
-            startCurrent();
+            startCurrent("queue");
             return;
         }
         if (outcome.decision == AutoplayPolicy.Decision.RECOMMEND) {
             // A candidate was already resolved: play it without a round trip.
             queue.setCurrent(outcome.target);
-            startCurrent();
+            startCurrent("recommendation");
             return;
         }
         if (outcome.decision == AutoplayPolicy.Decision.STOP) {
@@ -986,7 +1054,7 @@ final class PlaybackSession {
             }
             recovery.onAutoplaySucceeded();
             queue.setCurrent(chosen);
-            startCurrent();
+            startCurrent("recommendation");
         });
         return true;
     }
@@ -1197,7 +1265,7 @@ final class PlaybackSession {
                     oldest.remove();
                 }
             }
-            startCurrent();
+            startCurrent("recommendation");
             return true;
         }
         return false;

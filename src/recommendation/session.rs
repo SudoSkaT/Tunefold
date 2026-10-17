@@ -22,6 +22,10 @@ pub struct ActiveLoad {
 pub struct RecommendationSession {
     /// Track cuyas recomendaciones se están mostrando (`None` si aún no hay).
     source_track_key: Option<String>,
+    /// Generación de la carga que pobló `source_track_key` (para validar
+    /// actualizaciones tardías del MISMO ciclo — p. ej. el re-rank tras el
+    /// pre-análisis acústico en background).
+    source_generation: Option<u64>,
     /// Próxima generación a asignar (crece con cada petición, nunca decrece).
     generation: u64,
     /// Carga en vuelo (`track_key` + generación) o `None`.
@@ -87,7 +91,21 @@ impl RecommendationSession {
         }
         self.loading = None;
         self.source_track_key = Some(track_key.to_string());
+        self.source_generation = Some(generation);
         true
+    }
+
+    /// ¿Es válida una ACTUALIZACIÓN tardía del mismo ciclo de carga?
+    ///
+    /// A diferencia de [`Self::complete`] (que exige la carga EN VUELO), esto
+    /// valida respuestas que llegan DESPUÉS de completarla con la MISMA
+    /// generación: el re-rank del pre-análisis acústico de candidatos (que
+    /// tarda segundos en background) reutiliza la generación original. Se
+    /// rechaza si ya hay otra carga en vuelo o si la sesión cambió de track.
+    pub fn accepts_update(&self, track_key: &str, generation: u64) -> bool {
+        self.loading.is_none()
+            && self.source_track_key.as_deref() == Some(track_key)
+            && self.source_generation == Some(generation)
     }
 
     /// Cancela la carga en vuelo (p. ej. un error del backend).
@@ -103,6 +121,7 @@ impl RecommendationSession {
     /// pertenecen ya a la sesión.
     pub fn on_track_changed(&mut self) {
         self.source_track_key = None;
+        self.source_generation = None;
         self.loading = None;
     }
 
@@ -112,6 +131,7 @@ impl RecommendationSession {
     /// jamás pueden volver a coincidir con una carga en vuelo futura.
     pub fn reset(&mut self) {
         self.source_track_key = None;
+        self.source_generation = None;
         self.loading = None;
     }
 }
@@ -222,5 +242,44 @@ mod tests {
             Some(2),
             "tras reset la misma canción vuelve a pedirse"
         );
+    }
+
+    #[test]
+    fn accepts_update_only_for_the_completed_generation_of_the_same_track() {
+        let mut s = RecommendationSession::new();
+        let gen = s.request("a").unwrap();
+        // Antes de completar no hay sesión cargada: no se acepta actualización.
+        assert!(!s.accepts_update("a", gen));
+
+        s.complete("a", gen);
+        assert!(
+            s.accepts_update("a", gen),
+            "re-rank tardío del mismo ciclo se acepta"
+        );
+        assert!(!s.accepts_update("a", gen - 1), "generación ajena");
+        assert!(!s.accepts_update("b", gen), "track ajeno");
+    }
+
+    #[test]
+    fn accepts_update_is_rejected_while_another_load_is_in_flight() {
+        let mut s = RecommendationSession::new();
+        let gen_a = s.request("a").unwrap();
+        s.complete("a", gen_a);
+
+        // El usuario cambió a B (carga en vuelo): el re-rank de A es tarde.
+        s.request("b");
+        assert!(
+            !s.accepts_update("a", gen_a),
+            "una carga en vuelo invalida actualizaciones de la sesión anterior"
+        );
+    }
+
+    #[test]
+    fn accepts_update_is_rejected_after_track_change() {
+        let mut s = RecommendationSession::new();
+        let gen = s.request("a").unwrap();
+        s.complete("a", gen);
+        s.on_track_changed();
+        assert!(!s.accepts_update("a", gen));
     }
 }

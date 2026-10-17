@@ -552,7 +552,17 @@ impl App {
                 let has_list = self.view == View::Related || self.view == View::NowPlaying;
                 if has_list {
                     if let Some(track) = self.related.selected().cloned() {
-                        self.save_and_play(track);
+                        // Origen de la fila: lo que encoló el motor de
+                        // recomendaciones se registra como RecClick (bucle
+                        // de feedback v0.20); lo que pidió el usuario sigue
+                        // siendo un Play manual.
+                        let from_rec = self
+                            .related
+                            .list_state
+                            .selected()
+                            .and_then(|i| self.related.origins.get(i))
+                            .is_some_and(crate::playback::QueueItemOrigin::is_auto);
+                        self.begin_play(track, from_rec);
                     } else {
                         self.reload_related();
                     }
@@ -1192,11 +1202,18 @@ impl App {
 
     /// Guarda el track en la BD y lo reproduce (stream resuelto por el backend).
     fn save_and_play(&mut self, track: Track) {
+        self.begin_play(track, false);
+    }
+
+    /// Prepara y lanza la reproducción de `track`. Con `from_rec` la fila
+    /// salió de la lista de recomendaciones: el backend la registra como
+    /// `RecClick` (contexto Recommendation) en vez de un Play genérico.
+    fn begin_play(&mut self, track: Track, from_rec: bool) {
         self.status = Some(format!("Guardando «{}»...", track.title));
         self.pending_track = Some(track.identifier());
         // La intención del usuario pasa a ser el estado autoritativo ya. Así
-        // una respuesta LRC/tick de la canción anterior se descarta durante el
-        // buffering en vez de volver a pintar sus letras sobre la nueva.
+        // una respuesta LRC/tick de la canción anterior se descarta durante
+        // el buffering en vez de volver a pintar sus letras sobre la nueva.
         self.on_new_now_playing(track.clone());
         // Feedback inmediato: la canción nueva tarda en resolverse/descargarse
         // y el backend confirma con un evento cuando arranca, así que la UI se
@@ -1209,7 +1226,12 @@ impl App {
         // anterior en el panel de letras.
         self.clock.clear();
         self.related.clear_lyrics();
-        let _ = self.backend_tx.send(BackendCommand::Play(Box::new(track)));
+        let cmd = if from_rec {
+            BackendCommand::PlayFromRec(Box::new(track))
+        } else {
+            BackendCommand::Play(Box::new(track))
+        };
+        let _ = self.backend_tx.send(cmd);
     }
 
     /// Salta a la siguiente/anterior recomendación de la cola y la reproduce.
@@ -1552,16 +1574,40 @@ impl App {
                 let added = self.related.tracks.len() - self.related.previous_len;
                 self.status = Some(if added > 0 {
                     format!(
-                            "{} en cola (+{} nuevas). ↑/↓ selecciona, Enter reproduce, r actualiza, R reemplaza.",
-                            self.related.tracks.len(),
-                            added
-                        )
+                        "{} en cola (+{} nuevas). ↑/↓ selecciona, Enter reproduce, r actualiza, R reemplaza.",
+                        self.related.tracks.len(),
+                        added
+                    )
                 } else {
                     format!(
-                            "{} en cola. ↑/↓ o W/S selecciona, Enter reproduce, r actualiza, R reemplaza la cola.",
-                            self.related.tracks.len()
-                        )
+                        "{} en cola. ↑/↓ o W/S selecciona, Enter reproduce, r actualiza, R reemplaza la cola.",
+                        self.related.tracks.len()
+                    )
                 });
+            }
+            // Re-rank tardío tras el pre-análisis acústico (v0.20): misma
+            // generación que la carga original; solo se aplica si esa sesión
+            // sigue vigente (ni cambio de canción ni nueva carga la invalidó).
+            BackendEvent::RelatedReranked {
+                track,
+                related,
+                queue,
+                origins,
+                generation,
+            } => {
+                let id = track.identifier();
+                if !self.recs.accepts_update(&id, generation) {
+                    return;
+                }
+                self.related.fresh = related;
+                self.related.set_queue(queue, origins);
+                let last = self.related.tracks.len().saturating_sub(1);
+                let idx = self.related.list_state.selected().unwrap_or(0).min(last);
+                self.related.list_state.select(Some(idx));
+                self.status = Some(format!(
+                    "{} en cola (lista refinada con el análisis acústico local). ↑/↓ selecciona, Enter reproduce.",
+                    self.related.tracks.len()
+                ));
             }
             BackendEvent::QueueState {
                 shuffle,
@@ -2440,6 +2486,51 @@ mod tests {
         assert!(
             cmds.iter().any(|c| matches!(c, BackendCommand::Play(_))),
             "Enter debe reproducir la selección: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn enter_on_recommended_row_sends_play_from_rec() {
+        use crate::playback::QueueItemOrigin;
+        let (tx, mut rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        app.view = View::Related;
+        app.related.tracks = vec![sample_track(), sample_track()];
+        // Fila 0 la encoló el motor de recomendaciones; fila 1, el usuario.
+        app.related.origins = vec![QueueItemOrigin::Recommendation, QueueItemOrigin::User];
+        app.related.list_state.select(Some(0));
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let mut cmds = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            cmds.push(c);
+        }
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, BackendCommand::PlayFromRec(_))),
+            "fila recomendada ⇒ PlayFromRec (RecClick): {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, BackendCommand::Play(_))),
+            "no debe duplicar un Play manual: {cmds:?}"
+        );
+
+        // Fila propia del usuario: sigue siendo Play manual.
+        app.related.list_state.select(Some(1));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let mut cmds = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            cmds.push(c);
+        }
+        assert!(
+            cmds.iter().any(|c| matches!(c, BackendCommand::Play(_))),
+            "fila del usuario ⇒ Play manual: {cmds:?}"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, BackendCommand::PlayFromRec(_))),
+            "no marcar como recomendación lo que eligió el usuario: {cmds:?}"
         );
     }
 

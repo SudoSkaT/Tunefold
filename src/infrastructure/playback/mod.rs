@@ -23,6 +23,11 @@ use crate::infrastructure::config::Config;
 pub use output::SharedOutput;
 #[cfg(feature = "rodio")]
 pub use rodio_backend::RodioBackend;
+/// Buffer bloqueante `Read + Seek` sobre un stream HTTP con Range: lo
+/// comparten la reproducción (rodio) y el pre-análisis acústico de
+/// recomendaciones (`ui::preanalysis`), que decodifica sin dispositivo.
+#[cfg(feature = "rodio")]
+pub(crate) use rodio_backend::{StreamBuffer, StreamReader};
 
 /// Construye los motores a partir de la configuración. `http` es el cliente
 /// HTTP compartido para resolver/descargar streams. Todos los motores notifican

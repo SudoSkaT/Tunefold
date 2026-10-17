@@ -30,7 +30,9 @@ pub enum SignalKind {
     PlaylistAdd,
     /// El usuario eligió reproducir una recomendación (conversión).
     RecClick,
-    /// La recomendación se mostró (impresión: solo para medir, no puntúa).
+    /// La recomendación se mostró (impresión: solo para medir CTR por
+    /// semilla con `recomm_id`; su peso en el perfil es 0 — ver
+    /// [`signal_weight`] — así que nunca influye en el ranking por sí sola).
     RecImpression,
 }
 
@@ -152,7 +154,10 @@ pub fn signal_weight(signal: SignalKind, context: PlayContext, completion: bool)
         SignalKind::PlaylistAdd => 2.0,
         SignalKind::RecClick => 2.0,
         SignalKind::Completed => 1.5,
-        SignalKind::Play | SignalKind::RecImpression => 1.0,
+        SignalKind::Play => 1.0,
+        // Impresión = solo métrica (CTR por semilla vía `recomm_id`): pesa 0
+        // para que `from_signals` no confunda "se mostró" con "le gustó".
+        SignalKind::RecImpression => 0.0,
         SignalKind::Skip | SignalKind::Unlike => -1.0,
     };
     // Una canción "escuchada completa" refuerza la señal; un evento corto en
@@ -320,6 +325,42 @@ mod tests {
                 plays: 0,
                 negative: 0
             }
+        );
+    }
+
+    #[test]
+    fn impression_is_measured_but_never_scores() {
+        // La impresión alimenta el CTR (recomm_id), no el gusto: peso 0.
+        assert_eq!(
+            signal_weight(
+                SignalKind::RecImpression,
+                PlayContext::Recommendation,
+                false
+            ),
+            0.0,
+            "se mostró ≠ le gusta"
+        );
+        assert_eq!(
+            signal_weight(SignalKind::Play, PlayContext::Recommendation, false),
+            1.0
+        );
+        assert_eq!(
+            signal_weight(SignalKind::RecClick, PlayContext::Recommendation, false),
+            2.0,
+            "la conversión sí puntúa fuerte"
+        );
+
+        // Y el agregado la ignora: ni intento ni negativa.
+        let sigs = vec![mks(
+            1,
+            SignalKind::RecImpression,
+            PlayContext::Recommendation,
+        )];
+        let map = aggregate_signals(&sigs);
+        assert_eq!(
+            map.get(&1).copied(),
+            Some(crate::recommendation::types::TrackSignals::default()),
+            "una impresión no mueve plays ni negatives"
         );
     }
 }

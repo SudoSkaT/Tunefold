@@ -210,6 +210,7 @@ mod tests {
             beat,
             beat_confidence: 0.8,
             bpm,
+            chroma: [0.0; 12],
         }
     }
 

@@ -48,7 +48,10 @@ public final class ForegroundPlaybackService extends Service {
         library = new Library(new java.io.File(getFilesDir(), "library"));
         library.load();
         providers = new ProviderRegistry();
-        session = new PlaybackSession(controller, providers, library);
+        // Listening feedback for the shared ranker (Fase 5): the app owns the
+        // file; the .so is stateless and receives it per call.
+        session = new PlaybackSession(controller, providers, library,
+                new ListeningSignals(new java.io.File(getFilesDir(), "listening-signals.txt")));
         session.addObserver(sessionObserver);
 
         providers.initialize(new java.io.File(getCacheDir(), "rustypipe").getAbsolutePath(),

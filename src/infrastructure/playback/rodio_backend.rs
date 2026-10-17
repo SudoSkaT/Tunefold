@@ -803,7 +803,7 @@ impl PlaybackEngine for RodioBackend {
 /// Además de los bytes, acumula las métricas que usa el monitor de buffering:
 /// bytes descargados/consumidos, velocidad estimada (EMA) y bitrate de
 /// reproducción, para convertir bytes en segundos de audio.
-struct StreamBuffer {
+pub(crate) struct StreamBuffer {
     inner: Mutex<State>,
     cv: Condvar,
     /// `true` mientras un lector espera datos (buffer underrun): el stream
@@ -830,7 +830,7 @@ struct State {
 }
 
 impl StreamBuffer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Mutex::new(State::default()),
             cv: Condvar::new(),
@@ -862,7 +862,7 @@ impl StreamBuffer {
         self.stalled.store(stalled, Ordering::Relaxed);
     }
 
-    fn append(&self, bytes: &[u8]) {
+    pub(crate) fn append(&self, bytes: &[u8]) {
         let mut s = self.inner.lock().unwrap();
         s.buf.extend_from_slice(bytes);
         self.downloaded
@@ -870,7 +870,7 @@ impl StreamBuffer {
         self.cv.notify_all();
     }
 
-    fn finish(&self) {
+    pub(crate) fn finish(&self) {
         let mut s = self.inner.lock().unwrap();
         s.eof = true;
         self.cv.notify_all();
@@ -890,7 +890,7 @@ impl StreamBuffer {
         self.inner.lock().unwrap().cut.clone()
     }
 
-    fn fail(&self, err: String) {
+    pub(crate) fn fail(&self, err: String) {
         let mut s = self.inner.lock().unwrap();
         s.err = Some(err);
         self.cv.notify_all();
@@ -961,13 +961,13 @@ impl StreamBuffer {
 ///
 /// Mientras el stream no llega al final, `read` espera a que haya bytes y
 /// `seek` espera a que la posición solicitada haya sido descargada.
-struct StreamReader {
+pub(crate) struct StreamReader {
     shared: Arc<StreamBuffer>,
     pos: u64,
 }
 
 impl StreamReader {
-    fn new(shared: Arc<StreamBuffer>) -> Self {
+    pub(crate) fn new(shared: Arc<StreamBuffer>) -> Self {
         Self { shared, pos: 0 }
     }
 

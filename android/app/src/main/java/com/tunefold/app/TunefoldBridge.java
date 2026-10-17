@@ -75,4 +75,18 @@ final class TunefoldBridge {
     static native String resolveYoutubeSource(String trackJson);
     /** Provider "related to this video" list, for Home and autoplay. */
     static native String relatedYoutube(String videoId, int limit);
+
+    /**
+     * Reorders recommendation candidates by personal taste (Fase 5).
+     *
+     * <p>Stateless: the request carries candidates, listening signals and (when
+     * available) acoustic profiles in one JSON envelope, and the response is
+     * either {@code {"ok":true,"order":[indices...]}} or an
+     * {@code {"ok":false,...}} envelope. Indices refer to the input array as
+     * sent, so the caller can reorder its own list without re-serializing.
+     * Callers must fail open: any {@code ok:false}, unparsable response or
+     * {@link UnsatisfiedLinkError} (a binary without this native) keeps the
+     * provider order untouched — see {@code Recommendations.applyRank}.
+     */
+    static native String rankRelated(String request);
 }

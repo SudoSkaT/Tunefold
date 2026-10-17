@@ -17,6 +17,7 @@ pub mod liked;
 pub mod metadata;
 pub mod navigation;
 pub mod playlists;
+pub(crate) mod preanalysis;
 pub mod related;
 pub mod search;
 pub mod settings;

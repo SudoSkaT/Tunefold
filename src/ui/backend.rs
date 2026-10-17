@@ -19,11 +19,9 @@ use crate::infrastructure::db::Db;
 use crate::infrastructure::playback;
 use crate::playback::{decide_recovery, QueueManager, RecoveryAction, RecoveryBudget, RepeatMode};
 use crate::recommendation::acoustic_aggregator::AcousticAggregator;
+use crate::recommendation::aggregate_signals;
 use crate::recommendation::signals::{PlayContext, SignalKind};
 use crate::recommendation::types::UserProfile;
-use crate::recommendation::{
-    aggregate_signals, metadata_similarity, negative_penalty, user_affinity,
-};
 
 use super::event::BackendEvent;
 
@@ -44,6 +42,11 @@ pub enum BackendCommand {
     LoadSettings,
     /// Reproduce un track (resuelve el stream y lo delega al motor adecuado).
     Play(Box<Track>),
+    /// Reproduce una recomendación ELEGIDA en la vista de recomendaciones:
+    /// registra `RecClick` con contexto `Recommendation` (bucle de feedback
+    /// v0.20) en vez de un `Play` genérico, y los skips posteriores heredan
+    /// ese contexto.
+    PlayFromRec(Box<Track>),
     Pause,
     Resume,
     Toggle,
@@ -157,6 +160,14 @@ pub struct Backend {
     features: Option<crate::analysis::FeatureBus>,
     /// Bus de envolvente de forma de onda del mismo análisis.
     waveform: Option<crate::analysis::WaveformBus>,
+    /// Emisor de eventos hacia la UI. Lo instala `spawn_backend` para que
+    /// las tareas en background (p. ej. el pre-análisis de candidatos de
+    /// recomendación) puedan emitir sin esperar al siguiente comando.
+    events_out: Arc<std::sync::OnceLock<UnboundedSender<BackendEvent>>>,
+    /// Semillas cuyo pre-análisis de candidatos está en vuelo: evita
+    /// duplicar el trabajo cuando se piden listas "relacionadas" en ráfaga.
+    /// Mutex std (nunca se mantiene en hold a través de un await).
+    preanalysis_inflight: Arc<std::sync::Mutex<super::preanalysis::InflightSet>>,
 }
 
 impl Backend {
@@ -221,6 +232,10 @@ impl Backend {
             preload,
             features,
             waveform,
+            events_out: Arc::new(std::sync::OnceLock::new()),
+            preanalysis_inflight: Arc::new(std::sync::Mutex::new(
+                super::preanalysis::InflightSet::default(),
+            )),
         }
     }
 
@@ -309,13 +324,21 @@ impl Backend {
             .await
             .map_err(|e| format!("guardar escucha: {e}"))?;
 
-        // Señal real de interacción (FASE 11): un `Play` por contexto. La
-        // duración total del track se conserva para normalizar completed/skip.
+        // Señal real de interacción (FASE 11 + v0.20): un intento por
+        // contexto. La elección desde la lista de recomendaciones se registra
+        // como `RecClick` (conversión del bucle de feedback) en vez de `Play`
+        // genérico: ambos cuentan como intento en el agregado, pero solo el
+        // primero lleva el sello de "elegido desde las recomendaciones".
+        // La duración total del track se conserva para normalizar completed/skip.
         let _ = self
             .db
             .record_signal(
                 internal_id,
-                SignalKind::Play,
+                if context == PlayContext::Recommendation {
+                    SignalKind::RecClick
+                } else {
+                    SignalKind::Play
+                },
                 context,
                 None,
                 None,
@@ -325,8 +348,13 @@ impl Backend {
 
         // Nuevo acumulador acústico para esta reproducción (FASE 8): los
         // frames que lleguen vía el bus de features se agregan aquí y, al
-        // terminar, se persisten como perfil del track.
-        *self.acoustic_since.lock().await = Some(AcousticAggregator::new(internal_id));
+        // terminar, se persisten como perfil del track. La ventana de la
+        // firma estructural es la duración conocida del track (si no la hay,
+        // cero ⇒ se omite la estructura, el resto de features sí se acumulan).
+        *self.acoustic_since.lock().await = Some(AcousticAggregator::new(
+            internal_id,
+            persisted.duration.unwrap_or(std::time::Duration::ZERO),
+        ));
 
         self.history
             .record(internal_id, persisted.source, persisted.duration)
@@ -526,6 +554,19 @@ impl Backend {
                     Err(e) => vec![BackendEvent::PlaybackError(e)],
                 }
             }
+            BackendCommand::PlayFromRec(track) => {
+                // Conversión del bucle de feedback: `start_and_record` con
+                // contexto Recommendation registra `RecClick` (intento con
+                // peso 2) y fija el contexto de la sesión para que los skips
+                // posteriores cuenten como negativa real (no filtra Autoplay).
+                match self
+                    .start_and_record(*track, PlayContext::Recommendation)
+                    .await
+                {
+                    Ok((status, stats)) => vec![BackendEvent::PlaybackStarted { status, stats }],
+                    Err(e) => vec![BackendEvent::PlaybackError(e)],
+                }
+            }
             BackendCommand::NextTrack => match self.skip_track(true).await {
                 Ok(Some((status, stats))) => vec![BackendEvent::PlaybackStarted { status, stats }],
                 Ok(None) => Vec::new(),
@@ -574,9 +615,42 @@ impl Backend {
                     }
                 }
                 // Reordena/filtra los recomendados por el gusto local del
-                // usuario (FASE 9/10): lo que encaja con su perfil sube y lo
-                // que rechazó claramente baja o se descarta.
-                self.reorder_by_local_taste(&mut related).await;
+                // usuario (FASE 9/10 + v0.20): el pipeline completo de
+                // `rank` usa la pista actual como semilla armónica/estructural.
+                self.reorder_by_local_taste(&mut related, Some(&track))
+                    .await;
+                // Listas frías: pre-análisis del prefijo de los primeros
+                // candidatos sin perfil, en background. La respuesta no se
+                // retrasa; el re-rank llega como `RelatedReranked`.
+                self.maybe_spawn_preanalysis(&track, &related, generation)
+                    .await;
+                // Bucle de feedback (v0.20): al ENTREGAR la lista se registra
+                // una impresión por candidato con id interno, ligada a la
+                // semilla (`recomm_id`) para poder medir CTR por canción
+                // origen. Es solo métrica: su peso en el perfil es 0.
+                for t in &related {
+                    let internal = if t.id > 0 {
+                        Some(t.id)
+                    } else {
+                        match t.external_id.as_deref() {
+                            Some(ext) => self.db.internal_id_for_external(ext).await.ok().flatten(),
+                            None => None,
+                        }
+                    };
+                    if let Some(id) = internal {
+                        let _ = self
+                            .db
+                            .record_signal(
+                                id,
+                                SignalKind::RecImpression,
+                                PlayContext::Recommendation,
+                                None,
+                                cache_id,
+                                None,
+                            )
+                            .await;
+                    }
+                }
                 // La cola de autoplay CRECE con las recomendaciones de cada
                 // canción (dedupe, sin reemplazar lo ya encolado): así nunca se
                 // pierde la lista que el usuario estaba construyendo y el
@@ -1050,61 +1124,240 @@ impl Backend {
     }
 
     /// Reordena y filtra una lista de recomendados por el gusto LOCAL del
-    /// usuario (FASE 9/10). Sin datos de interacción la lista se deja tal cual
-    /// (mantiene el orden de YouTube). Con datos, lo que encaja con el perfil
-    /// sube y lo que el usuario rechazó claramente se descarta.
+    /// usuario (FASE 9/10 + rediseño v0.20). El scoring completo vive en
+    /// [`crate::recommendation::rank`] — el ÚNICO camino de ranking, también
+    /// el que expone Android por JNI: timbre + armonía + estructura +
+    /// afinidad, con la pista actual como SEMILLA (continuidad rítmica).
+    /// Sin NINGÚN dato (señales, perfiles, historial) la lista se conserva en
+    /// el orden del provider — el descubrimiento siempre funciona.
     ///
-    /// Falla silencioso: si algo no se puede cargar (red de señales, acústica)
-    /// se conserva la lista original — el descubrimiento siempre funciona.
-    async fn reorder_by_local_taste(&self, related: &mut Vec<Track>) {
+    /// Falla silencioso: si algo no se puede cargar (señales, acústica) se
+    /// devuelve la lista original.
+    async fn reorder_by_local_taste(&self, related: &mut Vec<Track>, seed: Option<&Track>) {
         let Ok(signals) = self.db.all_signals(20_000).await else {
             return;
         };
-        if signals.is_empty() {
-            return;
-        }
         let (Ok(all_tracks), Ok(acoustic_profiles)) = (
             self.db.all_tracks().await,
             self.db.all_acoustic_profiles().await,
         ) else {
             return;
         };
+        if signals.is_empty() && acoustic_profiles.is_empty() {
+            // Ni señales ni perfiles acústicos: no hay nada con lo que
+            // puntuar (rank empataría todo a 0 y el orden no cambiaría).
+            return;
+        }
         let mut tracks_map = HashMap::new();
         for t in &all_tracks {
             tracks_map.insert(t.id, t.clone());
         }
         let profile = UserProfile::from_signals(&signals, &tracks_map, &acoustic_profiles);
         let signals_by_track = aggregate_signals(&signals);
-        let history = self.history.stats().await.ok();
+        let history = self.history.stats().await.unwrap_or_default();
 
-        let mut scored: Vec<(Track, f64, crate::recommendation::types::TrackSignals)> = Vec::new();
-        for mut t in related.drain(..) {
-            // Resuelve el id interno del candidato para consultar su señal y
-            // su perfil acústico (los candidatos frescos de YouTube llegan con
-            // `id == 0`).
+        // Resuelve el id interno de cada candidato para consultar su señal y
+        // su perfil acústico (los candidatos frescos de YouTube llegan con
+        // `id == 0`). Los que no tienen id interno reciben un id PSEUDO
+        // negativo (único por posición) para poder emparejar score↔track en
+        // la reconstrucción; no puede colisionar con señales ni perfiles
+        // reales, así que puntúan exactamente igual que con id 0.
+        for (idx, t) in related.iter_mut().enumerate() {
             let internal = match t.external_id.as_deref() {
                 Some(ext) => self.db.internal_id_for_external(ext).await.ok().flatten(),
                 None => None,
             };
-            if let Some(id) = internal {
-                t.id = id;
+            match internal {
+                Some(id) => t.id = id,
+                None => t.id = -(idx as i64 + 1),
             }
-            let meta = metadata_similarity(&t, &profile);
-            let affinity = match &history {
-                Some(h) => user_affinity(&t, h, &profile.acoustic_profile, &acoustic_profiles),
-                None => 0.0,
-            };
-            let sig = signals_by_track.get(&t.id).copied().unwrap_or_default();
-            let negative = negative_penalty(sig.negative, sig.plays);
-            let local = (0.5 * meta + 0.5 * affinity) * negative;
-            scored.push((t, local, sig));
         }
-        // Solo se descarta lo que el usuario rechazó CLARAMENTE: al menos dos
-        // negativas y en número >= los intentos. Un único skip (o un skip de
-        // autoplay, que ya filtra `aggregate_signals`) no elimina un track.
-        scored.retain(|(_, _, sig)| !(sig.negative >= 2 && sig.negative >= sig.plays.max(1)));
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        related.extend(scored.into_iter().map(|(t, _, _)| t));
+
+        // Semilla: el perfil acústico de la pista de la que cuelga la lista
+        // ("relacionadas con X"). Es casi siempre fresco: esa pista acaba de
+        // sonar (o está sonando) y su perfil se agregó en esta sesión.
+        let seed_profile: Option<crate::recommendation::types::TrackAcousticProfile> = match seed {
+            Some(s) => {
+                let sid = if s.id > 0 {
+                    Some(s.id)
+                } else {
+                    match s.external_id.as_deref() {
+                        Some(ext) => self.db.internal_id_for_external(ext).await.ok().flatten(),
+                        None => None,
+                    }
+                };
+                sid.and_then(|id| acoustic_profiles.get(&id).cloned())
+            }
+            None => None,
+        };
+
+        let ranked = crate::recommendation::rank(
+            related,
+            &profile,
+            &history,
+            &acoustic_profiles,
+            &signals_by_track,
+            seed_profile.as_ref(),
+        )
+        .await;
+
+        // Reconstruye la lista en el orden del ranking. Solo se descarta lo
+        // que el usuario rechazó CLARAMENTE: al menos dos negativas y en
+        // número >= los intentos. Un único skip (o un skip de autoplay, que
+        // ya filtra `aggregate_signals`) no elimina un track.
+        let mut by_id: HashMap<i64, Track> = related.drain(..).map(|t| (t.id, t)).collect();
+        related.extend(ranked.into_iter().filter_map(|score| {
+            let sig = signals_by_track
+                .get(&score.track_id)
+                .copied()
+                .unwrap_or_default();
+            if sig.negative >= 2 && sig.negative >= sig.plays.max(1) {
+                return None;
+            }
+            by_id.remove(&score.track_id).map(|mut t| {
+                if t.id < 0 {
+                    // Candidato sin id interno: se restaura el 0 canónico.
+                    t.id = 0;
+                }
+                t
+            })
+        }));
+    }
+
+    /// Pre-análisis acústico en background para listas FRÍAS (v0.20).
+    ///
+    /// Si la cobertura de perfiles de `related` es baja (< 30 %), los
+    /// candidatos empatarían en neutro y el orden sería el del provider.
+    /// En ese caso se analiza el PREFIJO (~45 s) de los primeros
+    /// `PREANALYZE_TOP_K` candidatos sin perfil (sin reproducirlo en el
+    /// altavoz), se persiste cada perfil y se emite un `RelatedReranked`
+    /// con la MISMA generación: la UI lo aplica solo si esa sesión sigue
+    /// vigente (`RecommendationSession::accepts_update`).
+    ///
+    /// La respuesta original NO se retrasa: `LoadRelated` entrega la lista
+    /// de inmediato y el refinamiento llega cuando termina el lote.
+    async fn maybe_spawn_preanalysis(&self, seed: &Track, related: &[Track], generation: u64) {
+        if !self.config.flags.audio_analysis || related.is_empty() {
+            return;
+        }
+        // Sin feature `rodio` no hay decoder offline (Android compila el
+        // ranking en su propio `.so` con los perfiles que allí existan).
+        #[cfg(not(feature = "rodio"))]
+        {
+            let _ = (seed, generation);
+        }
+        #[cfg(feature = "rodio")]
+        {
+            use super::preanalysis::{
+                candidates_missing_profile, needs_preanalysis, pre_analyze_prefix, InflightGuard,
+                PREANALYZE_SECS, PREANALYZE_TOP_K,
+            };
+
+            let Ok(profiles) = self.db.all_acoustic_profiles().await else {
+                return;
+            };
+            // Id interno por candidato (los frescos llegan con id 0): mide
+            // la cobertura real y localiza a los faltantes.
+            let mut resolved: Vec<Option<i64>> = Vec::with_capacity(related.len());
+            for t in related {
+                let id = if t.id > 0 {
+                    Some(t.id)
+                } else {
+                    match t.external_id.as_deref() {
+                        Some(ext) => self.db.internal_id_for_external(ext).await.ok().flatten(),
+                        None => None,
+                    }
+                };
+                resolved.push(id);
+            }
+            let with = resolved
+                .iter()
+                .filter(|id| id.is_some_and(|id| profiles.contains_key(&id)))
+                .count();
+            if !needs_preanalysis(with, related.len()) {
+                return;
+            }
+            let candidates =
+                candidates_missing_profile(related, &resolved, &profiles, PREANALYZE_TOP_K);
+            if candidates.is_empty() {
+                return;
+            }
+            // Una sola tanda por semilla a la vez (ráfagas de `r`/Enter).
+            let key = seed.identifier();
+            {
+                let mut inflight = self.preanalysis_inflight.lock().unwrap();
+                if !inflight.insert(key.clone()) {
+                    return;
+                }
+            }
+            let backend = self.clone();
+            let events = self.events_out.get().cloned();
+            let seed = seed.clone();
+            let related = related.to_vec();
+            tokio::spawn(async move {
+                let _guard = InflightGuard(backend.preanalysis_inflight.clone(), key);
+                let mut analyzed = 0usize;
+                for candidate in &candidates {
+                    // Solo se persiste con id interno conocido (clave de la
+                    // tabla de perfiles): igual que en `start_and_record`.
+                    let internal = if candidate.id > 0 {
+                        Some(candidate.id)
+                    } else {
+                        match candidate.external_id.as_deref() {
+                            Some(ext) => backend
+                                .db
+                                .internal_id_for_external(ext)
+                                .await
+                                .ok()
+                                .flatten(),
+                            None => None,
+                        }
+                    };
+                    let Some(internal) = internal else { continue };
+                    let Some(mut profile) = pre_analyze_prefix(
+                        &backend.http,
+                        backend.resolver.as_ref(),
+                        candidate,
+                        PREANALYZE_SECS,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    profile.track_id = internal;
+                    if backend.db.save_acoustic_profile(&profile).await.is_ok() {
+                        analyzed += 1;
+                    }
+                }
+                if analyzed == 0 {
+                    return;
+                }
+                // Re-rank con los perfiles nuevos, si nos siguen dejando.
+                let Some(events) = events else { return };
+                let mut refined = related;
+                backend
+                    .reorder_by_local_taste(&mut refined, Some(&seed))
+                    .await;
+                let (queue, origins) = {
+                    let mut queue_guard = backend.queue.lock().await;
+                    queue_guard.append_unique_with_origin(
+                        &refined,
+                        crate::playback::QueueItemOrigin::Recommendation,
+                    );
+                    (
+                        queue_guard.tracks().to_vec(),
+                        queue_guard.origins().to_vec(),
+                    )
+                };
+                let _ = events.send(BackendEvent::RelatedReranked {
+                    track: Box::new(seed),
+                    related: refined,
+                    queue,
+                    origins,
+                    generation,
+                });
+            });
+        }
     }
 
     /// Reproduce la siguiente recomendación si el autoplay está activo.
@@ -1207,6 +1460,9 @@ pub fn spawn_backend(
     let (cmd_tx, mut cmd_rx) = unbounded_channel::<BackendCommand>();
     let (event_tx, event_rx) = unbounded_channel::<BackendEvent>();
     let router = backend.router.clone();
+    // El backend (y sus tareas en background) pueden emitir eventos en
+    // cualquier momento: p. ej. el re-rank tras el pre-análisis acústico.
+    let _ = backend.events_out.set(event_tx.clone());
 
     tokio::spawn(async move {
         // Receptor de eventos de reproducción del router.
@@ -1465,6 +1721,7 @@ fn is_heavy(cmd: &BackendCommand) -> bool {
             | BackendCommand::ResolveLink(..)
             | BackendCommand::SaveTrack(_)
             | BackendCommand::Play(_)
+            | BackendCommand::PlayFromRec(_)
             | BackendCommand::NextTrack
             | BackendCommand::PrevTrack
             | BackendCommand::LoadRelated(..)

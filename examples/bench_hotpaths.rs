@@ -129,6 +129,7 @@ fn main() {
         beat: false,
         beat_confidence: 0.7,
         bpm: 120.0,
+        chroma: [0.0; 12],
     });
     let mapper = ParameterMapper::default();
     bench("parameter mapper", vis_budget, || {

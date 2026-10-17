@@ -72,6 +72,9 @@ letras).
 - `cargo fmt --check` y `cargo clippy --all-targets --all-features -- -D
   warnings` deben pasar (ambas configuraciones: por defecto y con `youtube`).
 - Los tests del lib (`cargo test --lib`) corren en ambas configuraciones.
+  El contrato JNI de ranking (`platform/android_rank.rs`) se prueba con
+  `cargo test --lib --features android`, y la app Android con
+  `cd android && ./gradlew --offline test`.
 - Feature flags nuevos se declaran en `Cargo.toml` y se documentan en el README.
 
 ## Commits

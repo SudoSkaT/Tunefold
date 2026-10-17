@@ -12,7 +12,13 @@ pub mod android;
 pub mod android_decoder;
 
 #[cfg(feature = "android")]
-pub mod android_playback;
+pub mod android_download;
 
 #[cfg(feature = "android")]
-pub mod android_download;
+pub mod android_playback;
+
+/// Ranking de recomendaciones compartido por JNI (Fase 5): el mismo
+/// `recommendation::rank_sync` de la TUI, expuesto como envelope JSON
+/// estadoless. Compila solo con la feature `android` (es el `.so` móvil).
+#[cfg(feature = "android")]
+pub mod android_rank;

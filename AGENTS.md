@@ -16,6 +16,11 @@ YouTube).
   `#[cfg(feature = "youtube")]`; `lyrics.rs` (LRCLIB) se compila **siempre**.
 - `src/api/mod.rs` — punto único de composición de providers (frontera
   permitida entre providers y el resto del sistema).
+- `src/platform/android_rank.rs` — contrato JNI de ranking (Fase 5): puro
+  JSON estadoless sobre `recommendation::rank_sync`, con fail-open a orden
+  del proveedor; **no** depende de `providers/youtube`.
+- `docs/recommendations.md` — pesos, señales y pipeline de recomendaciones
+  (fuente canónica del motor; actualizar al tocar `recommendation/`).
 - `src/infrastructure/dirs.rs` — rutas XDG; **nunca** usar `data/` en código
   nuevo (solo migración no destructiva legacy→canónico).
 - `src/main.rs` — CLI de desarrollo; `--version` usa `CARGO_PKG_VERSION`.

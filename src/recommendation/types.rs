@@ -71,8 +71,19 @@ impl FeatureVector {
     }
 }
 
+/// Buckets temporales de la firma estructural (sectores iguales del tramo
+/// analizado: intro/build/… proxy de la arquitectura de la pista).
+pub const STRUCT_BUCKETS: usize = 8;
+/// Métricas por bucket de estructura: [flux, rms, centroid, onset].
+pub const STRUCT_METRICS: usize = 4;
+/// Longitud total de la firma estructural (`STRUCT_BUCKETS × STRUCT_METRICS`).
+pub const STRUCT_LEN: usize = STRUCT_BUCKETS * STRUCT_METRICS;
+
 /// Perfil acústico agregado de un track (promedio ponderado de frames).
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// `Serialize`/`Deserialize` porque el ranking compartido por JNI de Android
+/// lo recibe y devuelve dentro del envelope JSON (`platform::android_rank`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TrackAcousticProfile {
     pub track_id: i64,
     pub rms_mean: f32,
@@ -87,6 +98,43 @@ pub struct TrackAcousticProfile {
     pub onset_mean: f32,
     pub band_profile: [f32; 5],
     pub frame_count: i64,
+    /// Cromática media: 12 clases de pica normalizadas a suma 1.
+    pub chroma_profile: [f32; 12],
+    /// Tonalidad estimada: -1 desconocida; 0..11 mayor (C..B); 12..23 menor.
+    pub key: i16,
+    /// Confianza de la estimación de tonalidad 0..1.
+    pub key_confidence: f32,
+    /// Tasa de cambios armónicos sobre el tramo activo (cambios/s; 0 = sin
+    /// datos suficientes o armonía estática).
+    pub chord_change_rate: f32,
+    /// Firma estructural: `STRUCT_BUCKETS` sectores × [flux, rms, centroid,
+    /// onset] (0 si no hubo ventana conocida para bucketizar).
+    pub structure_profile: [f32; STRUCT_LEN],
+}
+
+impl Default for TrackAcousticProfile {
+    fn default() -> Self {
+        Self {
+            track_id: 0,
+            rms_mean: 0.0,
+            bass_mean: 0.0,
+            low_mid_mean: 0.0,
+            mid_mean: 0.0,
+            high_mid_mean: 0.0,
+            high_mean: 0.0,
+            spectral_centroid_mean: 0.0,
+            bpm_mean: 0.0,
+            bpm_variance: 0.0,
+            onset_mean: 0.0,
+            band_profile: [0.0; 5],
+            frame_count: 0,
+            chroma_profile: [0.0; 12],
+            key: -1,
+            key_confidence: 0.0,
+            chord_change_rate: 0.0,
+            structure_profile: [0.0; STRUCT_LEN],
+        }
+    }
 }
 
 /// Candidato a recomendación con su perfil acústico para scoring.
@@ -123,6 +171,8 @@ pub struct RecommendationScore {
 pub struct ScoreComponents {
     pub metadata: f64,
     pub acoustic: f64,
+    pub harmonic: f64,
+    pub structure: f64,
     pub affinity: f64,
     pub recency: f64,
     pub popularity: f64,
@@ -130,16 +180,21 @@ pub struct ScoreComponents {
 }
 
 impl ScoreComponents {
+    #[allow(clippy::too_many_arguments)]
     pub fn weighted_sum(
         &self,
         w_meta: f64,
         w_acoustic: f64,
+        w_harmonic: f64,
+        w_structure: f64,
         w_affinity: f64,
         w_recency: f64,
         w_popularity: f64,
     ) -> f64 {
         w_meta * self.metadata
             + w_acoustic * self.acoustic
+            + w_harmonic * self.harmonic
+            + w_structure * self.structure
             + w_affinity * self.affinity
             + w_recency * self.recency
             + w_popularity * self.popularity
@@ -193,6 +248,8 @@ pub struct AcousticProfile {
     pub bpm_variance: f32,
     pub onset_mean: f32,
     pub band_profile: [f32; 5],
+    /// Tendencia armónica del usuario: media ponderada de las cromáticas.
+    pub chroma: [f32; 12],
     pub weight_sum: f32,
 }
 
@@ -211,6 +268,9 @@ impl AcousticProfile {
         for i in 0..5 {
             self.band_profile[i] += weight * features.band_profile[i];
         }
+        for i in 0..12 {
+            self.chroma[i] += weight * features.chroma_profile[i];
+        }
         self.weight_sum += weight;
     }
 
@@ -228,6 +288,15 @@ impl AcousticProfile {
         self.onset_mean /= w;
         for i in 0..5 {
             self.band_profile[i] /= w;
+        }
+        // La media ponderada de cromáticas normalizadas sigue normalizada
+        // (cada una suma 1 ⇒ la combinación lineal también), pero se
+        // re-normaliza por seguridad ante perfiles parciales/corruptos.
+        let chroma_total: f32 = self.chroma.iter().map(|v| v.max(0.0)).sum();
+        if chroma_total > f32::EPSILON {
+            for v in self.chroma.iter_mut() {
+                *v /= chroma_total;
+            }
         }
     }
 

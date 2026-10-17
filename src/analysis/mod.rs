@@ -23,6 +23,7 @@
 
 pub mod bands;
 pub mod beat;
+pub mod chroma;
 pub mod engine;
 pub mod features;
 pub mod fft;

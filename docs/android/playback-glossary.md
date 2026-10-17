@@ -87,7 +87,20 @@ These four are deliberately **separate** and must never be conflated:
 | **RecoveryPolicy** | Bounded budgets for retries and autoplay skips, so a failing item cannot loop forever. |
 | **L1K3D** | The user's liked tracks. Membership only, persisted atomically; it is **not** the download list. Records carry the title as a trailing field so the list still reads as music after a restart instead of as bare provider ids. |
 | **Descargadas** | Derived from the LocalMediaStore's valid entries. A track appears because its file exists, not because it was liked. |
-| **Recommendations** | Provider "related" list, deduplicated against current track, queue, likes and recent history. A failure yields an empty list, never an error. |
+| **Recommendations** | Provider "related" list, deduplicated against current track, queue, likes and recent history, then reordered by the shared ranker (`forTrack` only). A failure yields an empty list, never an error. |
+
+## Recommendation ranking
+
+| Term | Meaning |
+|---|---|
+| **Shared ranker** | The same scoring the desktop TUI uses (acoustic + harmonic + structure + local history), delivered to Android as `TunefoldBridge.rankRelated`. One engine, so the two players cannot disagree about what "better for you" means. Full model: `docs/recommendations.md`. |
+| **Stateless contract** | One JSON request carries candidates, listening signals and (when available) acoustic profiles; the response is `{"ok":true,"order":[indices…]}` over the input array. The `.so` keeps no state — the app owns the data. |
+| **Fail-open** | Every failure mode (no data, bad parse, `ok:false`, out-of-range or non-permutation order, any thrown `Throwable`, even `UnsatisfiedLinkError` from an older binary) keeps the provider order. Quality may degrade; playback never breaks. |
+| **ListeningSignals** | The app-side recorder and JSON builder (`Recommendations.Ranker` seam). Persists to `filesDir/listening-signals.txt`: one tab-separated line per event (`kind, context, atMs, listenedMs, trackJson`), newest 200 kept, atomic write. Deleting the file only resets recommendation feedback. |
+| **Signal kinds** | `play` (started), `skip` (left by hand before its end), `completed` (reached its own end, with the listened milliseconds), `rec_click` (started from a recommendation — one intent, not play + click counted twice). |
+| **Start context** | How the current track began: `manual`, `queue`, `autoplay` or `recommendation`. Recorded with every play and reused for the skip that may follow, so the ranker knows whether leaving the track was the user's decision. |
+| **Shelf is not ranked** | `forDisplay` (the player's shelf) deliberately skips the ranker: the shelf is for discovery and shows associated tracks in provider order; only autoplay/Home (`forTrack`) are personalised. |
+| **Dormant acoustic axis** | The contract already accepts candidate `profiles` and a `seed_profile`, and Rust already scores them when present — Android simply does not analyse audio yet, so v1 sends meta + history + signals only. No contract change needed later. |
 | **MediaSession** | System integration for lock-screen and headset controls. |
 | **Transport command** | One dispatch point, `ForegroundPlaybackService.dispatchCommand`, used by the notification intents, the system and the MediaSession callback alike. Every external control therefore reaches the same `PlaybackController`. |
 | **Explicit control intent** | Notification actions name the service component. The service declares no intent-filter, so an implicit intent would resolve to nothing and the control would silently do nothing. |

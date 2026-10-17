@@ -9,13 +9,16 @@ preferencias de UI) viven en tu máquina:
 | Dato | Ubicación canónica | Tipo |
 |---|---|---|
 | Base de datos (biblioteca/historial/preferencias) | `~/.local/share/tunefold/music.db` | Datos de usuario |
+| Señales de escucha de Android (plays/skips/completados, para ordenar recomendaciones) | Almacenamiento privado de la app: `files/listening-signals.txt` | Datos de usuario |
 | Caché de miniaturas | `~/.cache/tunefold/thumbnails/` | Caché |
 | Caché de búsquedas/reportes de la feature YouTube | `~/.cache/tunefold/rustypipe/` | Caché |
 | Configuración (`.env`) | `~/.config/tunefold/.env` | Config |
 | Logs/estado | `~/.local/state/tunefold/` | Reciclable |
 
 Salvo lo indicado abajo, Tunefold no conserva ni transmite identificadores: el
-historial y las búsquedas quedan en tu disco.
+historial y las búsquedas quedan en tu disco. El ordenamiento personalizado de
+recomendaciones (TUI y Android) es **100 % local**: las señales de escucha se
+procesan en proceso (JNI) y nunca salen del dispositivo.
 
 ## Comunicaciones de red
 
@@ -34,6 +37,9 @@ historial y las búsquedas quedan en tu disco.
 
 - La caché (`~/.cache/tunefold/`) puede borrarse en cualquier momento sin
   pérdida funcional: `rm -rf ~/.cache/tunefold`.
+- Las señales de escucha de Android (`files/listening-signals.txt`) pueden
+  borrarse en cualquier momento: solo se pierde el feedback que mejora el
+  orden de recomendaciones; biblioteca, cola y descargas no viven ahí.
 - Migración desde versiones previas: Tunefold **copia** los datos legacy
   (`data/music.db`) a su destino canónico, nunca los borra.
 - No hay tracking, analíticas ni "llamadas a casa" desde el binario oficial.

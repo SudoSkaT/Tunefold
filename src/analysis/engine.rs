@@ -391,6 +391,7 @@ fn run(
                 beat: onset_out.triggered && tempo.confidence >= 0.35,
                 beat_confidence: tempo.confidence,
                 bpm: bpm_hold,
+                chroma: raw.chroma,
             };
             bus.publish(features);
             // La envolvente ESTÉREO del MISMO hop (misma ventana): el
@@ -442,6 +443,8 @@ fn analyze_frame(
     let centroid_hz = if total > 1e-9 { weighted / total } else { 0.0 };
     let centroid_norm = (centroid_hz / (meta.sample_rate as f32 / 2.0)).clamp(0.0, 1.0);
 
+    let chroma = super::chroma::chroma_from_magnitudes(mags_out, meta.sample_rate as f32);
+
     RawFeatures {
         timestamp: Duration::ZERO, // lo completa el llamador
         rms: rms_v,
@@ -449,6 +452,7 @@ fn analyze_frame(
         bands,
         centroid_norm,
         flux: flux.flux(mags_out),
+        chroma,
     }
 }
 

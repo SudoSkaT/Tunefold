@@ -68,6 +68,7 @@ fn acoustic(track_id: i64, bpm: f32, bass: f32, high: f32) -> TrackAcousticProfi
         onset_mean: 0.1,
         band_profile: [bass, 0.2, 0.2, 0.2, high],
         frame_count: 100,
+        ..TrackAcousticProfile::default()
     }
 }
 
@@ -86,6 +87,7 @@ fn prof(bass: f32, mid: f32, high: f32, bpm: f32, centroid: f32) -> TrackAcousti
         onset_mean: 0.1,
         band_profile: [bass, mid, mid, high, high],
         frame_count: 100,
+        ..TrackAcousticProfile::default()
     }
 }
 
@@ -514,7 +516,7 @@ async fn rank_places_matching_track_above_mismatch() {
     let signals_map = HashMap::<i64, TrackSignals>::new();
 
     let candidates: Vec<Track> = vec![tracks[&2].clone(), tracks[&3].clone()];
-    let ranked = rank(&candidates, &profile, &hist, &aps, &signals_map).await;
+    let ranked = rank(&candidates, &profile, &hist, &aps, &signals_map, None).await;
     assert_eq!(ranked.len(), 2);
     // El rockero "B" debería quedar por encima de "C" (clásica).
     assert_eq!(ranked[0].track_id, 2, "rock similar a la preferencia");
@@ -573,7 +575,7 @@ async fn rank_penalizes_frequently_skipped_track() {
     );
 
     let candidates: Vec<Track> = vec![tracks[&1].clone(), tracks[&2].clone()];
-    let ranked = rank(&candidates, &profile, &hist, &aps, &signals_map).await;
+    let ranked = rank(&candidates, &profile, &hist, &aps, &signals_map, None).await;
     assert_eq!(ranked[0].track_id, 2, "el track con skips queda de último");
 }
 
@@ -630,7 +632,7 @@ async fn rank_distinguishes_popular_from_recommended() {
     ];
     let signals_map = HashMap::new();
     let candidates: Vec<Track> = vec![tracks[&1].clone(), tracks[&2].clone()];
-    let ranked = rank(&candidates, &profile, &hist, &aps, &signals_map).await;
+    let ranked = rank(&candidates, &profile, &hist, &aps, &signals_map, None).await;
     assert_eq!(
         ranked[0].track_id, 1,
         "lo que encaja al gusto vence a lo meramente popular"
@@ -749,10 +751,195 @@ async fn acoustic_features_steer_ranking_when_metadata_is_tied() {
     }];
     let signals_map = HashMap::new();
     let candidates: Vec<Track> = vec![t1.clone(), t2.clone()];
-    let ranked = rank(&candidates, &profile, &hist, &aps, &signals_map).await;
+    let ranked = rank(&candidates, &profile, &hist, &aps, &signals_map, None).await;
     // Aunque ambos comparten artista/género, el acústico similar vence.
     assert_eq!(
         ranked[0].track_id, 1,
         "el sonido parecido gana sobre metadata empatada"
+    );
+}
+
+// ───────────────── Rediseño v0.20: semilla armónica/estructural
+
+fn chroma_on(pitches: &[usize]) -> [f32; 12] {
+    let mut c = [0.0f32; 12];
+    for &p in pitches {
+        c[p] = 1.0;
+    }
+    let t: f32 = c.iter().sum();
+    for v in c.iter_mut() {
+        *v /= t;
+    }
+    c
+}
+
+fn structure_flat(rms: f32) -> [f32; 32] {
+    let mut s = [0.0f32; 32];
+    for i in 0..8 {
+        s[i * 4 + 1] = rms;
+    }
+    s
+}
+
+#[allow(clippy::too_many_arguments)]
+fn harmonic_profile(
+    track_id: i64,
+    bpm: f32,
+    bass: f32,
+    high: f32,
+    chroma: [f32; 12],
+    key: i16,
+    rate: f32,
+    struct_rms: f32,
+) -> TrackAcousticProfile {
+    let mut p = acoustic(track_id, bpm, bass, high);
+    p.chroma_profile = chroma;
+    p.key = key;
+    p.key_confidence = 0.9;
+    p.chord_change_rate = rate;
+    p.structure_profile = structure_flat(struct_rms);
+    p
+}
+
+#[tokio::test]
+async fn seed_similarity_breaks_tie_between_fresh_candidates() {
+    // Sin señales de usuario ni historial, meta/affinity/popularity empatan a 0:
+    // la similitud con la SEMILLA (la pista que suena) es lo único que decide.
+    let mut tracks = HashMap::new();
+    tracks.insert(1, track(1, "A", "Seedling", "lofi", 2010));
+    tracks.insert(2, track(2, "B", "Distant", "edm", 2022));
+
+    let profile = UserProfile::default();
+    let hist = vec![];
+    let signals_map = HashMap::new();
+
+    let seed_profile = harmonic_profile(99, 90.0, 0.5, 0.2, chroma_on(&[0, 4, 7]), 0, 1.0, 0.5);
+    let match_a = harmonic_profile(1, 90.0, 0.5, 0.2, chroma_on(&[0, 4, 7]), 0, 1.0, 0.5);
+    // Disonante: otro tempo, otra tonalidad (tritón), otro ritmo armónico.
+    let mismatch_b = harmonic_profile(2, 160.0, 0.1, 0.9, chroma_on(&[1, 5, 8]), 6, 4.0, 0.05);
+
+    let aps = HashMap::from([(1, match_a), (2, mismatch_b)]);
+    // Orden inicial: el candidato malo PRIMERO (simula el orden del provider).
+    let candidates: Vec<Track> = vec![tracks[&2].clone(), tracks[&1].clone()];
+    let ranked = rank(
+        &candidates,
+        &profile,
+        &hist,
+        &aps,
+        &signals_map,
+        Some(&seed_profile),
+    )
+    .await;
+
+    assert_eq!(
+        ranked[0].track_id, 1,
+        "el candidato rítmicamente afín a la semilla vence al provider-order"
+    );
+    assert!(
+        ranked[0].components.harmonic > 0.8,
+        "componente armónico alto para el afinado: {}",
+        ranked[0].components.harmonic
+    );
+    assert!(ranked[0].final_score > ranked[1].final_score);
+}
+
+#[tokio::test]
+async fn popular_mismatched_track_does_not_beat_rhythmic_match() {
+    // El usuario escucha rock grave/lento. A: pocos plays pero afinado con su
+    // gusto Y con la semilla. B: hiper-escuchado (popularidad local máxima)
+    // pero rítmicamente disonante. El ritmo debe ganar a la popularidad.
+    let mut tracks = HashMap::new();
+    tracks.insert(1, track(1, "A", "Beat", "rock", 2000));
+    tracks.insert(2, track(2, "B", "PopStar", "pop", 2022));
+    tracks.insert(9, track(9, "Seed", "Beat", "rock", 1999));
+
+    let sigs = vec![
+        signal(
+            9,
+            SignalKind::Completed,
+            PlayContext::Manual,
+            200_000,
+            200_000,
+        ),
+        signal(
+            9,
+            SignalKind::Completed,
+            PlayContext::Manual,
+            200_000,
+            200_000,
+        ),
+    ];
+    let profile = UserProfile::from_signals(&sigs, &tracks, &HashMap::new());
+
+    let seed_profile = harmonic_profile(9, 95.0, 0.75, 0.15, chroma_on(&[0, 4, 7]), 0, 1.2, 0.5);
+    let match_a = harmonic_profile(1, 92.0, 0.7, 0.2, chroma_on(&[0, 4, 7]), 0, 1.0, 0.5);
+    let mismatch_b = harmonic_profile(2, 150.0, 0.1, 0.85, chroma_on(&[1, 5, 8]), 6, 3.5, 0.05);
+
+    let aps = HashMap::from([(1, match_a), (2, mismatch_b), (9, seed_profile.clone())]);
+    let hist = vec![
+        crate::infrastructure::storage::TrackListeningStats {
+            track_id: 1,
+            key: tracks[&1].identifier(),
+            artist_name: Some("Beat".to_string()),
+            play_count: 1,
+            last_played: "2024-06-15 12:00:00".to_string(),
+            recently_played: false,
+        },
+        crate::infrastructure::storage::TrackListeningStats {
+            track_id: 2,
+            key: tracks[&2].identifier(),
+            artist_name: Some("PopStar".to_string()),
+            play_count: 5_000,
+            last_played: "2024-01-01 12:00:00".to_string(),
+            recently_played: false,
+        },
+    ];
+    let signals_map = HashMap::new();
+    let candidates: Vec<Track> = vec![tracks[&2].clone(), tracks[&1].clone()];
+    let ranked = rank(
+        &candidates,
+        &profile,
+        &hist,
+        &aps,
+        &signals_map,
+        Some(&seed_profile),
+    )
+    .await;
+
+    assert_eq!(
+        ranked[0].track_id, 1,
+        "el candidato rítmicamente afín vence al hiper-popular disonante"
+    );
+    let pop_component = ranked[1].components.popularity;
+    assert!(
+        pop_component > ranked[0].components.popularity,
+        "el popular SÍ tiene el componente de popularidad más alto (pero pierde)"
+    );
+}
+
+#[tokio::test]
+async fn without_seed_and_profiles_order_is_provider_stable() {
+    // Lista fría: sin perfiles acústicos, sin señales, sin historial ⇒ todos
+    // empatan a 0 y el orden del provider se conserva (sort estable).
+    let mut tracks = HashMap::new();
+    tracks.insert(1, track(1, "A", "X", "rock", 2000));
+    tracks.insert(2, track(2, "B", "Y", "pop", 2001));
+    tracks.insert(3, track(3, "C", "Z", "jazz", 2002));
+
+    let candidates: Vec<Track> = vec![tracks[&1].clone(), tracks[&2].clone(), tracks[&3].clone()];
+    let ranked = rank(
+        &candidates,
+        &UserProfile::default(),
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+        None,
+    )
+    .await;
+    let ids: Vec<i64> = ranked.iter().map(|s| s.track_id).collect();
+    assert_eq!(
+        ids,
+        vec![1, 2, 3],
+        "empate total ⇒ orden del provider intacto"
     );
 }

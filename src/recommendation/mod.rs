@@ -16,10 +16,10 @@ pub use session::RecommendationSession;
 #[cfg(test)]
 pub mod behavior_tests;
 
-pub use ranker::rank;
+pub use ranker::{rank, rank_sync};
 pub use scoring::{
-    acoustic_similarity, metadata_similarity, negative_penalty, popularity_factor, recency_bonus,
-    user_affinity,
+    acoustic_similarity, harmonic_similarity, harmonic_similarity_to_profile, metadata_similarity,
+    negative_penalty, popularity_factor, recency_bonus, structure_similarity, user_affinity,
 };
 pub use signals::{
     aggregate_signals, is_meaningful_negative, signal_weight, PlayContext, PlaySignal, SignalKind,

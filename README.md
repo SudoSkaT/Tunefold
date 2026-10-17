@@ -96,6 +96,20 @@ de configuración):
 
 Las variables legacy `PLAYFUSION_*` se aceptan como alias.
 
+## Recomendaciones
+
+El orden "relacionados/autoplay" no es el crudo del proveedor: Tunefold lo
+reeordena con similitud acústica, armónica y estructural más el historial
+local, con la popularidad del proveedor pesando solo un 5 %. Los candidatos
+sin perfil se pre-analizan por rangos HTTP sin abrir dispositivo de audio, y
+las impresiones vistas nunca puntúan. El motor, los pesos y las señales están
+documentados en [`docs/recommendations.md`](docs/recommendations.md).
+
+Android comparte **el mismo** motor por JNI (`src/platform/android_rank.rs`,
+contrato estadoless con fail-open al orden del proveedor). Todo el
+procesamiento es local: las señales de escucha no salen del dispositivo (ver
+[`PRIVACY.md`](PRIVACY.md)).
+
 ## Límites de streaming (diagnóstico 2026-08)
 
 El síntoma «la reproducción se corta alrededor de 1 MiB (~65 s)» fue

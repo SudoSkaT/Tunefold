@@ -167,7 +167,8 @@ impl Db {
         let row = sqlx::query(
             "SELECT track_id, rms_mean, bass_mean, low_mid_mean, mid_mean, high_mid_mean, high_mean, \
                     spectral_centroid_mean, bpm_mean, bpm_variance, onset_mean, band_profile, \
-                    frame_count \
+                    frame_count, chroma_profile, key_id, key_confidence, chord_change_rate, \
+                    structure_profile \
              FROM track_acoustic_profiles \
              WHERE track_id = ?1",
         )
@@ -175,24 +176,7 @@ impl Db {
         .fetch_optional(self.pool())
         .await?;
 
-        Ok(row.map(|r| TrackAcousticProfile {
-            track_id: r.get("track_id"),
-            rms_mean: r.get("rms_mean"),
-            bass_mean: r.get("bass_mean"),
-            low_mid_mean: r.get("low_mid_mean"),
-            mid_mean: r.get("mid_mean"),
-            high_mid_mean: r.get("high_mid_mean"),
-            high_mean: r.get("high_mean"),
-            spectral_centroid_mean: r.get("spectral_centroid_mean"),
-            bpm_mean: r.get("bpm_mean"),
-            bpm_variance: r.get("bpm_variance"),
-            onset_mean: r.get("onset_mean"),
-            band_profile: {
-                let s: String = r.get("band_profile");
-                band_profile_from_str(&s)
-            },
-            frame_count: r.get("frame_count"),
-        }))
+        Ok(row.map(|r| profile_from_row(&r)))
     }
 
     /// Guarda (o acumula) el perfil acústico agregado de un track. FASE 8:
@@ -200,20 +184,16 @@ impl Db {
     /// terminar una reproducción; aquí se persiste para poder comparar tracks
     /// sin depender de un análisis en vivo posterior.
     pub async fn save_acoustic_profile(&self, profile: &TrackAcousticProfile) -> Result<()> {
-        let band = format!(
-            "[{},{},{},{},{}]",
-            profile.band_profile[0],
-            profile.band_profile[1],
-            profile.band_profile[2],
-            profile.band_profile[3],
-            profile.band_profile[4]
-        );
+        let band = f32_array_to_json(&profile.band_profile);
+        let chroma = f32_array_to_json(&profile.chroma_profile);
+        let structure = f32_array_to_json(&profile.structure_profile);
         sqlx::query(
             "INSERT INTO track_acoustic_profiles \
                 (track_id, rms_mean, bass_mean, low_mid_mean, mid_mean, high_mid_mean, \
                  high_mean, spectral_centroid_mean, bpm_mean, bpm_variance, onset_mean, \
-                 band_profile, frame_count) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+                 band_profile, frame_count, chroma_profile, key_id, key_confidence, \
+                 chord_change_rate, structure_profile) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) \
              ON CONFLICT(track_id) DO UPDATE SET \
                  rms_mean = excluded.rms_mean, \
                  bass_mean = excluded.bass_mean, \
@@ -226,7 +206,12 @@ impl Db {
                  bpm_variance = excluded.bpm_variance, \
                  onset_mean = excluded.onset_mean, \
                  band_profile = excluded.band_profile, \
-                 frame_count = excluded.frame_count",
+                 frame_count = excluded.frame_count, \
+                 chroma_profile = excluded.chroma_profile, \
+                 key_id = excluded.key_id, \
+                 key_confidence = excluded.key_confidence, \
+                 chord_change_rate = excluded.chord_change_rate, \
+                 structure_profile = excluded.structure_profile",
         )
         .bind(profile.track_id)
         .bind(profile.rms_mean)
@@ -241,6 +226,11 @@ impl Db {
         .bind(profile.onset_mean)
         .bind(band)
         .bind(profile.frame_count)
+        .bind(chroma)
+        .bind(profile.key)
+        .bind(profile.key_confidence)
+        .bind(profile.chord_change_rate)
+        .bind(structure)
         .execute(self.pool())
         .await?;
         Ok(())
@@ -253,31 +243,15 @@ impl Db {
         let rows = sqlx::query(
             "SELECT track_id, rms_mean, bass_mean, low_mid_mean, mid_mean, high_mid_mean, high_mean, \
                     spectral_centroid_mean, bpm_mean, bpm_variance, onset_mean, band_profile, \
-                    frame_count \
+                    frame_count, chroma_profile, key_id, key_confidence, chord_change_rate, \
+                    structure_profile \
              FROM track_acoustic_profiles",
         )
         .fetch_all(self.pool())
         .await?;
         let mut map = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let p = TrackAcousticProfile {
-                track_id: row.get("track_id"),
-                rms_mean: row.get("rms_mean"),
-                bass_mean: row.get("bass_mean"),
-                low_mid_mean: row.get("low_mid_mean"),
-                mid_mean: row.get("mid_mean"),
-                high_mid_mean: row.get("high_mid_mean"),
-                high_mean: row.get("high_mean"),
-                spectral_centroid_mean: row.get("spectral_centroid_mean"),
-                bpm_mean: row.get("bpm_mean"),
-                bpm_variance: row.get("bpm_variance"),
-                onset_mean: row.get("onset_mean"),
-                band_profile: {
-                    let s: String = row.get("band_profile");
-                    band_profile_from_str(&s)
-                },
-                frame_count: row.get("frame_count"),
-            };
+        for row in &rows {
+            let p = profile_from_row(row);
             map.insert(p.track_id, p);
         }
         Ok(map)
@@ -1027,18 +1001,33 @@ impl Db {
     }
 }
 
-/// Parsea la representación textual "[r1,r2,r3,r4,r5]" del perfil de bandas a
-/// un array `[f32; 5]`. Devuelve ceros si no se puede interpretar.
-fn band_profile_from_str(s: &str) -> [f32; 5] {
+/// Serializa un array de f32 como JSON compacto `"[v1,v2,…]"` (el mismo
+/// formato que ya usaba `band_profile`; sin espacios, como el literal previo).
+fn f32_array_to_json<const N: usize>(arr: &[f32; N]) -> String {
+    let mut s = String::with_capacity(N * 8 + 2);
+    s.push('[');
+    for (i, v) in arr.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&v.to_string());
+    }
+    s.push(']');
+    s
+}
+
+/// Parsea la representación textual "[v1,v2,…]" a `[f32; N]`. Devuelve ceros
+/// si no se puede interpretar o el número de elementos no coincide.
+fn f32_array_from_str<const N: usize>(s: &str) -> [f32; N] {
     let s = s.trim();
+    let mut arr = [0.0f32; N];
     if !(s.starts_with('[') && s.ends_with(']')) {
-        return [0.0f32; 5];
+        return arr;
     }
     let inner = &s[1..s.len() - 1];
-    let mut arr = [0.0f32; 5];
     let mut i = 0;
     for part in inner.split(',') {
-        if i >= 5 {
+        if i >= N {
             break;
         }
         if let Ok(val) = part.trim().parse::<f32>() {
@@ -1047,6 +1036,34 @@ fn band_profile_from_str(s: &str) -> [f32; 5] {
         }
     }
     arr
+}
+
+/// Reconstruye un `TrackAcousticProfile` desde una fila con las columnas de
+/// `track_acoustic_profiles` (incluidas las armónicas/estructurales de 0011).
+fn profile_from_row(r: &sqlx::sqlite::SqliteRow) -> TrackAcousticProfile {
+    let band: String = r.get("band_profile");
+    let chroma: String = r.get("chroma_profile");
+    let structure: String = r.get("structure_profile");
+    TrackAcousticProfile {
+        track_id: r.get("track_id"),
+        rms_mean: r.get("rms_mean"),
+        bass_mean: r.get("bass_mean"),
+        low_mid_mean: r.get("low_mid_mean"),
+        mid_mean: r.get("mid_mean"),
+        high_mid_mean: r.get("high_mid_mean"),
+        high_mean: r.get("high_mean"),
+        spectral_centroid_mean: r.get("spectral_centroid_mean"),
+        bpm_mean: r.get("bpm_mean"),
+        bpm_variance: r.get("bpm_variance"),
+        onset_mean: r.get("onset_mean"),
+        band_profile: f32_array_from_str(&band),
+        frame_count: r.get("frame_count"),
+        chroma_profile: f32_array_from_str(&chroma),
+        key: r.get("key_id"),
+        key_confidence: r.get("key_confidence"),
+        chord_change_rate: r.get("chord_change_rate"),
+        structure_profile: f32_array_from_str(&structure),
+    }
 }
 
 fn signal_to_playsignal(row: &sqlx::sqlite::SqliteRow) -> PlaySignal {
@@ -1885,6 +1902,16 @@ mod tests {
             onset_mean: 0.1,
             band_profile: [0.8, 0.4, 0.5, 0.3, 0.2],
             frame_count: 150,
+            chroma_profile: [1.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.0],
+            key: 12 + 9,
+            key_confidence: 0.77,
+            chord_change_rate: 1.5,
+            structure_profile: {
+                let mut s = [0.0f32; 32];
+                s[1] = 0.42;
+                s[31] = 0.11;
+                s
+            },
         };
         db.save_acoustic_profile(&p).await.unwrap();
 
@@ -1894,16 +1921,28 @@ mod tests {
         assert!((got.bpm_mean - 96.0).abs() < 1e-3);
         assert_eq!(got.band_profile, [0.8, 0.4, 0.5, 0.3, 0.2]);
         assert_eq!(got.frame_count, 150);
+        assert!(
+            (got.chroma_profile[0] - 1.0).abs() < 1e-5,
+            "chroma ida/vuelta"
+        );
+        assert!((got.chroma_profile.iter().sum::<f32>() - 1.5).abs() < 1e-4);
+        assert_eq!(got.key, 12 + 9, "tonalidad ida/vuelta");
+        assert!((got.key_confidence - 0.77).abs() < 1e-5);
+        assert!((got.chord_change_rate - 1.5).abs() < 1e-5);
+        assert!((got.structure_profile[1] - 0.42).abs() < 1e-5, "estructura");
+        assert!((got.structure_profile[31] - 0.11).abs() < 1e-5);
 
         // Re-guardar con valores nuevos reemplaza el perfil (acumulación nueva).
         let p2 = TrackAcousticProfile {
             track_id: id,
             rms_mean: 0.1,
+            key: -1,
             ..p
         };
         db.save_acoustic_profile(&p2).await.unwrap();
         let got2 = db.acoustic_profile_for_track(id).await.unwrap().unwrap();
         assert!((got2.rms_mean - 0.1).abs() < 1e-4);
+        assert_eq!(got2.key, -1, "el re-guardo actualiza las columnas nuevas");
     }
 
     #[tokio::test]
@@ -1983,6 +2022,7 @@ mod tests {
                 onset_mean: 0.05,
                 band_profile: [0.6, 0.3, 0.4, 0.2, 0.1],
                 frame_count: 60,
+                ..TrackAcousticProfile::default()
             })
             .await
             .unwrap();

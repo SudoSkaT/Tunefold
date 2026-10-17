@@ -12,7 +12,9 @@ import java.util.Set;
  * Recommendations for Home and autoplay (§15).
  *
  * <p>Deliberately simple and deterministic: the provider's own "related to
- * this track" list, filtered. No model, no scoring, no cloud.
+ * this track" list, filtered — and, for {@link #forTrack}, optionally
+ * reordered by the shared taste ranker ({@link #applyRank}, same scoring as
+ * the desktop TUI) which fails open to the provider order on any problem.
  *
  * <p>Two guarantees matter more than variety:
  * <ul>
@@ -43,24 +45,42 @@ final class Recommendations {
     /** Where trace events go; a no-op seam so this stays unit-testable. */
     interface Telemetry { void mark(String event, String detail); }
 
+    /**
+     * Reorders candidates by personal taste, or returns {@code null} to leave
+     * the provider order alone.
+     *
+     * <p>Production wires this to {@link TunefoldBridge#rankRelated} (same
+     * scoring weights as the desktop TUI, Fase 5); tests inject a fake.
+     */
+    interface Ranker {
+        String rank(List<MediaTrack> candidates);
+    }
+
     static final Telemetry NO_TELEMETRY = (event, detail) -> { };
 
     private final RelatedSource source;
     private final Library library;
     private final PlaybackQueue queue;
     private final Telemetry telemetry;
+    private final Ranker ranker;
     private final Set<TrackKey> recentlyOffered = new LinkedHashSet<>();
 
     Recommendations(RelatedSource source, Library library, PlaybackQueue queue) {
-        this(source, library, queue, NO_TELEMETRY);
+        this(source, library, queue, NO_TELEMETRY, null);
     }
 
     Recommendations(RelatedSource source, Library library, PlaybackQueue queue,
                      Telemetry telemetry) {
+        this(source, library, queue, telemetry, null);
+    }
+
+    Recommendations(RelatedSource source, Library library, PlaybackQueue queue,
+                     Telemetry telemetry, Ranker ranker) {
         this.source = source;
         this.library = library;
         this.queue = queue;
         this.telemetry = telemetry == null ? NO_TELEMETRY : telemetry;
+        this.ranker = ranker;
     }
 
     /**
@@ -77,7 +97,11 @@ final class Recommendations {
         telemetry.mark(PlaybackTrace.RECOMMENDATIONS_START, "id=" + originKey);
         try {
             source.related(originKey.providerTrackId(), (raw, error) -> {
-                List<MediaTrack> filtered = filter(originKey, raw);
+                // Personalisation happens before the anti-bucle filter: the
+                // ranker only reorders what the provider answered (indices
+                // stay meaningful), then the filter decides what may be shown.
+                List<MediaTrack> ordered = applyRank(raw);
+                List<MediaTrack> filtered = filter(originKey, ordered);
                 telemetry.mark(PlaybackTrace.RECOMMENDATIONS_END,
                         "kept=" + filtered.size() + " raw=" + (raw == null ? 0 : raw.size())
                                 + (error == null ? "" : " error=" + error));
@@ -91,6 +115,91 @@ final class Recommendations {
             telemetry.mark(PlaybackTrace.RECOMMENDATIONS_END, "error=unavailable");
             deliver(callback, new ArrayList<>(), null);
         }
+    }
+
+    /**
+     * Reorders with the shared ranker, failing open to the provider order.
+     *
+     * <p>Every failure mode keeps the list untouched: no ranker injected, an
+     * empty list, a {@code null} response, an {@code ok:false} envelope, a
+     * malformed or empty {@code order}, out-of-range indices, or any thrown
+     * {@link Throwable} — including the {@link UnsatisfiedLinkError} a binary
+     * built without {@code rankRelated} raises. Recommendation quality may
+     * degrade to plain provider order; playback must never break.
+     */
+    List<MediaTrack> applyRank(List<MediaTrack> raw) {
+        if (ranker == null || raw == null || raw.isEmpty()) {
+            return raw;
+        }
+        try {
+            int[] order = orderOf(ranker.rank(raw));
+            if (order == null) {
+                return raw;
+            }
+            // The order must be a permutation of the input: duplicates or a
+            // hole would silently drop candidates, so anything short of that
+            // fails open instead of risking a lost track.
+            boolean[] seen = new boolean[raw.size()];
+            boolean bijective = order.length == raw.size();
+            for (int i = 0; bijective && i < order.length; i++) {
+                int index = order[i];
+                bijective = index >= 0 && index < raw.size() && !seen[index];
+                if (bijective) {
+                    seen[index] = true;
+                }
+            }
+            if (!bijective) {
+                return raw;
+            }
+            List<MediaTrack> ranked = new ArrayList<>(order.length);
+            for (int index : order) {
+                ranked.add(raw.get(index));
+            }
+            return ranked;
+        } catch (Throwable failure) {
+            Log.i(TAG, "event=RANK_UNAVAILABLE " + failure);
+            return raw;
+        }
+    }
+
+    /**
+     * Extracts {@code order} from a {@code {"ok":true,"order":[...]}}
+     * response without org.json (the unit-test android.jar stubs it out).
+     *
+     * @return one index per input candidate, or {@code null} for every
+     *         failure mode so the caller keeps the provider order
+     */
+    static int[] orderOf(String response) {
+        if (response == null || !response.contains("\"ok\":true")) {
+            return null;
+        }
+        int key = response.indexOf("\"order\"");
+        int open = key < 0 ? -1 : response.indexOf('[', key);
+        int close = open < 0 ? -1 : response.indexOf(']', open);
+        if (open < 0 || close <= open + 1) {
+            return null;
+        }
+        String body = response.substring(open + 1, close);
+        // Java's split would silently drop a trailing empty token, so a
+        // dangling or doubled comma must be rejected before splitting.
+        if (body.isEmpty() || body.startsWith(",") || body.endsWith(",")
+                || body.contains(",,")) {
+            return null;
+        }
+        String[] parts = body.split(",");
+        int[] order = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            try {
+                String token = parts[i].trim();
+                if (token.isEmpty()) {
+                    return null;
+                }
+                order[i] = Integer.parseInt(token);
+            } catch (NumberFormatException malformed) {
+                return null;
+            }
+        }
+        return order;
     }
 
     /**

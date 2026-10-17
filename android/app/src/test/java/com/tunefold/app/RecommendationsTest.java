@@ -222,4 +222,81 @@ public class RecommendationsTest {
         assertFalse("the engine exposes no download side effect",
                 source.toString().contains("startDownload"));
     }
+
+    // ------------------------------------------- shared ranking (Fase 5)
+
+    /** Builds a forTrack whose provider always answers [a, b]. */
+    private List<MediaTrack> forTrackWithRanker(Recommendations.Ranker ranker) {
+        Recommendations ranked = new Recommendations((id, callback) ->
+                callback.onRecommendations(list(track("a"), track("b")), null),
+                library, queue, Recommendations.NO_TELEMETRY, ranker);
+        List<MediaTrack>[] captured = new List[1];
+        ranked.forTrack(track("x"), (tracks, error) -> captured[0] = tracks);
+        assertNotNull(captured[0]);
+        return captured[0];
+    }
+
+    @Test public void rankerReordersProviderOrder() {
+        List<MediaTrack> ranked = forTrackWithRanker(candidates -> "{\"ok\":true,\"order\":[1,0]}");
+        assertEquals(2, ranked.size());
+        assertEquals("b", TrackKey.of(ranked.get(0)).providerTrackId());
+        assertEquals("a", TrackKey.of(ranked.get(1)).providerTrackId());
+    }
+
+    @Test public void noRankerKeepsProviderOrder() {
+        List<MediaTrack> ranked = forTrackWithRanker(null);
+        assertEquals("a", TrackKey.of(ranked.get(0)).providerTrackId());
+        assertEquals("b", TrackKey.of(ranked.get(1)).providerTrackId());
+    }
+
+    /** Every failure mode falls open to the provider order (§25 in spirit). */
+    @Test public void rankerFailuresKeepProviderOrder() {
+        List<String> brokenResponses = Arrays.asList(
+                null,
+                "garbage",
+                "{\"ok\":false,\"category\":\"invalid_request\",\"error\":\"x\"}",
+                "{\"ok\":true}",
+                "{\"ok\":true,\"order\":[]}",
+                "{\"ok\":true,\"order\":[0]}",            // hole: not a permutation
+                "{\"ok\":true,\"order\":[0,0]}",          // duplicate index
+                "{\"ok\":true,\"order\":[0,99]}",         // out of range
+                "{\"ok\":true,\"order\":[0,notanint]}");  // malformed body
+        for (String response : brokenResponses) {
+            List<MediaTrack> ranked = forTrackWithRanker(candidates -> response);
+            assertEquals("response must not reorder: " + response, 2, ranked.size());
+            assertEquals("a", TrackKey.of(ranked.get(0)).providerTrackId());
+            assertEquals("b", TrackKey.of(ranked.get(1)).providerTrackId());
+        }
+    }
+
+    @Test public void rankerThrowableKeepsProviderOrder() {
+        // Both are unchecked, so the Ranker lambda may throw them without
+        // declaring anything: a bug and a binary without rankRelated alike.
+        Recommendations.Ranker[] broken = {
+                candidates -> { throw new IllegalStateException("boom"); },
+                candidates -> { throw new UnsatisfiedLinkError("rankRelated missing"); },
+        };
+        for (Recommendations.Ranker ranker : broken) {
+            List<MediaTrack> ranked = forTrackWithRanker(ranker);
+            assertEquals(2, ranked.size());
+            assertEquals("a", TrackKey.of(ranked.get(0)).providerTrackId());
+            assertEquals("b", TrackKey.of(ranked.get(1)).providerTrackId());
+        }
+    }
+
+    @Test public void orderOfParsesOnlyWellFormedOkResponses() {
+        int[] order = Recommendations.orderOf("{\"ok\":true,\"order\":[2,0,1]}");
+        assertNotNull(order);
+        assertEquals(3, order.length);
+        assertEquals(2, order[0]);
+        assertEquals(0, order[1]);
+        assertEquals(1, order[2]);
+
+        assertNull(Recommendations.orderOf(null));
+        assertNull(Recommendations.orderOf("not json"));
+        assertNull(Recommendations.orderOf("{\"ok\":false,\"order\":[1,0]}"));
+        assertNull(Recommendations.orderOf("{\"ok\":true}"));
+        assertNull(Recommendations.orderOf("{\"ok\":true,\"order\":[]}"));
+        assertNull(Recommendations.orderOf("{\"ok\":true,\"order\":[0,]}}"));
+    }
 }

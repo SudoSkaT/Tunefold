@@ -100,6 +100,18 @@ pub enum BackendEvent {
         /// la UI solo aplica la respuesta si sigue siendo la carga en vuelo.
         generation: u64,
     },
+    /// Re-rank de las recomendaciones tras el pre-análisis acústico en
+    /// background (v0.20): reutiliza la generación de la carga original y la
+    /// UI solo lo aplica si esa sesión sigue vigente
+    /// (`RecommendationSession::accepts_update`). Sin `synced` (la letra no
+    /// cambia; la cola se actualiza igual que en `Related`).
+    RelatedReranked {
+        track: Box<Track>,
+        related: Vec<Track>,
+        queue: Vec<Track>,
+        origins: Vec<QueueItemOrigin>,
+        generation: u64,
+    },
     /// Estado global de la cola (shuffle/repeat/tamaño). Se emite cuando cambia
     /// cualquiera de esos atributos (al alternar shuffle/repeat y al reemplazar
     /// la cola) para que la UI refleje de inmediato los mandos, sin depender de

@@ -382,6 +382,7 @@ mod tests {
             beat,
             beat_confidence: 0.9,
             bpm,
+            chroma: [0.0; 12],
         }
     }
 
