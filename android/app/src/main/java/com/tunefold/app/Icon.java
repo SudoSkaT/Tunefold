@@ -161,6 +161,21 @@ enum Icon {
     /** Pulse: the technical diagnostics panel. */
     DIAGNOSTICS(false, "M 2.8 12 L 6.4 12 L 8.6 6.4 L 11.6 17.6 L 14.4 8.4 L 16.6 12 L 21.2 12"),
 
+    /**
+     * A dot and two arcs opening to the right: a broadcast.
+     *
+     * <p>Not a tuning dial. A dial says "frequency you chose", which is what the
+     * lock screen's remote already says; a station says "a station exists and it is
+     * playing", which is what Radio is. The word alone made the shelf guessable and
+     * the glyph makes it recognisable, and a shelf of three words is three things
+     * the eye has to read instead of three things it can see.
+     */
+    RADIO(false,
+            "M 6.2 12 C 6.2 10.9 7.1 10 8.2 10 C 9.3 10 10.2 10.9 10.2 12"
+                    + " C 10.2 13.1 9.3 14 8.2 14 C 7.1 14 6.2 13.1 6.2 12 Z"
+                    + " M 13.4 8.4 C 15.2 9.9 16.1 11 16.1 12 C 16.1 13 15.2 14.1 13.4 15.6"
+                    + " M 17.6 5.6 C 20.3 8 21.6 10 21.6 12 C 21.6 14 20.3 16 17.6 18.4"),
+
     /** Sliders: settings. */
     SETTINGS(false,
             "M 4 7 L 9.6 7 M 14.4 7 L 20 7 M 4 12 L 14.8 12 M 18.8 12 L 20 12"
@@ -177,6 +192,16 @@ enum Icon {
 
     /** Cross: dismiss. */
     CLOSE(false, "M 6.4 6.4 L 17.6 17.6 M 17.6 6.4 L 6.4 17.6"),
+
+    /**
+     * Check: confirm something, and mark the row that is the chosen one.
+     *
+     * <p>Stroked like the rest of the utility family rather than filled like the
+     * transport, because it marks a state rather than commanding an action — and
+     * the pairing rule of the family keeps it the same weight as the rest of the
+     * set, which is what stops a settings list looking assembled.
+     */
+    CHECK(false, "M 4.8 12.6 L 9.8 17.6 L 19.2 6.8"),
 
     /** A remote control: the player over a locked screen. */
     REMOTE(false,

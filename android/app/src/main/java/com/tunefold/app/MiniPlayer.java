@@ -66,9 +66,18 @@ final class MiniPlayer extends LinearLayout {
                 DesignTokens.dp(DesignTokens.CONTENT_PADDING_HORIZONTAL), 0);
         setBackground(new android.graphics.drawable.ColorDrawable(
                 DesignTokens.Palette.SURFACE_RAISED));
+        // One rule along the top edge: the strip is a plate laid on the page, and
+        // without it the content scrolling under the strip simply stops, which
+        // reads as a rendering fault rather than as "there is more below".
+        setForeground(new TopRule(context));
         setClickable(true);
         setFocusable(true);
-        setElevation(DesignTokens.dp(DesignTokens.ELEVATION_CARD));
+        // Deliberately no elevation. The strip draws its own rule along its top
+        // edge, and the platform shadow it used to carry spilled onto the
+        // navigation bar underneath it — a 48dp gradient that muddied the selected
+        // destination's marker and made the two surfaces look like one smudge. A
+        // printed plate needs a rule, not a shadow, and dropping the elevation also
+        // drops the extra render pass an elevated view costs on every frame.
 
         artwork = new ArtworkView(context);
         artwork.setCornerRadiusDp(DesignTokens.RADIUS_ARTWORK_THUMB);
@@ -118,7 +127,7 @@ final class MiniPlayer extends LinearLayout {
     /** The cover sub-view, so the screen can feed it the same bitmap the player has. */
     ArtworkView artwork() { return artwork; }
 
-    /** Applies a session snapshot; the only way this strip changes. */
+        /** Applies a session snapshot; the only way this strip changes. */
     void apply(PlaybackSession.Snapshot snapshot) {
         MediaTrack track = snapshot == null ? null : snapshot.currentTrack;
         boolean visible = track != null;

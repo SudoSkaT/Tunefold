@@ -4,6 +4,7 @@ import android.content.Context;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.View;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -23,6 +24,12 @@ import android.widget.TextView;
  *
  * <p>Both texts are written only when the composed string actually differs, so
  * refreshing a section on every tick costs one comparison and no allocation.
+ *
+ * <p>The rule under the heading is the one piece of ornament on the whole page, and
+ * it is there because it is the device a printed page uses to separate a section
+ * from the next one: a hairline, the width of the column, in the mineral olive. It
+ * costs one {@link View} per header, built once, and it is what turns four stacked
+ * blocks into one page instead of four lists.
  */
 final class SectionHeader extends LinearLayout {
 
@@ -46,28 +53,58 @@ final class SectionHeader extends LinearLayout {
     private Runnable actionTarget;
 
     SectionHeader(Context context) {
+        this(context, null);
+    }
+
+    /**
+     * Un encabezado que ya trae su título.
+     *
+     * <p>Para las superficies que tienen uno y se construyen después: un
+     * encabezado que obliga a un segundo {@code setTitle} desde fuera es un
+     * encabezado que existe un instante sin nombre en pantalla.
+     *
+     * @param heading el título inicial, o {@code null} para ponerlo luego
+     */
+    SectionHeader(Context context, CharSequence heading) {
         super(context);
         DesignTokens.init(context);
-        setOrientation(HORIZONTAL);
+        setOrientation(VERTICAL);
         setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout row = new LinearLayout(context);
+        row.setOrientation(HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        addView(row, new LayoutParams(LayoutParams.MATCH_PARENT,
+                LayoutParams.WRAP_CONTENT));
 
         title = label(context, DesignTokens.TYPE_LABEL_SIZE,
                 DesignTokens.Palette.ON_SURFACE_MUTED);
-        addView(title, new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(title, new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f));
 
         // The action is a control and says so: a 48dp tall target, all-caps like the
         // heading it belongs to, and a description for anyone not reading the glyph.
+        // It wears the lifted gold, the one gold that can carry words on the page
+        // field; the raw accent stops at 3:1 there and this is a label, not a glyph.
         action = label(context, DesignTokens.TYPE_LABEL_SIZE,
-                DesignTokens.Palette.ACCENT);
+                DesignTokens.Palette.ACCENT_TEXT);
         action.setVisibility(GONE);
         action.setGravity(Gravity.CENTER);
         LayoutParams actionParams = new LayoutParams(LayoutParams.WRAP_CONTENT,
                 DesignTokens.dp(DesignTokens.CONTROL_TARGET));
-        addView(action, actionParams);
+        row.addView(action, actionParams);
+
+        View rule = new View(context);
+        rule.setBackgroundColor(DesignTokens.Palette.HAIRLINE);
+        LayoutParams ruleParams = new LayoutParams(LayoutParams.MATCH_PARENT,
+                DesignTokens.dp(DesignTokens.SPACE_1));
+        ruleParams.topMargin = DesignTokens.dp(DesignTokens.SPACE_1);
+        addView(rule, ruleParams);
+
         setOnClickListener(view -> {
             Runnable target = actionTarget;
             if (target != null) target.run();
         });
+        if (heading != null) setTitle(heading, NO_COUNT);
     }
 
     /**
@@ -120,6 +157,7 @@ final class SectionHeader extends LinearLayout {
         TextView view = new TextView(context);
         view.setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp);
         view.setTextColor(color);
+        view.setLetterSpacing(DesignTokens.TYPE_LABEL_TRACKING);
         view.setAllCaps(true);
         view.setMaxLines(1);
         view.setEllipsize(TextUtils.TruncateAt.END);

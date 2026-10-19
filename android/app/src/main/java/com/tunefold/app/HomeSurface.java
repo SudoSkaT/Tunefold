@@ -63,8 +63,8 @@ final class HomeSurface extends SectionSurface {
     private final TrackGroup liked;
     private final TrackGroup recommended;
     private final Navigation navigation;
-    /** Time-of-day greeting, the first thing the screen says. */
-    private final android.widget.TextView greeting;
+    /** The first thing on the screen: who Tunefold is and what the library holds. */
+    private final MastheadView masthead;
 
     /** Identity the recommendations were asked for; {@code null} for "never". */
     private String recommendationsFor = null;
@@ -76,19 +76,25 @@ final class HomeSurface extends SectionSurface {
     private int renderedLikedRevision = -1;
     /** Download set as it was last derived; see the note at its use. */
     private int renderedDownloadsRevision = -1;
+    /**
+     * Revisions the masthead's counts were last read at.
+     *
+     * <p>Revisions, not counts: reading the counts is the expensive half, and a
+     * revision is the cheap half that tells you whether the expensive half would
+     * change anything.
+     */
+    private int renderedMastheadLikedRevision = -1;
+    private int renderedMastheadDownloadsRevision = -1;
+    /** Whether the masthead's last caption mentioned something playing. */
+    private boolean renderedMastheadPlaying;
 
     HomeSurface(Context context, Host host, Navigation navigation) {
         super(context, host);
         this.navigation = navigation;
-        greeting = new android.widget.TextView(context);
-        greeting.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
-                DesignTokens.TYPE_TITLE_SIZE);
-        greeting.setTextColor(DesignTokens.Palette.ON_SURFACE);
-        greeting.setIncludeFontPadding(false);
-        greeting.setFocusable(false);
-        addView(greeting, new LayoutParams(LayoutParams.MATCH_PARENT,
-                LayoutParams.WRAP_CONTENT));
         // The order this screen is read in.
+        masthead = new MastheadView(context);
+        addView(masthead, new LayoutParams(LayoutParams.MATCH_PARENT,
+                LayoutParams.WRAP_CONTENT));
         continueListening = group("Sigue escuchando");
         startHere = group("Empieza aquí");
         liked = group("L1K3D");
@@ -104,6 +110,16 @@ final class HomeSurface extends SectionSurface {
             candidate.setRangeListener((first, count) -> requestArtwork(candidate));
         }
     }
+
+    /**
+     * Puts the one control this screen's header may carry in the masthead row.
+     *
+     * <p>The diagnostics toggle is a development tool and belongs to the surface
+     * the developer is looking at, not to the Activity's chrome: parked in the
+     * masthead it costs 48&nbsp;dp of a row that is already there instead of a
+     * full-width strip of its own above the identity.
+     */
+    void setAccessory(View accessory) { masthead.setAccessory(accessory); }
 
     private TrackGroup group(String title) {
         TrackGroup group = new TrackGroup(getContext(), title, host.rowPool(), host,
@@ -135,10 +151,10 @@ final class HomeSurface extends SectionSurface {
     void render(boolean force) {
         PlaybackSession session = session();
         if (session == null) return;
-        applyGreeting();
         PlaybackSession.Snapshot snapshot = session.snapshot();
         TrackKey active = snapshot.currentKey;
         int likedRevision = session.libraryRevision();
+        applyMasthead(session, snapshot, force);
 
         continueListening.setActiveTrack(active);
         liked.setActiveTrack(active);
@@ -237,24 +253,56 @@ final class HomeSurface extends SectionSurface {
     }
 
     /**
-     * Time-of-day greeting, written only when the part of day moved.
+     * The masthead: who Tunefold is, and what the library holds.
      *
-     * <p>Cheap on purpose: the hour is read on every render and the label only
-     * moves three times a day, so arriving with the same word costs one
-     * comparison instead of a layout pass.
+     * <p><b>Cheap on purpose, and the cheapness is the whole point.</b> The session
+     * notifies twice a second for every reason at once, and reading the two counts
+     * is not free: L1K3D hands over a copied list and a downloads count taken from
+     * identities that each have to be walked. So the counts are asked for only when a
+     * <em>revision</em> moved, which is a field load — the same rule the rest of this
+     * screen follows for the same reason. The greeting is compared inside the
+     * masthead, because the hour moves three times a day and the label is written
+     * once for each of them.
+     *
+     * <p>Nothing here is owned by this surface: L1K3D is membership and downloads
+     * are a derived view of the store, and this only says what they currently hold.
      */
-    private void applyGreeting() {
-        int hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
-        String word = hour < 6 ? "Buenas noches" : hour < 13 ? "Buenos días" : hour < 21
-                ? "Buenas tardes" : "Buenas noches";
-        if (!word.equals(renderedGreeting)) {
-            renderedGreeting = word;
-            greeting.setText(word);
+    private void applyMasthead(PlaybackSession session, PlaybackSession.Snapshot snapshot,
+            boolean force) {
+        boolean playing = snapshot.currentTrack != null;
+        int likedRevision = session.libraryRevision();
+        int downloadsRevision = session.downloadsRevision();
+        String greeting = greetingForHour();
+        if (force || playing != renderedMastheadPlaying
+                || likedRevision != renderedMastheadLikedRevision
+                || downloadsRevision != renderedMastheadDownloadsRevision
+                || !greeting.equals(renderedGreeting)) {
+            renderedMastheadLikedRevision = likedRevision;
+            renderedMastheadDownloadsRevision = downloadsRevision;
+            renderedMastheadPlaying = playing;
+            // El saludo se compara aquí y no dentro del masthead porque depende de
+            // dos cosas —la hora y el nombre— y sólo una de ellas la resuelve la
+            // vista; si el nombre cambia, la frase cambia aunque la hora no.
+            renderedGreeting = greeting;
+            masthead.apply(greeting, session.likedKeys().size(),
+                    session.downloadedKeys().size(), playing);
         }
     }
 
-    /** Part of day the greeting was last written for; "" before the first. */
+    /** La última frase de saludo escrita, para no repetirla. */
     private String renderedGreeting = "";
+
+    /**
+     * Part of day and name, resolved once per render.
+     *
+     * <p>El nombre se lee de las preferencias del propio contexto, que es donde vive
+     * y no en esta pantalla: los ajustes lo escriben, esta pantalla sólo lo dice.
+     */
+    private String greetingForHour() {
+        return MastheadView.greetingForHour(
+                java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY),
+                UiTheme.displayName(getContext()));
+    }
 
     /**
      * The rows a preview shows: the most recent ones, in order.

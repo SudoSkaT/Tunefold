@@ -1,6 +1,9 @@
 package com.tunefold.app;
 
 import android.content.Context;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -20,9 +23,22 @@ import android.widget.TextView;
  * <p>Selection is state, not a second view: {@link #setActiveDestination} repaints
  * the glyph and the caption, so a section switch touches four captions and four
  * glyphs instead of rebuilding the bar.
+ *
+ * <h3>Selection is said twice, not once</h3>
+ * The active destination takes the accent <b>and</b> a printed rule above its glyph,
+ * because a colour is not an accessible way to mark where you are: a user who
+ * cannot separate the selected caption's hue from the unselected ones is left with
+ * four equal-looking buttons. The rule costs one {@code drawRect} on a paint built
+ * once, and it is the same gold rule the shelf strip uses, so "selected" looks like
+ * one idea across the app rather than two.
  */
 @android.annotation.SuppressLint("ViewConstructor")
 final class NavigationItem extends LinearLayout implements ArtworkTheme.AccentListener {
+
+    /** The marker above the active destination's glyph. */
+    private final Paint marker = new Paint(Paint.ANTI_ALIAS_FLAG);
+    /** Where the marker goes, reused so drawing never allocates. */
+    private final RectF mark = new RectF();
 
     private final IconButton icon;
     private final TextView caption;
@@ -34,6 +50,8 @@ final class NavigationItem extends LinearLayout implements ArtworkTheme.AccentLi
         this.label = label;
         setOrientation(VERTICAL);
         setGravity(Gravity.CENTER);
+        setWillNotDraw(false);
+        marker.setColor(ArtworkTheme.accent());
         // The whole slot is the target, not just the glyph, which is what makes a
         // 20dp glyph comfortably tappable.
         int target = DesignTokens.dp(DesignTokens.CONTROL_TARGET_NAVIGATION);
@@ -112,17 +130,41 @@ final class NavigationItem extends LinearLayout implements ArtworkTheme.AccentLi
         applyState(active);
     }
 
-    @Override public void onAccentChanged(int accent) { applyState(isSelected()); }
+    @Override public void onAccentChanged(int accent) {
+        marker.setColor(accent);
+        applyState(isSelected());
+    }
 
     @Override protected void onDetachedFromWindow() {
         ArtworkTheme.unregister(this);
         super.onDetachedFromWindow();
     }
 
+    /**
+     * The rule above the active glyph.
+     *
+     * <p>Drawn from {@link #onDraw} rather than from a child view: a marker that
+     * exists or does not exist costs a visibility change and a layout, and this is
+     * one rectangle on a paint that is already there.
+     */
+    @Override protected void onDraw(Canvas canvas) {
+        super.onDraw(canvas);
+        if (!isSelected()) return;
+        int width = Math.round(DesignTokens.dp(DesignTokens.NAV_INDICATOR_WIDTH));
+        int thickness = Math.max(1, DesignTokens.dp(DesignTokens.RULE_THICKNESS));
+        float centre = getWidth() / 2f;
+        mark.set(centre - width / 2f, 0f, centre + width / 2f, thickness);
+        canvas.drawRect(mark, marker);
+    }
+
     private void applyState(boolean active) {
-        int color = active ? ArtworkTheme.accent() : DesignTokens.Palette.ON_SURFACE_MUTED;
+        // The glyph takes the accent; the caption takes the lifted one. The glyph
+        // needs 3:1 and the accent has 4.24 on this bar's surface; the caption is
+        // words, and gold alone would not carry them.
+        int color = active ? DesignTokens.Palette.ACCENT_TEXT
+                : DesignTokens.Palette.ON_SURFACE_MUTED;
         icon.setActiveDestination(active);
-        caption.setTextColor(color);
+        if (caption.getCurrentTextColor() != color) caption.setTextColor(color);
         // One node, one description, and it states where the tap goes.
         setContentDescription(active ? label + ", selected" : label);
     }

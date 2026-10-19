@@ -69,7 +69,13 @@ final class PrimaryPlaybackButton extends IconButton {
         if (pressed == value) return;
         pressed = value;
         super.setPressed(value);
-        disc.setColor(value ? DesignTokens.Palette.ACCENT_PRESSED : ArtworkTheme.accent());
+        // Derived from the accent in force, not from the brand: the accent moves
+        // with the cover, and a press state painted from a fixed gold snapped the
+        // disc back to the brand colour on the one control the user holds down
+        // while audio is starting.
+        disc.setColor(value
+                ? DesignTokens.pressedAccent(ArtworkTheme.accent(), ArtworkTheme.onAccent())
+                : ArtworkTheme.accent());
         invalidate();
     }
 

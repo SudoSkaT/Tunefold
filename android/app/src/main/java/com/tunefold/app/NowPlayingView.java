@@ -79,7 +79,6 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
     }
 
     /** How many tracks the player shows as coming next. */
-    private static final int UP_NEXT_ROWS = 4;
     /** La letra se apaga, no desaparece, mientras la canción no tiene qué cantar. */
     private static final float LYRICS_SILENCE_ALPHA = 0.45f;
 
@@ -90,6 +89,8 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
     private final LinearLayout stage;
     private final ArtworkView artwork;
     private final LinearLayout details;
+    /** The card's top rail: the close control, the wordmark and one rule. */
+    private final LinearLayout railBlock;
     private final TextView title;
     private final TextView subtitle;
     private final StateDotView stateDot;
@@ -143,10 +144,7 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
     private Tab selectedTab = Tab.QUEUE;
     private boolean radioOn;
     private String radioLabel = "";
-    private LinearLayout tabBar;
-    private TextView queueTab;
-    private TextView recommendedTab;
-    private TextView radioTab;
+    private ShelfTabBar tabBar;
     /** Radio apagada: armar estación por canción o por artista. */
     private LinearLayout radioPane;
     /** What an empty shelf says, instead of blank space. */
@@ -157,6 +155,8 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
     private final SecondaryActionButton autoplay;
     private final SecondaryActionButton like;
     private final SecondaryActionButton download;
+    /** The control that leaves the player, inside the card's own top rail. */
+    private final IconButton closeControl;
 
     // ---- last rendered values; every apply* method compares before it writes ----
 
@@ -179,6 +179,8 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
     private CharSequence renderedErrorText = "";
     /** The window this surface was last laid out for; {@code null} before the first. */
     private LayoutRules.Profile window;
+    /** Whether the window is too short to also show the lyric; see lyricVisible. */
+    private boolean shortWindow;
     /** Identity of the current window's layout, so a repeated call costs one compare. */
     private String windowKey = "";
     /**
@@ -213,6 +215,58 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         root.setBackground(new ColorDrawable(DesignTokens.Palette.SURFACE_CARD));
         root.setElevation(DesignTokens.dp(DesignTokens.ELEVATION_CARD));
 
+        // ---- the top rail: one control out, the product's name, one printed rule
+        //
+        // It used to be a back button floating in the Activity's frame over the
+        // card, which meant it sat on top of the cover's top-left corner in
+        // portrait: a 48dp target on the loudest object on the screen. Inside the
+        // card it is a rail, it cannot overlap anything, and the wordmark gives
+        // the emotional centre of the app the same identity the home screen has.
+        LinearLayout rail = new LinearLayout(context);
+        rail.setOrientation(LinearLayout.HORIZONTAL);
+        rail.setGravity(Gravity.CENTER_VERTICAL);
+        closeControl = new IconButton(context);
+        closeControl.setAction(Icon.BACK, "Close player");
+        rail.addView(closeControl, new LinearLayout.LayoutParams(
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET),
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET)));
+        TextView wordmark = new TextView(context);
+        wordmark.setText("TUNEFOLD");
+        wordmark.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_LABEL_SIZE);
+        wordmark.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        wordmark.setLetterSpacing(DesignTokens.TYPE_DISPLAY_TRACKING);
+        wordmark.setAllCaps(true);
+        wordmark.setIncludeFontPadding(false);
+        wordmark.setSingleLine(true);
+        wordmark.setFocusable(false);
+        wordmark.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        LinearLayout.LayoutParams wordmarkParams = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        wordmarkParams.leftMargin = DesignTokens.dp(DesignTokens.GAP);
+        rail.addView(wordmark, wordmarkParams);
+        // The rail is one block and the cover's height budget subtracts one block:
+        // added to the card as two loose children it would have been free height,
+        // and the cover — which is fitted to whatever is left — would have grown by
+        // exactly that much and pushed the transport off the bottom. The rule
+        // belongs to the block, not to the row: inside a horizontal rail a
+        // MATCH_PARENT-width child is a sibling that eats the row, and it ate the
+        // wordmark.
+        railBlock = new LinearLayout(context);
+        railBlock.setOrientation(LinearLayout.VERTICAL);
+        railBlock.addView(rail, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        View railRule = new View(context);
+        railRule.setBackgroundColor(DesignTokens.Palette.HAIRLINE);
+        LinearLayout.LayoutParams railRuleParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                DesignTokens.dp(DesignTokens.RULE_THICKNESS));
+        railRuleParams.topMargin = DesignTokens.dp(DesignTokens.GAP_TIGHT);
+        railBlock.addView(railRule, railRuleParams);
+        root.addView(railBlock, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
         // `stage` holds artwork and details as SIBLINGS from the start, so a layout
         // change only re-weights them: no view is ever re-parented and nothing can
         // end up hidden in the wrong mode.
@@ -225,7 +279,14 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         root.addView(stage, new LinearLayout.LayoutParams(-1, -2));
 
         artwork = new ArtworkView(context);
-        stage.addView(artwork, new LinearLayout.LayoutParams(-1, -2));
+        // La portada se apoyaba en la regla de la cabecera sin un solo píxel de
+        // aire entre las dos: en la pantalla se leía como un recorte de la regla,
+        // no como una funda colocada debajo. El bloque es el ancla de la pantalla y
+        // necesita su propio margen de bloque, el mismo que la separación de
+        // cualquier otro.
+        LinearLayout.LayoutParams artworkParams = new LinearLayout.LayoutParams(-1, -2);
+        artworkParams.topMargin = DesignTokens.dp(DesignTokens.GAP);
+        stage.addView(artwork, artworkParams);
 
         details = new LinearLayout(context);
         details.setOrientation(LinearLayout.VERTICAL);
@@ -236,6 +297,11 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         title.setMaxLines(2);
         title.setEllipsize(TextUtils.TruncateAt.END);
         title.setText(NOTHING_PLAYING);
+        // The title is the loudest thing after the cover, and it is the only line on
+        // this surface that a person reads to find out what is playing: bold is what
+        // separates it from the shelves below without making it bigger, which would
+        // cost the row that has to hold two lines of it.
+        title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         addDetails(title, DesignTokens.BLOCK_GAP);
 
         subtitle = label(context, DesignTokens.TYPE_BODY_SIZE,
@@ -275,9 +341,16 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         // La línea que se está cantando. Va donde estaba la mitad de las barras que
         // ya no hay, y es la misma regla que la consola: la última línea cuyo
         // momento ya pasó.
+        //
+        // En cursiva y en lino: es la voz de la canción, no un dato del
+        // reproductor, y el reproductor ya tiene su propia tipografía para lo
+        // que es suyo. En una ventana corta cede: es la única línea de esta
+        // pantalla que es pura letra, y el resto no lo es.
         lyricLine = new TextView(context);
         lyricLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
-        lyricLine.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        lyricLine.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        lyricLine.setTypeface(android.graphics.Typeface.create(
+                android.graphics.Typeface.DEFAULT, android.graphics.Typeface.ITALIC));
         lyricLine.setGravity(Gravity.CENTER);
         lyricLine.setMaxLines(3);
         lyricLine.setEllipsize(TextUtils.TruncateAt.END);
@@ -349,7 +422,12 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         LinearLayout.LayoutParams downloadParams = new LinearLayout.LayoutParams(target, target);
         downloadParams.leftMargin = DesignTokens.dp(DesignTokens.GAP);
         actionRow.addView(download, downloadParams);
-        addDetails(actionRow, 0f);
+        // Estaba a cero de margen: la fila de tres acciones salía pegada al
+        // transporte por arriba y a las pestañas por abajo, y leída como un
+        // arrastre del bloque en vez de como tres acciones. Los tres controles
+        // son el "seguir escuchando" de esta pantalla, y eso pide aire y un
+        // criterio: los mismos tres, en el orden en que se usan.
+        addDetails(actionRow, DesignTokens.SECTION_GAP);
 
         // "A continuación": la cola que el reproductor va a soltar. Sólo cuando hay
         // algo detrás — una lista puesta desde el reparto o una cola vaciada no
@@ -371,20 +449,22 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         // El selector de repisas, delante de las listas: Siguiente,
         // Recomendados y siempre Radio — apagada para armarla, encendida para
         // mirar la cola que está armando.
-        tabBar = new LinearLayout(context);
-        tabBar.setOrientation(LinearLayout.HORIZONTAL);
-        tabBar.setGravity(Gravity.CENTER);
-        queueTab = tabButton("Siguiente");
+        tabBar = new ShelfTabBar(context);
+        LinearLayout queueTab = tabBar.tab("Siguiente", Icon.QUEUE);
         queueTab.setOnClickListener(ignored -> selectTab(Tab.QUEUE));
-        tabBar.addView(queueTab, tabParams());
-        recommendedTab = tabButton("Recomendados");
+        tabBar.addView(queueTab, tabBar.tabParams());
+        LinearLayout recommendedTab = tabBar.tab("Recomendados", Icon.DIAGNOSTICS);
         recommendedTab.setOnClickListener(ignored -> selectTab(Tab.RECOMMENDED));
-        tabBar.addView(recommendedTab, tabParams());
-        radioTab = tabButton("Radio");
+        tabBar.addView(recommendedTab, tabBar.tabParams());
+        LinearLayout radioTab = tabBar.tab("Radio", Icon.RADIO);
         radioTab.setOnClickListener(ignored -> selectTab(Tab.RADIO));
-        tabBar.addView(radioTab, tabParams());
-        details.addView(tabBar, details.indexOfChild(upNext),
-                new LinearLayout.LayoutParams(-1, -2));
+        tabBar.addView(radioTab, tabBar.tabParams());
+        LinearLayout.LayoutParams tabBarParams =
+                new LinearLayout.LayoutParams(-1, -2);
+        // Mismo motivo que la fila de acciones: las pestañas se leían como la
+        // cola pegada al transporte, y no como el selector de qué cola es.
+        tabBarParams.topMargin = DesignTokens.dp(DesignTokens.SECTION_GAP);
+        details.addView(tabBar, details.indexOfChild(upNext), tabBarParams);
 
         // Armar radio: por la canción que suena o por su artista, por separado.
         radioPane = new LinearLayout(context);
@@ -424,6 +504,18 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
 
     View view() { return root; }
 
+    /**
+     * What the top rail's control does.
+     *
+     * <p>The player owns the control and the screen owns the command: the rail is
+     * inside the card so it cannot land on the cover, and the screen is the only
+     * thing that knows how to close the surface it opened.
+     */
+    void setOnClose(Runnable action) {
+        if (action == null) return;
+        closeControl.setOnClickListener(ignored -> action.run());
+    }
+
     /** Quién oye un toque en una fila de "sigue". */
     void setQueuedTrackChosen(QueuedTrackChosen chosen) { queuedTrackChosen = chosen; }
 
@@ -438,7 +530,11 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         List<MediaTrack> next = new ArrayList<>();
         int from = current == null ? 0 : queue.indexOfKey(current);
         if (from < 0) from = 0;
-        for (int index = from + 1; index < queue.size() && next.size() < UP_NEXT_ROWS + 1; index++) {
+        // Sin tope: la cola se entrega entera. El tope vivía aquí y en el pintado,
+        // y los dos juntos producían el "+1 más". Quitar sólo uno de los dos deja
+        // una cola que se corta sin avisar, que es peor que una que al menos decía
+        // "hay una más".
+        for (int index = from + 1; index < queue.size(); index++) {
             MediaTrack track = queue.at(index);
             if (track != null) next.add(track);
         }
@@ -478,6 +574,8 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         private int fitHeight = -1;
         /** Measured height of the details subtree, reused while nothing moved. */
         private int detailsHeight;
+        /** Measured height of the top rail, reused on the same terms. */
+        private int railHeight;
         /** El relleno de la tarjeta, sin el aire repartido que se le añade luego. */
         private int basePaddingTop;
         private int basePaddingBottom;
@@ -503,11 +601,19 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
                 int inner = Math.max(0, width - getPaddingLeft() - getPaddingRight());
                 if (inner != fitWidth || available != fitHeight) {
                     View details = owner.details;
+                    View rail = owner.railBlock;
                     details.measure(MeasureSpec.makeMeasureSpec(inner, MeasureSpec.EXACTLY),
+                            MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+                    // The rail is measured on the same pass and for the same reason:
+                    // it is height the cover does not get, and a cover that is fitted
+                    // to "whatever is left" has to be told about it or it grows by
+                    // exactly the rail's height and pushes the transport off-screen.
+                    rail.measure(MeasureSpec.makeMeasureSpec(inner, MeasureSpec.EXACTLY),
                             MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
                     fitWidth = inner;
                     fitHeight = available;
                     detailsHeight = details.getMeasuredHeight();
+                    railHeight = rail.getMeasuredHeight();
                 }
                 LinearLayout.LayoutParams art =
                         (LinearLayout.LayoutParams) owner.artwork.getLayoutParams();
@@ -515,7 +621,7 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
                         (LinearLayout.LayoutParams) owner.details.getLayoutParams();
                 int gaps = art.bottomMargin + text.topMargin;
                 int spare = available - getPaddingTop() - getPaddingBottom()
-                        - detailsHeight - gaps;
+                        - detailsHeight - railHeight - gaps;
                 // El suelo es el mínimo del token: por debajo, una portada ya no es
                 // una portada y el problema pasa a ser de ventana, no de proporción.
                 // El techo es el lado que la ventana pidió, para que la portada no
@@ -828,14 +934,18 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
      */
     void setLyrics(LyricTrack track) {
         lyricTrack = track;
-        lyricPositionMs = -1L;
         if (track == null || track.isEmpty()) {
-            lyricLine.setVisibility(View.GONE);
+            setVisible(lyricLine, false);
             return;
         }
-        lyricLine.setVisibility(View.VISIBLE);
+        setVisible(lyricLine, lyricVisible(shortWindow, true));
         lyricLine.setText(DesignTokens.LYRICS_SILENCE);
         lyricLine.setAlpha(LYRICS_SILENCE_ALPHA);
+        // Se reutiliza la última posición conocida y no se reinicia a cero: la letra
+        // llega después de que la canción empiece, y buscar en el segundo cero
+        // encendía la primera línea de la canción mientras el usuario ya iba por la
+        // mitad. El comentario de abajo llevaba mucho tiempo prometer justo lo que el
+        // código no hacía.
         showLyricAt(lyricPositionMs >= 0L ? lyricPositionMs : 0L);
     }
 
@@ -873,19 +983,16 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
         upNext.addView(header);
-        int shown = Math.min(wanted.size(), UP_NEXT_ROWS);
-        for (int index = 0; index < shown; index++) {
+        // La cola se enseña entera. Estaba capada a cuatro filas y lo que sobraba
+        // terminaba en un "+1 más" que no hacía nada: anunciaba pistas que la pantalla
+        // se negaba a dejar ver ni quitar de la cola. Una lista que dice que hay una
+        // cosa más y no la deja tocar no es un atajo, es un sitio donde no se puede
+        // llegar. El bloque ya vive en un ScrollView, así que crece sin romper nada.
+        for (int index = 0; index < wanted.size(); index++) {
             MediaTrack track = wanted.get(index);
             QueueRow row = new QueueRow(track, new ArtworkView(context));
             queueRows.add(row);
             upNext.addView(buildQueueRow(row, index));
-        }
-        if (wanted.size() > shown) {
-            TextView more = moreRow(wanted.size() - shown);
-            more.setLayoutParams(new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT));
-            upNext.addView(more);
         }
         refreshTabContent();
     }
@@ -1007,35 +1114,6 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         }
     }
 
-    private TextView moreRow(int hidden) {
-        TextView row = new TextView(context);
-        row.setText("+" + hidden + " más");
-        row.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_CAPTION_SIZE);
-        row.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
-        row.setGravity(Gravity.CENTER);
-        row.setFocusable(false);
-        return row;
-    }
-
-    /** One tab segment: full-width third, 48dp target, selected in accent. */
-    private TextView tabButton(String text) {
-        TextView tab = new TextView(context);
-        tab.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_LABEL_SIZE);
-        tab.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
-        tab.setGravity(Gravity.CENTER);
-        tab.setMinHeight(DesignTokens.dp(DesignTokens.CONTROL_TARGET));
-        tab.setText(text);
-        tab.setContentDescription(text);
-        tab.setClickable(true);
-        tab.setFocusable(true);
-        return tab;
-    }
-
-    private LinearLayout.LayoutParams tabParams() {
-        return new LinearLayout.LayoutParams(0,
-                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-    }
-
     /**
      * Shows one shelf. Tapping Cola while the radio plays stops the station:
      * choosing the manual queue is choosing it over the generated one.
@@ -1075,20 +1153,20 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
     /** The selected tab, for the swipe handler. */
     Tab selectedTab() { return selectedTab; }
 
-    /** Paints the three segments; only the radio label changes over time. */
+    /**
+     * The three segments, named and pointed at one.
+     *
+     * <p>How a selected tab <em>looks</em> is {@link ShelfTabBar}'s business, and it
+     * was also this class's, which meant two answers to one question and a strip
+     * whose rule said one thing while its captions said another. Here only the two
+     * facts the bar cannot know: what each one is called and which one is selected.
+     */
     private void paintTabs() {
-        paintTab(queueTab, "Siguiente", selectedTab == Tab.QUEUE);
-        paintTab(recommendedTab, "Recomendados", selectedTab == Tab.RECOMMENDED);
-        paintTab(radioTab, radioOn && !radioLabel.isEmpty() ? radioLabel : "Radio",
-                selectedTab == Tab.RADIO);
-    }
-
-    private static void paintTab(TextView tab, String text, boolean selected) {
-        if (!TextUtils.equals(tab.getText(), text)) tab.setText(text);
-        int color = selected ? DesignTokens.Palette.ACCENT
-                : DesignTokens.Palette.ON_SURFACE_MUTED;
-        if (tab.getCurrentTextColor() != color) tab.setTextColor(color);
-        tab.setContentDescription(text + (selected ? ", selected" : ""));
+        tabBar.setCaption(0, "Siguiente");
+        tabBar.setCaption(1, "Recomendados");
+        tabBar.setCaption(2, radioOn && !radioLabel.isEmpty() ? radioLabel : "Radio");
+        tabBar.setSelectedIndex(selectedTab == Tab.QUEUE ? 0
+                : selectedTab == Tab.RECOMMENDED ? 1 : 2);
     }
 
     /**
@@ -1119,14 +1197,23 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         paintTabs();
     }
 
-    /** One station builder: full-width, 48dp target, accent action. */
+    /**
+     * One station builder: full-width, 48dp target, on the card.
+     *
+     * <p>Linen rather than gold, for the same reason the shelf tabs are: this row
+     * sits on the card, where a 13&nbsp;sp accent cannot be read with confidence.
+     * The card surface behind it is what separates it from the list, not a hue.
+     */
     private TextView radioStarter(String text, String description, Runnable action) {
         TextView starter = new TextView(context);
         starter.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
-        starter.setTextColor(DesignTokens.Palette.ACCENT);
+        starter.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        starter.setLetterSpacing(DesignTokens.TYPE_LABEL_TRACKING);
         starter.setGravity(Gravity.CENTER);
         starter.setMinHeight(DesignTokens.dp(DesignTokens.CONTROL_TARGET));
         starter.setText(text);
+        starter.setBackground(MainActivity.roundDrawable(
+                DesignTokens.Palette.SURFACE_CARD_ACTIVE, DesignTokens.RADIUS_SMALL));
         starter.setContentDescription(description);
         starter.setClickable(true);
         starter.setFocusable(true);
@@ -1269,7 +1356,10 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         TextView create = new TextView(context);
         create.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_LABEL_SIZE);
-        create.setTextColor(DesignTokens.Palette.ACCENT);
+        // Linen, not the accent: this action lives on the card, and the strip's
+        // accent is already spoken for by the selected shelf's rule.
+        create.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        create.setLetterSpacing(DesignTokens.TYPE_LABEL_TRACKING);
         create.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         create.setMinHeight(DesignTokens.dp(DesignTokens.CONTROL_TARGET));
         create.setText("Crear radio");
@@ -1447,16 +1537,13 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
      * layout. Silence keeps whatever was last written instead of blanking the space
      * on every gap between phrases.
      */
-    private void showLyricAt(long positionMs) {
+    private void showLyricAt(long enginePositionMs) {
         LyricTrack current = lyricTrack;
         if (current == null || current.isEmpty()) return;
-        lyricPositionMs = positionMs;
-        LyricTrack.Line line = current.activeAt(positionMs);
-        if (line == null) {
-            lyricLine.setVisibility(View.GONE);
-            return;
-        }
-        lyricLine.setVisibility(View.VISIBLE);
+        lyricPositionMs = enginePositionMs;
+        LyricTrack.Line line = current.activeAt(lyricPositionFor(enginePositionMs));
+        setVisible(lyricLine, lyricVisible(shortWindow, line != null));
+        if (line == null) return;
         String text = line.text.trim();
         boolean singing = !text.isEmpty();
         String shown = singing ? text : DesignTokens.LYRICS_SILENCE;
@@ -1466,6 +1553,38 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         }
         lyricLine.setText(shown);
         lyricLine.setAlpha(singing ? 1f : LYRICS_SILENCE_ALPHA);
+    }
+
+    /**
+     * La posición a la que se busca la línea que se está cantando.
+     *
+     * <p>La del decodificador menos {@link DesignTokens#LYRIC_LEAD_MS}, porque la del
+     * decodificador va por delante de lo que sale por el altavoz. Buscar en la
+     * posición cruda encendía la línea <em>siguiente</em> a la que se canta, que en
+     * una frase de tres segundos se lee como un verso entero de adelanto.
+     *
+     * <p>El elapsed y el cursor siguen usando la posición cruda: el reloj dice
+     * truthfully dónde va la canción, la letra tiene que decir dónde está la voz.
+     *
+     * <p>Puro y sin tipos de Android, para que un revisor pueda comprobarlo leyendo
+     * la resta.
+     */
+    static long lyricPositionFor(long enginePositionMs) {
+        return Math.max(0L, enginePositionMs - DesignTokens.LYRIC_LEAD_MS);
+    }
+
+    /**
+     * Whether the line being sung has room to be shown.
+     *
+     * <p>Only the lyric yields, and only in a window too short to hold it: a phone on
+     * its side spends its height on the cover, the transport and the shelves, and the
+     * lyric is the one block on this surface that is additive — nothing else is
+     * hidden behind it, and every action on the card stays reachable. Pure, because
+     * "does the lyric fit" is a question a reviewer should be able to answer without
+     * turning a phone sideways.
+     */
+    static boolean lyricVisible(boolean shortWindow, boolean hasLine) {
+        return hasLine && !shortWindow;
     }
 
     // -------------------------------------------------------------- geometry
@@ -1520,8 +1639,12 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         applySpacing(profile);
         // A short window is a landscape phone: the bars are the one block that can
         // give up height without losing meaning, and they are what pushes the
-        // transport off the bottom.
-        progress.setCompact(profile.shortWindow());
+        // transport off the bottom. The lyric is the other one, and it goes first
+        // because nothing is hidden behind it.
+        shortWindow = profile.shortWindow();
+        progress.setCompact(shortWindow);
+        setVisible(lyricLine, lyricVisible(shortWindow,
+                lyricTrack != null && !lyricTrack.isEmpty()));
 
         // The cover keeps its share of the window and never leaves its bounds: a
         // window too small for the composition is a window problem, not a deformed

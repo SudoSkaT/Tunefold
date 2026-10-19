@@ -47,7 +47,7 @@ import java.util.Objects;
  * they were.
  */
 public final class MainActivity extends Activity
-        implements SearchSurface.SearchHost, HomeSurface.Navigation {
+        implements SearchSurface.SearchHost, HomeSurface.Navigation, SettingsSurface.Host {
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     /** La pista cuya letra ya se pidió, y la que ya llegó: una comparación por repintado. */
@@ -77,8 +77,6 @@ public final class MainActivity extends Activity
     private boolean destroyed;
     /** The window the interface was last adapted to; {@code null} before the first. */
     private LayoutRules.Profile window;
-    /** Width of the content box in pixels; what a centred column is measured against. */
-    private int windowWidthPx;
 
     // ---- the tree ----
     private FrameLayout root;
@@ -88,9 +86,9 @@ public final class MainActivity extends Activity
     private LinearLayout bottomBar;
     private LinearLayout navBar;
     private FrameLayout player;
-    /** The control that leaves the player, kept so it can follow the card's edge. */
-    private IconButton playerClose;
-    private FrameLayout.LayoutParams playerCloseParams;
+    /** The player's scroller; it carries the gutter when the card fills the window. */
+    private ScrollView playerScroller;
+
     private PlaybackDebugPanel debugPanel;
     private LiveAudioBars bars;
 
@@ -99,14 +97,25 @@ public final class MainActivity extends Activity
     private SearchSurface searchSurface;
     private LibrarySurface likedSurface;
     private LibrarySurface downloadsSurface;
+    private SettingsSurface settingsSurface;
     private final SectionSurface[] surfaces = new SectionSurface[Section.values().length];
     private final NavigationItem[] navItems = new NavigationItem[Section.values().length];
 
     private NowPlayingView nowPlaying;
 
     /** Which destination the content area is showing. */
-    private enum Section { HOME, SEARCH, LIKED, DOWNLOADED }
+    private enum Section { HOME, SEARCH, LIKED, DOWNLOADED, SETTINGS }
     private Section section = Section.HOME;
+    /**
+     * The destination to land on once the session binds, read from the saved state.
+     *
+     * <p>A theme change has to recreate the Activity — most views read their colours
+     * once, at construction — and recreating dropped the user back on Home. That is
+     * the one thing a settings screen must not do: you pick a theme to look at the
+     * theme, and the screen you were reading leaves. It also means a rotation, or a
+     * trip through the system's process death, no longer loses the place either.
+     */
+    private Section restoredSection = Section.HOME;
     /** Where Search returns to; {@code null} means "wherever you were". */
     private Section returnFromSearch = Section.HOME;
     /** Whether the player is covering the navigation. */
@@ -115,6 +124,8 @@ public final class MainActivity extends Activity
     private int downloadsRenderedRevision = -1;
 
     /** Request code for the runtime POST_NOTIFICATIONS prompt. */
+    private static final String STATE_SECTION = "section";
+    private static final String STATE_RETURN_FROM_SEARCH = "returnFromSearch";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 4201;
 
     // Row menu items. Named, because a menu whose branches are the numbers 1..5 is
@@ -146,7 +157,7 @@ public final class MainActivity extends Activity
             // which let a reconnect stack duplicate observers.
             session.addObserver(sessionObserver);
             applyWindow(true);
-            showSection(Section.HOME, true);
+            showSection(restoredSection, true);
             render();
             if (getIntent().getBooleanExtra("runtime_smoke_test", false)) resolveAndPlay();
             applyRuntimeDownloadHook();
@@ -169,6 +180,19 @@ public final class MainActivity extends Activity
         super.onCreate(savedInstanceState);
         // Before anything measures: every dimension in the tree comes from a token.
         DesignTokens.init(this);
+        // Antes de construir nada: desde aquí la tabla de colores vale para el
+        // tema del usuario y ninguna vista nace con un color que haya que
+        // corregir después.
+        UiTheme.load(this);
+        // Antes de enlazar: la sesión llega asíncrona y showSection lee este campo.
+        // Leerlo en onRestoreInstanceState sería una carrera sin motivo, ya que el
+        // estado guardado está disponible aquí mismo.
+        if (savedInstanceState != null) {
+            restoredSection = sectionFrom(savedInstanceState.getString(STATE_SECTION),
+                    Section.HOME);
+            returnFromSearch = sectionFrom(
+                    savedInstanceState.getString(STATE_RETURN_FROM_SEARCH), Section.HOME);
+        }
         getWindow().setBackgroundDrawable(
                 new ColorDrawable(DesignTokens.Palette.SURFACE_BASE));
         buildInterface();
@@ -176,6 +200,21 @@ public final class MainActivity extends Activity
         Intent service = new Intent(this, ForegroundPlaybackService.class);
         bound = bindService(service, connection, BIND_AUTO_CREATE);
         mainHandler.post(poll);
+    }
+
+    @Override protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putString(STATE_SECTION, section.name());
+        outState.putString(STATE_RETURN_FROM_SEARCH, returnFromSearch.name());
+    }
+
+    private static Section sectionFrom(String name, Section fallback) {
+        if (name == null) return fallback;
+        try {
+            return Section.valueOf(name);
+        } catch (IllegalArgumentException unknown) {
+            return fallback;
+        }
     }
 
     /**
@@ -228,26 +267,43 @@ public final class MainActivity extends Activity
     }
 
     /**
-     * The diagnostics toggle, parked at the top of Home.
+     * The rule along the top of the destinations.
      *
-     * <p>A development tool is a thing that must be reachable and a thing that must
-     * not be in the way: one 48dp target at the top of the discovery screen, which
-     * opens a panel that is hidden by default and costs nothing until it is asked
-     * for. It was in the top bar until the bottom navigation replaced it.
+     * <p>It belongs to the strip's own edge only while the strip is not there: with
+     * something playing the strip draws its own rule at the top of the bar, and two
+     * rules 56&nbsp;dp apart would say "there is a surface here" where there is
+     * only one. Without any rule at all, a list that scrolls under the bar simply
+     * stops, which reads as a rendering fault rather than as "there is more below".
      */
-    private LinearLayout.LayoutParams diagnosticsParams() {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                DesignTokens.dp(DesignTokens.CONTROL_TARGET),
-                DesignTokens.dp(DesignTokens.CONTROL_TARGET));
-        params.gravity = Gravity.END;
-        return params;
+    private void syncBottomBarRule() {
+        boolean stripGone = mini.getVisibility() != View.VISIBLE;
+        boolean moved = stripGone != bottomBarRuleShown;
+        bottomBarRuleShown = stripGone;
+        navBar.setForeground(stripGone ? bottomBarRule : null);
+        // The strip's height is part of the page's bottom padding, so a change in
+        // the strip is also a change in how far the last row can scroll clear.
+        if (moved) mainHandler.post(() -> syncBottomBarPadding());
     }
 
-    /** The four destinations, built once and kept. */
+    private TopRule bottomBarRule;
+    private boolean bottomBarRuleShown;
+
+    /**
+     * The diagnostics toggle, parked in Home's masthead row.
+     *
+     * <p>A development tool is a thing that must be reachable and a thing that must
+     * not be in the way: one 48dp target inside a row the screen already has, which
+     * opens a panel that is hidden by default and costs nothing until it is asked
+     * for. It used to be a full-width strip above the masthead, which read as a
+     * broken header bar to anyone who did not know what it was. It is Home's control
+     * because Home is where a developer is looking, so {@link HomeSurface} is where
+     * it lives — the screen owns the content, the Activity owns the command.
+     */
     private void buildSurfaces() {
         debugPanel = new PlaybackDebugPanel(this);
         content.addView(debugPanel.view(), spaced(DesignTokens.SPACE_2));
 
+        homeSurface = new HomeSurface(this, this, this);
         IconButton diagnostics = new IconButton(this, DesignTokens.CONTROL_TARGET,
                 DesignTokens.ICON_SIZE_SMALL);
         diagnostics.setAction(Icon.DIAGNOSTICS, "Diagnostics");
@@ -255,16 +311,16 @@ public final class MainActivity extends Activity
             debugPanel.toggle();
             renderDiagnostics();
         });
-        content.addView(diagnostics, diagnosticsParams());
-
-        homeSurface = new HomeSurface(this, this, this);
+        homeSurface.setAccessory(diagnostics);
         searchSurface = new SearchSurface(this, this);
         likedSurface = new LibrarySurface(this, this, "L1K3D");
         downloadsSurface = new LibrarySurface(this, this, "Descargadas");
+        settingsSurface = new SettingsSurface(this, this);
         surfaces[Section.HOME.ordinal()] = homeSurface;
         surfaces[Section.SEARCH.ordinal()] = searchSurface;
         surfaces[Section.LIKED.ordinal()] = likedSurface;
         surfaces[Section.DOWNLOADED.ordinal()] = downloadsSurface;
+        surfaces[Section.SETTINGS.ordinal()] = settingsSurface;
         for (SectionSurface surface : surfaces) {
             content.addView(surface, spaced(0f));
         }
@@ -361,20 +417,16 @@ public final class MainActivity extends Activity
         playerScroller.setFillViewport(true);
         playerScroller.setBackgroundColor(DesignTokens.Palette.SURFACE_BASE);
         playerScroller.addView(nowPlaying.view(), new ScrollView.LayoutParams(-1, -2));
+        this.playerScroller = playerScroller;
         FrameLayout.LayoutParams scrollerParams = new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
         player.addView(playerScroller, scrollerParams);
 
         // One control, top left, that means exactly what the system gesture means.
-        playerClose = new IconButton(this);
-        playerClose.setAction(Icon.BACK, "Close player");
-        playerClose.setOnClickListener(view -> closePlayer());
-        playerCloseParams = new FrameLayout.LayoutParams(
-                DesignTokens.dp(DesignTokens.CONTROL_TARGET),
-                DesignTokens.dp(DesignTokens.CONTROL_TARGET));
-        playerCloseParams.leftMargin = DesignTokens.dp(DesignTokens.CONTENT_PADDING_HORIZONTAL);
-        playerCloseParams.topMargin = DesignTokens.dp(DesignTokens.CONTENT_PADDING_TOP);
-        player.addView(playerClose, playerCloseParams);
+        // It lives inside the card's own top rail: as a sibling in this frame it sat
+        // on top of the cover's corner in portrait, and its margin had to be
+        // re-derived every time the column width changed.
+        nowPlaying.setOnClose(this::closePlayer);
 
         root.addView(player, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -391,7 +443,8 @@ public final class MainActivity extends Activity
     private void buildBottomBar() {
         bottomBar = new LinearLayout(this);
         bottomBar.setOrientation(LinearLayout.VERTICAL);
-        bottomBar.setBackgroundColor(DesignTokens.BOTTOM_NAV_SURFACE);
+        bottomBar.setBackgroundColor(DesignTokens.bottomNavSurface());
+        bottomBarRule = new TopRule(this);
 
         mini = new MiniPlayer(this, new MiniPlayer.Actions() {
             @Override public void onPlayPause() {
@@ -416,6 +469,10 @@ public final class MainActivity extends Activity
         root.addView(bottomBar, new FrameLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
+        // The strip starts hidden, so the bar's top edge is the first thing the page
+        // scrolls under: it needs its rule from the first frame, not from the first
+        // snapshot.
+        syncBottomBarRule();
     }
 
     /**
@@ -428,7 +485,8 @@ public final class MainActivity extends Activity
         LinearLayout nav = new LinearLayout(this);
         nav.setOrientation(LinearLayout.HORIZONTAL);
         int height = DesignTokens.dp(DesignTokens.CONTROL_TARGET_NAVIGATION);
-        Section[] order = {Section.HOME, Section.SEARCH, Section.LIKED, Section.DOWNLOADED};
+        Section[] order = {Section.HOME, Section.SEARCH, Section.LIKED, Section.DOWNLOADED,
+                Section.SETTINGS};
         for (int index = 0; index < order.length; index++) {
             Section target = order[index];
             NavigationItem item = new NavigationItem(this, glyphFor(target), labelFor(target));
@@ -441,20 +499,21 @@ public final class MainActivity extends Activity
         return nav;
     }
 
-    /**
+/**
      * The system's own bars are the window's, not ours: we pad and never draw them.
-     *
+ *
      * <p>Insets are remembered rather than applied twice: the window the layout rules
      * measure is the window <em>after</em> them, and a phone in landscape is 2388 px
      * shorter than the display once the navigation bar and the cutout have taken their
      * share. Handing them to {@link #applyWindow} is what keeps a phone on its side
      * from being laid out as if it were standing up.
-     *
+ *
      * <p>One listener, installed once, for the life of the screen: a second one would
      * be a second set of writes on every inset change, and the two would fight.
      */
     @SuppressWarnings("deprecation")
     private void applySystemBars() {
+        paintSystemBars();
         root.setOnApplyWindowInsetsListener((view, system) -> {
             int left = system.getSystemWindowInsetLeft();
             int top = system.getSystemWindowInsetTop();
@@ -469,11 +528,73 @@ public final class MainActivity extends Activity
         });
     }
 
+    /**
+     * The status and navigation bars, in the brand.
+     *
+     * <p>They were the platform default, which is pure black, and a black band above
+     * and below an olive page is the most expensive kind of palette leak there is: it
+     * is the one place the app is not the app. It is set from the tokens like
+     * everything else, and the icon appearance follows from the contrast — the field
+     * is dark, so the light icons are right and no flag is needed.
+     *
+     * <p>Guarded because Android 15 draws these transparent and lays the window out
+     * edge to edge, where the colour calls are ignored: there the olive is drawn by
+     * the root view itself and this method has nothing to do.
+     */
+    @SuppressWarnings("deprecation")
+    private void paintSystemBars() {
+        // Los colores dejan de valer en 35 (borde a borde); los iconos no, y sin
+        // ellos un tema claro se queda con el reloj en blanco sobre el campo claro.
+        if (android.os.Build.VERSION.SDK_INT < 35) {
+            getWindow().setStatusBarColor(DesignTokens.Palette.SURFACE_BASE);
+            getWindow().setNavigationBarColor(DesignTokens.bottomNavSurface());
+        }
+        paintSystemBarIcons();
+    }
+
+    /**
+     * Puts the clock and the battery in a colour that can be read on the field the
+     * theme actually paints.
+     *
+     * <p>API 35 draws edge to edge and ignores the colour calls, so the icons are
+     * the only thing left in the system's hands there; below it the flags are the
+     * mechanism. Either way the decision is the same one the palette already makes
+     * everywhere else: a pale field wants dark icons. Six of the six themes ship a
+     * pale field in some role, and white-on-pale is not a style, it is a clock
+     * nobody can read.
+     *
+     * <p>The legacy path edits the visibility flags in place rather than assigning
+     * them, because the layout flags that keep the bars from flickering on a scroll
+     * live in the same word.
+     */
+    @SuppressWarnings("deprecation")
+    private void paintSystemBarIcons() {
+        boolean darkIcons = ColorMath.luminance(DesignTokens.Palette.SURFACE_BASE) > 0.5d;
+        int mask = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                | android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            android.view.WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.setSystemBarsAppearance(darkIcons ? mask : 0, mask);
+            }
+            return;
+        }
+        int flags = getWindow().getDecorView().getSystemUiVisibility();
+        if (darkIcons) {
+            flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        } else {
+            flags &= ~(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                    | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+        }
+        getWindow().getDecorView().setSystemUiVisibility(flags);
+    }
+
     private static Icon glyphFor(Section target) {
         switch (target) {
             case HOME: return Icon.HOME;
             case SEARCH: return Icon.SEARCH;
             case LIKED: return Icon.HEART;
+            case SETTINGS: return Icon.SETTINGS;
             default: return Icon.DOWNLOADS;
         }
     }
@@ -483,6 +604,7 @@ public final class MainActivity extends Activity
             case HOME: return "Home";
             case SEARCH: return "Search";
             case LIKED: return "L1K3D";
+            case SETTINGS: return "Ajustes";
             default: return "Descargadas";
         }
     }
@@ -545,6 +667,8 @@ public final class MainActivity extends Activity
             case DOWNLOADED:
                 renderDownloaded();
                 break;
+            case SETTINGS:
+                break;
             default:
                 break;
         }
@@ -572,6 +696,31 @@ public final class MainActivity extends Activity
     }
 
     @Override public void onSearchIdle() { }
+
+    // ------------------------------------------------------------- settings
+
+    /**
+     * Un tema ha sido puesto.
+     *
+     * <p>La ventana se reconstruye entera en lugar de repintar las quince vistas
+     * que cachean un color. El motivo está en {@link UiTheme}: una cache de color
+     * olvidada es un bug que sólo aparece en el tercer tema que alguien prueba.
+     * El estado de reproducción no se pierde porque la sesión vive en el servicio.
+     */
+    @Override public void onThemeChosen(ThemeSpec theme) {
+        ArtworkTheme.reset();
+        recreate();
+    }
+
+    /**
+     * El nombre ha cambiado.
+     *
+     * <p>Sin reconstrucción: son dos cadenas y la portada las vuelve a leer en su
+     * siguiente render, que ocurre en cuanto la sesión notifique.
+     */
+    @Override public void onDisplayNameChanged(String name) {
+        if (homeSurface != null) homeSurface.render(true);
+    }
 
     // --------------------------------------------------------------- the player
 
@@ -1046,6 +1195,7 @@ public final class MainActivity extends Activity
         if (destroyed || session == null) return;
         PlaybackSession.Snapshot snapshot = session.snapshot();
         mini.apply(snapshot);
+        syncBottomBarRule();
         if (playerOpen) {
             nowPlaying.applyTrack(snapshot);
             nowPlaying.applyPlaybackState(snapshot);
@@ -1240,7 +1390,6 @@ public final class MainActivity extends Activity
         int heightPx = Math.max(1, metrics.heightPixels - insets.top - insets.bottom);
         // The screen's smaller side, in dp: what decides whether this is a phone or a
         // tablet, in every orientation.
-        windowWidthPx = widthPx;
         int smallestPx = Math.min(metrics.widthPixels, metrics.heightPixels);
         float density = Math.max(0.01f, metrics.density);
         LayoutRules.Profile profile = LayoutRules.of(Math.round(widthPx / density),
@@ -1265,8 +1414,12 @@ public final class MainActivity extends Activity
 
         // The card's own width, not the window's: a tablet caps the column, and a
         // cover sized against the window would be wider than the column it sits in.
+        // A phone has no cap, so the card takes the window minus the gutter the
+        // scroller keeps on each side — measuring the cover against the window here
+        // would let it ask for a width the card no longer has.
         int cardWidthPx = profile.contentMaxDp() > 0
-                ? DesignTokens.dp(profile.contentMaxDp()) : widthPx;
+                ? DesignTokens.dp(profile.contentMaxDp())
+                : Math.max(0, widthPx - DesignTokens.dp(profile.gutterDp()) * 2);
         int inner = Math.max(0, cardWidthPx - DesignTokens.dp(DesignTokens.CARD_PADDING) * 2);
         // Height is only known once the player is on screen and measured; until then
         // the width rule alone decides, which is the safer of the two errors.
@@ -1332,15 +1485,19 @@ public final class MainActivity extends Activity
         cardParams.width = wanted;
         cardParams.gravity = gravity;
         card.setLayoutParams(cardParams);
-        // The close control belongs to the card, so it follows the card's left edge
-        // instead of sitting in the far corner of a window the card no longer fills.
-        if (playerClose != null && playerCloseParams != null) {
-            int side = widthPx <= 0 ? 0 : Math.max(0, (windowWidthPx - widthPx) / 2);
-            int margin = DesignTokens.dp(DesignTokens.CONTENT_PADDING_HORIZONTAL) + side;
-            if (playerCloseParams.leftMargin != margin) {
-                playerCloseParams.leftMargin = margin;
-                playerClose.setLayoutParams(playerCloseParams);
-            }
+        // A phone has no column maximum, so the card would run edge to edge and its
+        // dark well would read as "the whole screen changed colour" rather than as a
+        // panel. The page gutter becomes the scroller's padding: the card keeps the
+        // same width on both forms, and on a tablet the capped column already
+        // carries its own margins so nothing is subtracted twice.
+        int gutter = widthPx <= 0 && window != null
+                ? DesignTokens.dp(window.gutterDp()) : 0;
+        int playerBottom = DesignTokens.dp(DesignTokens.CONTENT_PADDING_BOTTOM) + insets.bottom;
+        if (playerScroller != null
+                && (playerScroller.getPaddingLeft() != gutter
+                || playerScroller.getPaddingRight() != gutter
+                || playerScroller.getPaddingBottom() != playerBottom)) {
+            playerScroller.setPadding(gutter, 0, gutter, playerBottom);
         }
     }
 
@@ -1357,12 +1514,56 @@ public final class MainActivity extends Activity
         int left = DesignTokens.dp(horizontalDp);
         int right = left;
         int top = DesignTokens.dp(DesignTokens.CONTENT_PADDING_TOP) + insets.top;
-        int bottom = DesignTokens.dp(DesignTokens.CONTENT_PADDING_BOTTOM);
+        int bottom = contentBottomPadding();
         if (content.getPaddingLeft() == left && content.getPaddingTop() == top
                 && content.getPaddingRight() == right && content.getPaddingBottom() == bottom) {
             return;
         }
         content.setPadding(left, top, right, bottom);
+    }
+
+    /**
+     * How much room the last row of a list needs below it.
+     *
+     * <p><b>The bar is drawn over the page, not under it.</b> The navigation bar
+     * and the strip sit in the same frame as the content and float over it, so the
+     * last row of every list was scrolling straight underneath them and stopping
+     * with its title hidden — which does not read as "there is more below", it
+     * reads as a list whose last item is broken.
+     *
+     * <p>So the page carries the bar's height as bottom padding, and the card in
+     * the player carries the same breathing room. Both are what make the last thing
+     * on the screen the last thing you can read.
+     *
+     * <p>The bar's real height is preferred over the sum of its tokens because the
+     * strip appears and disappears with playback; the token sum is the floor for the
+     * first layout, when nothing has been measured yet.
+     */
+    private int contentBottomPadding() {
+        int bar = bottomBar == null ? 0 : bottomBar.getHeight();
+        int floor = DesignTokens.dp(DesignTokens.MINI_PLAYER_HEIGHT
+                + DesignTokens.BOTTOM_NAV_HEIGHT);
+        return DesignTokens.dp(DesignTokens.CONTENT_PADDING_BOTTOM) + Math.max(bar, floor);
+    }
+
+    /**
+     * Re-applies the bottom reserve after the bar changes shape.
+     *
+     * <p>Called when the strip appears or disappears, because a strip that is
+     * 56&nbsp;dp shorter than the one that was there before it is 56&nbsp;dp of
+     * page that the last row would otherwise slide under again.
+     */
+    private void syncBottomBarPadding() {
+        if (content == null) return;
+        int bottom = contentBottomPadding();
+        if (content.getPaddingBottom() == bottom) return;
+        content.setPadding(content.getPaddingLeft(), content.getPaddingTop(),
+                content.getPaddingRight(), bottom);
+        int gutter = playerScroller == null ? 0 : playerScroller.getPaddingLeft();
+        int playerBottom = DesignTokens.dp(DesignTokens.CONTENT_PADDING_BOTTOM) + insets.bottom;
+        if (playerScroller != null && playerScroller.getPaddingBottom() != playerBottom) {
+            playerScroller.setPadding(gutter, 0, gutter, playerBottom);
+        }
     }
 
     /** Insets the system has handed us, in pixels; zero until it does. */

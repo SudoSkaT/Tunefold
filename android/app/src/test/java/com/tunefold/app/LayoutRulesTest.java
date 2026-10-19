@@ -91,10 +91,21 @@ public class LayoutRulesTest {
         }
     }
 
-    @Test public void aLandscapeWindowComposesInTwoRegions() {
-        assertTrue(LayoutRules.of(796, 360, 360, true).twoColumnPlayer());
-        assertFalse(smallPhone().twoColumnPlayer());
-    }
+/**
+ * A window wide enough for two regions, and tall enough to hold both of them.
+ *
+ * <p>Measured on a device in landscape: with the split on, the card was taller than
+ * the display with the cover centred inside it, so the details sat at the top of the
+ * screen and the cover half a screen below, and neither could be seen with the
+ * other. Height is therefore part of earning the split, not just width.
+ */
+@Test public void aWideWindowSplitsOnlyWhenItCanHoldBothRegions() {
+    assertTrue("a tablet in landscape has the height for it",
+            LayoutRules.of(1280, 800, 1280, true).twoColumnPlayer());
+    assertFalse("a landscape phone cannot hold both regions",
+            LayoutRules.of(796, 360, 360, true).twoColumnPlayer());
+    assertFalse(smallPhone().twoColumnPlayer());
+}
 
     @Test public void aLargeScreenAlsoComposesInTwoRegions() {
         // A portrait tablet: wide enough that a cover beside its details beats one

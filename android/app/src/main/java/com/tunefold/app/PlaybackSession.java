@@ -823,6 +823,19 @@ final class PlaybackSession {
      * and was written when the cover was known; the like's copy is a label remembered
      * for a membership.
      */
+    /**
+     * The duration remembered for an identity, or {@code -1} when unknown.
+     *
+     * <p>Same shape as {@link #thumbnailFor} and for the same reason: a member that
+     * nothing is playing about has no track object left, and the only thing that
+     * survives the process is what the library remembered. Without the duration the
+     * player of a downloaded track showed an unknown total and a bar that would not
+     * move.
+     */
+    private long durationFor(TrackKey key) {
+        return library.durationFor(key);
+    }
+
     private String thumbnailFor(TrackKey key) {
         String downloaded = downloader == null ? null : downloader.registry().thumbnailOf(key);
         if (downloaded != null && !downloaded.isEmpty()) return downloaded;
@@ -871,7 +884,7 @@ final class PlaybackSession {
         // providerId must stay the real identity: it is what the download registry
         // and the queue key on. Only the display fields are synthesised.
         return new MediaTrack(key.provider(), key.providerTrackId(), trackTitle(key),
-                "", "", "", "", -1, thumbnailFor(key), sourceFor(key), "{}");
+                "", "", "", "", durationFor(key), thumbnailFor(key), sourceFor(key), "{}");
     }
 
     // ------------------------------------------------------------- download

@@ -40,6 +40,39 @@ public class LyricTrackTest {
         assertEquals("Second line", text(track.activeAt(8999L)));
     }
 
+    /**
+     * La letra se busca por detrás de la posición del decodificador.
+     *
+     * <p>La posición que llega al reproductor cuenta fotogramas entregados al
+     * decodificador, que van por delante de los que han salido por el altavoz. Buscar
+     * la línea en esa cifra cruda encendía la línea <em>siguiente</em> a la que se
+     * canta: en una frase de tres segundos, un verso entero de adelanto.
+     *
+     * <p>Se prueba justo en el borde, que es donde se nota: un milisegundo antes del
+     * cambio de línea la vista tiene que seguir en la anterior.
+     */
+    @Test public void theLineShownLagsTheDecoderSoItMatchesTheVoice() {
+        LyricTrack track = LyricTrack.parse("id", RESPONSE);
+        long secondStartsAtEngine = 4000L + DesignTokens.LYRIC_LEAD_MS;
+
+        assertEquals("Second line", text(track.activeAt(NowPlayingView
+                .lyricPositionFor(secondStartsAtEngine))));
+        assertEquals("First line", text(track.activeAt(NowPlayingView
+                .lyricPositionFor(secondStartsAtEngine - 1L))));
+        // El retraso tampoco apaga antes de tiempo la línea que ya está sonando:
+        // sigue en pantalla durante toda su duración, no se va medio verso antes.
+        assertEquals("Second line", text(track.activeAt(NowPlayingView
+                .lyricPositionFor(8_999L + DesignTokens.LYRIC_LEAD_MS))));
+    }
+
+    /** El retraso nunca puede empujar la búsqueda por debajo del principio. */
+    @Test public void theCompensationNeverGoesBeforeTheStartOfTheSong() {
+        assertEquals(0L, NowPlayingView.lyricPositionFor(0L));
+        assertEquals(0L, NowPlayingView.lyricPositionFor(DesignTokens.LYRIC_LEAD_MS));
+        assertEquals(1L, NowPlayingView.lyricPositionFor(DesignTokens.LYRIC_LEAD_MS + 1L));
+        assertEquals(0L, NowPlayingView.lyricPositionFor(-5_000L));
+    }
+
     @Test public void nothingIsSungBeforeTheFirstLine() {
         LyricTrack track = LyricTrack.parse("id", RESPONSE);
         assertNull(track.activeAt(0L));

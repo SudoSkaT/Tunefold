@@ -238,11 +238,12 @@ public class DesignTokensTest {
      * A bar field too short cannot show bars, and one too tall pushes the
      * transport off a short window.
      *
-     * <p>The floor is one lane, not two: the player draws a single row and spends
-     * what the second one used to take on the lyric being sung.
+     * <p>One band, not two: the figure is a single row of bars carrying the
+     * envelope of both channels, and the height it gives back is spent on the
+     * lyric, which says more than a second channel drawn.
      */
-    @Test public void theSoundBarsAreAUsableBand() {
-        assertTrue("a lane needs room", DesignTokens.SOUNDBARS_HEIGHT >= 32f);
+@Test public void theSoundBarsAreAUsableBand() {
+        assertTrue("a band needs room", DesignTokens.SOUNDBARS_HEIGHT >= 32f);
         assertTrue("and not the whole card", DesignTokens.SOUNDBARS_HEIGHT <= 96f);
         assertTrue("the compact band keeps the proportion of the normal one",
                 DesignTokens.SOUNDBARS_HEIGHT_COMPACT <= DesignTokens.SOUNDBARS_HEIGHT);
@@ -250,6 +251,53 @@ public class DesignTokensTest {
                 DesignTokens.SOUNDBARS_BAR_GAP > 0f);
         assertTrue("bars must be drawn, not hinted",
                 DesignTokens.SOUNDBARS_BAR_PITCH > DesignTokens.SOUNDBARS_BAR_GAP);
+    }
+
+    /**
+     * A printed rule that cannot be seen is not a rule.
+     *
+     * <p>Every rule in the app —the masthead's, the heading's, the selected tab's,
+     * the selected destination's— is this thickness, so a rule thinner than a
+     * physical pixel disappears against a cover and a thicker one stops being a
+     * rule. Asserted so raising or lowering it is a decision, not an accident.
+     */
+    @Test public void aRuleIsVisibleWithoutBecomingAnEdge() {
+        assertTrue("a rule below a pixel is not drawn", DesignTokens.RULE_THICKNESS >= 1f);
+        assertTrue("a rule thicker than a hairline is an edge",
+                DesignTokens.RULE_THICKNESS <= DesignTokens.SPACE_4);
+        assertTrue("the navigation marker must fit inside a slot",
+                DesignTokens.NAV_INDICATOR_WIDTH > 0f
+                        && DesignTokens.NAV_INDICATOR_WIDTH < DesignTokens.CONTROL_TARGET_NAVIGATION);
+    }
+
+    /**
+     * The display level has to be able to hold the wordmark.
+     *
+     * <p>The masthead sets nine tracked capitals at this size; a size below the
+     * body type would put the product's name in the same voice as a track's
+     * attribution, which is the hierarchy this token exists to create.
+     */
+    @Test public void theDisplayLevelIsAboveTheTitle() {
+        assertTrue("the brand must outrank a track's name",
+                DesignTokens.TYPE_DISPLAY_SIZE > DesignTokens.TYPE_TITLE_SIZE);
+        assertTrue("the brand is set in wide capitals",
+                DesignTokens.TYPE_DISPLAY_TRACKING > 0f);
+    }
+
+    /**
+     * A row cover has to carry enough of the sleeve to be recognised.
+     *
+     * <p>Below about fifty dp a cover stops being a picture and becomes a colour
+     * chip, and the row then says "dark square, small type" for every track in the
+     * library.
+     */
+    @Test public void aRowCoverIsBigEnoughToBeAPicture() {
+        assertTrue("a row cover below 48dp is a chip, not a sleeve",
+                DesignTokens.ARTWORK_THUMB >= 48f);
+        assertTrue("and it still leaves the row room for words",
+                DesignTokens.ARTWORK_THUMB < DesignTokens.ROW_HEIGHT);
+        assertTrue("and it is not confused with the player's cover",
+                DesignTokens.ARTWORK_THUMB < DesignTokens.ARTWORK_MIN);
     }
 
     /**

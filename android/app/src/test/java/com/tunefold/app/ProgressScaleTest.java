@@ -1,6 +1,7 @@
 package com.tunefold.app;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
@@ -74,5 +75,22 @@ public class ProgressScaleTest {
 
     @Test public void negativePositionsReadAsZero() {
         assertEquals(0L, ProgressScale.displayedSecond(-1_000L));
+    }
+
+    /**
+     * Un total desconocido no puede decir "0:00".
+     *
+     * <p>El total se quedaba con el texto de constructor mientras el elapsed seguía
+     * contando, y la pantalla afirmaba que la canción duraba cero segundos sin haber
+     * dejado de sonarla. Quien lee el total para saber cuánto queda merece una
+     * ausencia declarada antes que un número falso.
+     */
+    @Test public void anUnknownTotalIsNeverRenderedAsZeroSeconds() {
+        assertFalse("0:00".equals(ProgressControl.totalFor(0L)));
+        assertFalse("0:00".equals(ProgressControl.totalFor(-1L)));
+        assertFalse("0:00".equals(ProgressControl.totalFor(Long.MIN_VALUE)));
+        // Y una duración de verdad sigue saliendo como siempre.
+        assertEquals("3:00", ProgressControl.totalFor(180_000L));
+        assertEquals("0:00", ProgressControl.totalFor(1L));
     }
 }

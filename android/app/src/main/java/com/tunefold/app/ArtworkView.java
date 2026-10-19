@@ -18,6 +18,17 @@ import android.view.ViewOutlineProvider;
  * and {@code NowPlayingView}: the placeholder, the swap, the identity guard against a
  * late decode, and the square constraint.
  *
+ * <h3>The placeholder is part of the design, not a loading state</h3>
+ * A track with no cover, or one whose cover has not arrived, is a state this app
+ * shows constantly — an empty library, a slow connection, a remembered track from a
+ * session that is gone. A flat grey rectangle in that moment says "something is
+ * missing"; what it should say is "this is a sleeve, we just have not seen it yet".
+ * So the placeholder is a printed one: a warm wood field, an inset rule at the
+ * margin of a sleeve, and a mark in the middle that says which app is speaking. It
+ * is built once per width and reused, so a scrolling list of unknown covers costs
+ * one gradient and two rectangles each — the same cost the flat rectangle used to
+ * cost, minus the design debt.
+ *
  * <h3>Why it is cheap</h3>
  * <ul>
  *   <li>the placeholder is one {@link Paint} with a gradient rebuilt only when the
@@ -34,9 +45,12 @@ import android.view.ViewOutlineProvider;
 final class ArtworkView extends View {
 
     private final Paint placeholder = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint sleeveRule = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint sleeveMark = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint cover = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
     private final Rect destination = new Rect();
     private final Rect source = new Rect();
+    private final android.graphics.RectF rule = new android.graphics.RectF();
 
     /** Identity the displayed cover belongs to; empty while showing the placeholder. */
     private String coverId = "";
@@ -52,6 +66,13 @@ final class ArtworkView extends View {
         DesignTokens.init(context);
         cornerRadius = DesignTokens.dp(DesignTokens.RADIUS_LARGE);
         placeholder.setColor(DesignTokens.Palette.SURFACE_ARTWORK);
+        sleeveRule.setStyle(Paint.Style.STROKE);
+        sleeveRule.setColor(DesignTokens.Palette.HAIRLINE);
+        sleeveMark.setColor(DesignTokens.scaleAlpha(DesignTokens.Palette.ON_SURFACE,
+                DesignTokens.Palette.ALPHA_HAIRLINE * 3f));
+        sleeveMark.setStyle(Paint.Style.STROKE);
+        sleeveMark.setStrokeCap(Paint.Cap.ROUND);
+        sleeveMark.setStrokeJoin(Paint.Join.ROUND);
         setOutlineProvider(new ViewOutlineProvider() {
             @Override public void getOutline(View view, Outline outline) {
                 outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), cornerRadius);
@@ -157,7 +178,68 @@ final class ArtworkView extends View {
             gradientForWidth = width;
         }
         canvas.drawRect(0f, 0f, width, height, placeholder);
+        drawSleeve(canvas, width, height);
     }
+
+    /**
+     * The printed sleeve: an inset rule and a mark, drawn over the placeholder.
+     *
+     * <p>Two rectangles and two short strokes, all with paints built once: no text
+     * to measure, no bitmap, no shader. What it buys is that a cover which never
+     * arrives looks like a sleeve waiting for its photograph rather than like a
+     * hole in the layout — and the mark is the only place in the app where the
+     * product says its own name without a word of it.
+     *
+     * <p>The mark scales with the view, so a 56dp row thumbnail gets a small mark
+     * and the player's 300dp cover gets a large one, and neither is a different
+     * drawing.
+     */
+    private void drawSleeve(Canvas canvas, int width, int height) {
+        float inset = Math.max(DesignTokens.dp(DesignTokens.SPACE_2), width * 0.07f);
+        rule.set(inset, inset, width - inset, height - inset);
+        sleeveRule.setStrokeWidth(Math.max(1f, width * 0.006f));
+        canvas.drawRoundRect(rule, width * 0.03f, width * 0.03f, sleeveRule);
+        // Below a row thumbnail the mark is smaller than the stroke that draws it,
+        // so a list of 56dp covers would be paying for noise. The rule alone still
+        // says "printed sleeve" at that size.
+        if (width < DesignTokens.dp(DesignTokens.ARTWORK_THUMB)) return;
+        // A pair of stacked rules with a play marker beside them: the transport
+        // glyphs, so the placeholder is drawn with the product's own vocabulary
+        // instead of a generic image placeholder.
+        float side = width * 0.34f;
+        float unit = side / 24f;
+        float left = inset + side * 0.16f;
+        float top = (height - side) / 2f;
+        sleeveMark.setStrokeWidth(Math.max(1f, width * 0.012f));
+        canvas.drawLine(left, top + 6f * unit, left + side * 0.55f, top + 6f * unit,
+                sleeveMark);
+        canvas.drawLine(left, top + 11f * unit, left + side * 0.55f, top + 11f * unit,
+                sleeveMark);
+        canvas.drawLine(left, top + 16f * unit, left + side * 0.32f, top + 16f * unit,
+                sleeveMark);
+        // The marker is drawn in grid units, so the stroke it shares has to be in
+        // grid units too: the canvas scale multiplies it along with the geometry.
+        sleeveMark.setStrokeWidth(DesignTokens.ICON_STROKE * 0.9f);
+        canvas.save();
+        canvas.translate(left + side * 0.62f, top + 6.5f * unit);
+        canvas.scale(unit, unit);
+        canvas.drawPath(markerPath(), sleeveMark);
+        canvas.restore();
+    }
+
+    /** El triángulo del reproductor, en unidades de la rejilla de iconos. */
+    private android.graphics.Path markerPath() {
+        if (marker == null) {
+            marker = new android.graphics.Path();
+            marker.moveTo(2f, 1.5f);
+            marker.lineTo(11.5f, 6.5f);
+            marker.lineTo(2f, 11.5f);
+            marker.close();
+        }
+        return marker;
+    }
+
+    private android.graphics.Path marker;
 
     /** The centre square of {@code value}: cover art is always square, so that is what survives. */
     private Rect centreCrop(Bitmap value) {

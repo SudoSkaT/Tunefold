@@ -70,8 +70,19 @@ final class ArtworkPalette {
     private static final float MIN_SATURATION = 0.40f;
     /** Por debajo de esta luminosidad no se le puede poner contenido encima. */
     private static final float MIN_VALUE = 0.28f;
-    /** Por encima, el píxel es un brillo, no un color. */
-    private static final float MAX_VALUE = 0.96f;
+    /**
+     * El techo de luminosidad: 1.0, o sea ninguno.
+     *
+     * <p>Antes era 0.96 y parecía una regla de sentido común —"por encima de esto
+     * el píxel es un brillo, no un color"—, pero lo que hace que un píxel sea un
+     * brillo es que sea <b>poco saturado</b>, no que sea claro: el blanco y el gris
+     * claro ya se caen solos por {@link #MIN_SATURATION}. Con el techo en 0.96 una
+     * naranja o un amarillo puros (valor 1.0) se descartaban píxel a píxel, la
+     * extracción se quedaba sin nada que promediar y devolvía la marca: tres
+     * fundas de color devolvían el mismo oro. El brillo de verdad —el blanco, el
+     * halo de una foto— no se cuela por aquí, sino por la saturación.
+     */
+    private static final float MAX_VALUE = 1.0f;
     /** Saturación mínima del color final: el promedio la apaga y hay que devolverla. */
     private static final float MIN_RESULT_SATURATION = 0.45f;
     /**
@@ -83,7 +94,17 @@ final class ArtworkPalette {
      * que se les pide el contraste de un texto grande, no el de una etiqueta mínima.
      */
     private static final double MIN_BAR_CONTRAST = 3.0d;
-    private static final int BRAND = DesignTokens.Palette.ACCENT;
+    /**
+     * The accent of the theme in force, read at the moment it is asked for.
+     *
+     * <p>It used to be a {@code static final} captured at class-initialisation time,
+     * which quietly made every theme fall back to the first one's accent whenever a
+     * cover could not be made legible. A theme that cannot supply its own fallback
+     * is not really a theme.
+     */
+    private static int brand() {
+        return DesignTokens.Palette.ACCENT;
+    }
 
     private ArtworkPalette() { }
 
@@ -95,7 +116,7 @@ final class ArtworkPalette {
      * @return nunca nulo, y nunca un color ilegible
      */
     static Palette derive(int[] argb) {
-        if (argb == null || argb.length == 0) return Palette.brand(BRAND);
+        if (argb == null || argb.length == 0) return Palette.brand(brand());
         float[] sums = new float[HUE_BUCKETS * 3];
         int[] counts = new int[HUE_BUCKETS];
         float[] saturation = new float[HUE_BUCKETS];
@@ -114,7 +135,7 @@ final class ArtworkPalette {
             hue[bucket] += hsv[0];
         }
         int first = best(counts, saturation, -1);
-        if (first < 0) return Palette.brand(BRAND);
+        if (first < 0) return Palette.brand(brand());
         int second = best(counts, saturation, first);
         int primaryColor = averageOf(sums, counts, first);
         int secondaryColor = second >= 0 ? averageOf(sums, counts, second) : primaryColor;
@@ -140,21 +161,28 @@ final class ArtworkPalette {
      * botón de reproducción lleva contenido oscuro encima y necesita esta garantía.
      */
     static int lift(int color) {
-        if (luminance(color) >= MIN_ACCENT_LUMINANCE) return color;
-        int low = 0;
-        int high = 1_000;
-        int best = 0xFFFFFFFF;
-        while (low <= high) {
-            int middle = (low + high) / 2;
-            int candidate = DesignTokens.mix(color, 0xFFFFFFFF, middle / 1000f);
-            if (luminance(candidate) >= MIN_ACCENT_LUMINANCE) {
-                best = candidate;
-                high = middle - 1;
-            } else {
-                low = middle + 1;
+        int byFloor = color;
+        if (luminance(byFloor) < MIN_ACCENT_LUMINANCE) {
+            int low = 0;
+            int high = 1_000;
+            int best = 0xFFFFFFFF;
+            while (low <= high) {
+                int middle = (low + high) / 2;
+                int candidate = DesignTokens.mix(color, 0xFFFFFFFF, middle / 1000f);
+                if (luminance(candidate) >= MIN_ACCENT_LUMINANCE) {
+                    best = candidate;
+                    high = middle - 1;
+                } else {
+                    low = middle + 1;
+                }
             }
+            byFloor = best;
         }
-        return best;
+        // El suelo de luminosidad no basta por sí solo: lo que tiene que leerse es
+        // el glifo que va ENCIMA del disco, y ese depende del tema. Un disco que
+        // cumple el suelo y no el contraste es un disco con el glifo invisible, que
+        // es el peor estado posible en el control que más se pulsa.
+        return ColorMath.readable(byFloor, DesignTokens.Palette.ON_ACCENT, 4.5d);
     }
 
     /**
@@ -188,29 +216,41 @@ final class ArtworkPalette {
     }
 
     /**
-     * Sube el valor del color hasta que se lea sobre la tarjeta.
+     * Deja el color de una funda legible sobre la tarjeta donde se dibujan las
+     * barras.
      *
-     * <p>Se sube la luminosidad y no se mezcla con el blanco: mezclarse bajaría el
-     * croma justo lo que {@link #vivid} acaba de recuperar, y el resultado sería
-     * otra vez el rosa pálido que motivated todo esto.
+     * <p>Delega en {@link ColorMath#readable}, que mueve el <b>valor</b> en vez de
+     * mezclar con blanco: mezclar con blanco baja el croma justo lo que
+     * {@link #vivid} acaba de recuperar, y el resultado sería otra vez el rosa
+     * pálido que motivó todo esto.
+     *
+     * <p>Y hay un caso que el movimiento de valor sólo no resuelve. Un azul
+     * profundo o un carmesí muy saturados no ganan luminosidad subiendo el valor —
+     *al 100% de saturación el canal del medio sigue en el suelo—, así que no hay
+     *ningún valor que los lleve a 3:1 contra la tarjeta. Antes de que existiera
+     * este recorrido, esa combinación caía al final de la función y devolvía el
+     * acento de marca: tres fundas azules, carmesí y púrpuras salían las tres
+     * doradas, que es exactamente el defecto que estas pruebas existen para
+     * cazar.
+     *
+     * <p>La salida es subir el croma del color original hasta
+     * {@link #MIN_RESULT_SATURATION} y volver a intentarlo: el matiz se conserva
+     * entero y el color deja de ser un gris. El suelo garantiza que siga siendo un
+     * color y no una sombra.
      */
     static int readableOnCard(int color) {
-        if (contrast(color, DesignTokens.Palette.SURFACE_CARD) >= MIN_BAR_CONTRAST) return color;
+        int repaired = ColorMath.readable(color, DesignTokens.Palette.SURFACE_CARD,
+                MIN_BAR_CONTRAST);
+        if (repaired == color) return color;
         float[] hsv = new float[3];
-        float[] rgb = new float[3];
         toHsv(color, hsv);
-        int alpha = DesignTokens.Palette.ACCENT & 0xFF000000;
-        for (float value = hsv[2]; value <= 1f; value += 0.02f) {
-            hsv[2] = value;
-            fromHsv(hsv, rgb);
-            int candidate = alpha | opaque(rgb[0]) << 16 | opaque(rgb[1]) << 8 | opaque(rgb[2]);
-            if (contrast(candidate, DesignTokens.Palette.SURFACE_CARD) >= MIN_BAR_CONTRAST) {
-                return candidate;
-            }
-        }
-        // Ni el blanco llega al contraste pedido sobre una tarjeta clara: la marca
-        // es el suelo conocido, y es un hecho que se puede defender.
-        return DesignTokens.Palette.ACCENT;
+        toHsv(repaired, hsv);
+        // Alcanzó el contraste moviendo el valor, que conserva matiz y croma: la
+        // funda sigue siendo la funda y no hay nada que arreglar.
+        if (hsv[1] >= MIN_RESULT_SATURATION - 0.01f) return repaired;
+        return ColorMath.readable(
+                ColorMath.resaturate(color, MIN_RESULT_SATURATION),
+                DesignTokens.Palette.SURFACE_CARD, MIN_BAR_CONTRAST);
     }
 
     /** Devuelve al croma que el promedio se llevó. */
@@ -258,48 +298,19 @@ final class ArtworkPalette {
         return channel < 0 ? 0 : channel > 255 ? 255 : channel;
     }
 
-    /** {@code pixel} → HSV, con matiz en grados y saturación/valor en 0..1. */
+    /**
+     * {@code pixel} → HSV, con matiz en grados y saturación/valor en 0..1.
+     *
+     * <p>Delega en {@link ColorMath} para que la conversión exista una sola vez: la
+     * resolución de temas la necesita también, y dos copias de un HSV divergen
+     * justo en el último decimal.
+     */
     static void toHsv(int pixel, float[] out) {
-        float red = ((pixel >> 16) & 0xFF) / 255f;
-        float green = ((pixel >> 8) & 0xFF) / 255f;
-        float blue = (pixel & 0xFF) / 255f;
-        float max = Math.max(red, Math.max(green, blue));
-        float min = Math.min(red, Math.min(green, blue));
-        float delta = max - min;
-        float hue;
-        if (delta <= 0f) {
-            hue = 0f;
-        } else if (max == red) {
-            hue = 60f * (((green - blue) / delta) % 6f);
-        } else if (max == green) {
-            hue = 60f * (((blue - red) / delta) + 2f);
-        } else {
-            hue = 60f * (((red - green) / delta) + 4f);
-        }
-        out[0] = hue < 0f ? hue + 360f : hue;
-        out[1] = max <= 0f ? 0f : delta / max;
-        out[2] = max;
+        ColorMath.toHsv(pixel, out);
     }
 
     /** HSV → `rgb` en 0..255. */
     static void fromHsv(float[] hsv, float[] rgb) {
-        float hue = ((hsv[0] % 360f) + 360f) % 360f;
-        float saturation = Math.max(0f, Math.min(1f, hsv[1]));
-        float value = Math.max(0f, Math.min(1f, hsv[2]));
-        float chroma = value * saturation;
-        float match = value - chroma;
-        float sector = hue / 60f;
-        float second = chroma * (1f - Math.abs(sector % 2f - 1f));
-        switch ((int) sector) {
-            case 0: rgb[0] = chroma + match; rgb[1] = second + match; rgb[2] = match; break;
-            case 1: rgb[0] = second + match; rgb[1] = chroma + match; rgb[2] = match; break;
-            case 2: rgb[0] = match; rgb[1] = chroma + match; rgb[2] = second + match; break;
-            case 3: rgb[0] = match; rgb[1] = second + match; rgb[2] = chroma + match; break;
-            case 4: rgb[0] = second + match; rgb[1] = match; rgb[2] = chroma + match; break;
-            default: rgb[0] = chroma + match; rgb[1] = match; rgb[2] = second + match; break;
-        }
-        for (int channel = 0; channel < 3; channel++) {
-            rgb[channel] = Math.max(0f, Math.min(255f, rgb[channel] * 255f));
-        }
+        ColorMath.fromHsv(hsv, rgb);
     }
 }

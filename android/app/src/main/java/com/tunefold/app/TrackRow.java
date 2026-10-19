@@ -132,11 +132,15 @@ final class TrackRow extends LinearLayout {
         // not operated, and the two actions it does offer live in one place: the
         // overflow. Two always-present buttons per row is also two always-present
         // focus stops in a list of fifty.
+        //
+        // Linen rather than the faint role: this word is a value the user reads
+        // (SAVED, FAILED, SAVING 42%), not a placeholder, and the faint role stops
+        // at 3.5:1 on the page field.
         status = new TextView(context);
         status.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_CAPTION_SIZE);
         status.setLetterSpacing(DesignTokens.TYPE_LABEL_TRACKING);
         status.setMaxLines(1);
-        status.setTextColor(DesignTokens.Palette.ON_SURFACE_FAINT);
+        status.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
         status.setGravity(Gravity.CENTER);
         LayoutParams statusParams = new LayoutParams(LayoutParams.WRAP_CONTENT,
                 DesignTokens.dp(DesignTokens.ROW_STATUS_HEIGHT));
@@ -447,10 +451,20 @@ final class TrackRow extends LinearLayout {
         }
     }
 
-    /** Marks the row as the one currently playing. */
+    /**
+     * Marks the row as the one currently playing.
+     *
+     * <p>Two signals, not one. A bold weight says "this is the one" only to someone
+     * looking for it, and colour alone would say it only to someone who can see
+     * colour — so the weight marks the text and the row's own affordance takes the
+     * accent, which is the same mark the player itself is wearing for this track.
+     * Driven explicitly rather than left to a parent's activated flag reaching a
+     * child by whatever rule the platform happens to apply.
+     */
     void setActiveTrack(boolean active) {
         if (isActivated() == active) return;
         setActivated(active);
         title.setTypeface(active ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
+        overflow.setToggleState(active);
     }
 }

@@ -48,6 +48,18 @@ final class LayoutRules {
      */
     static final int SHORT_WINDOW_DP = 480;
 
+    /**
+     * Height at or above which a window may compose the player in two regions, in
+     * {@code dp}.
+     *
+     * <p>Six hundred, and not the short-window threshold: a split composition needs
+     * room for two columns that are both worth looking at, and the metadata column
+     * of this player —title, state, bars, transport, three shelves— is taller than
+     * four hundred and eighty no matter how narrow it is. Below this the cover goes
+     * beside nothing and the window composes in one column.
+     */
+    static final int TWO_COLUMN_MIN_HEIGHT_DP = 600;
+
     // ----------------------------------------------------------------- bounds
 
     /**
@@ -68,6 +80,22 @@ final class LayoutRules {
     static final int ARTWORK_MAX_COMPACT_DP = 420;
     static final int ARTWORK_MAX_MEDIUM_DP = 480;
     static final int ARTWORK_MAX_EXPANDED_DP = 540;
+
+    /**
+     * The share of a <em>short</em> window's height the cover may take, in {@code dp}.
+     *
+     * <p>A landscape phone composes in two regions: the cover on one side, the words
+     * and the transport on the other, and the card is as tall as the taller of the
+     * two. The words column is unavoidably tall — title, state, progress, transport,
+     * the shelf — so a cover sized at 88% of a 360&nbsp;dp window did not fit beside
+     * anything: the composition became a very large cover and a narrow strip of
+     * controls, and the column beside it was mostly the gap the gutter leaves.
+     *
+     * <p>Below this share both regions are the same order of magnitude, which is
+     * what makes the split read as one composition instead of a picture with a
+     * footnote.
+     */
+    static final float ARTWORK_SHORT_HEIGHT_RATIO = 0.62f;
 
     /** Air added between blocks per step, on the screens that have room for it. */
     static final float SPACING_STEP_DP = 4f;
@@ -137,11 +165,23 @@ final class LayoutRules {
         /**
          * Whether the player is composed as two regions side by side.
          *
-         * <p>Landscape, or a window wide enough that a cover beside its details
-         * beats a cover above them. A short <em>portrait</em> window is not: the
-         * cover is the first thing to give up, not the first thing to move.
+         * <p>A split needs <em>both</em> regions on screen at once, or it is not a
+         * composition — it is a cover that happens to be beside something. On a wide
+         * window that is tall enough to hold the metadata column, a cover beside its
+         * details beats a cover above them.
+         *
+         * <p>It is therefore off in a short window, and a landscape phone is the
+         * short window. Measured on a device in landscape, the split produced a
+         * card far taller than the display with the cover vertically centred inside
+         * it: the details were at the top of the screen and the cover was half a
+         * screen further down, so neither region could be seen with the other and
+         * the space beside the details was wasted. One column with a cover that
+         * gives up height is the arrangement that actually reads there.
          */
-        boolean twoColumnPlayer() { return landscape || form() >= FORM_MEDIUM; }
+        boolean twoColumnPlayer() {
+            if (heightDp < TWO_COLUMN_MIN_HEIGHT_DP) return false;
+            return landscape || form() >= FORM_MEDIUM;
+        }
 
         /**
          * How many steps of extra air this window earns; 0 on a phone.
@@ -214,7 +254,16 @@ final class LayoutRules {
             // A height budget only binds when the caller knows the height. A caller
             // that does not (the first layout, before anything has been measured)
             // gets the width rule alone, which is the safer of the two errors.
-            if (innerHeightDp > 0) side = Math.min(side, Math.round(innerHeightDp * heightShare));
+            if (innerHeightDp > 0) {
+                // The tighter budget is for the two-region composition only, because
+                // that is where it solves something: there the cover and the words
+                // share one row, and a cover sized off a short window's height puts
+                // the second region in a strip beside a picture. A short *portrait*
+                // window composes in one column and keeps the ordinary budget.
+                float budget = shortWindow() && twoColumnPlayer()
+                        ? ARTWORK_SHORT_HEIGHT_RATIO : heightShare;
+                side = Math.min(side, Math.round(innerHeightDp * budget));
+            }
             // Two regions share one row: the cover yields enough of it for the
             // metadata to exist at all. This is the rule that keeps "cover on the
             // left, everything else on the right" true at every width.

@@ -34,6 +34,13 @@ final class PlaybackDebugPanel {
         root = new LinearLayout(context);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setVisibility(View.GONE);
+        // It is a panel, so it gets the one raised surface in the app and a rule of
+        // its own: without them it was a run of monospace text floating in the page,
+        // which read as a glitch rather than as a tool somebody opened on purpose.
+        root.setBackground(MainActivity.roundDrawable(DesignTokens.Palette.SURFACE_OVERLAY,
+                DesignTokens.RADIUS_SMALL));
+        int pad = DesignTokens.dp(DesignTokens.SPACE_4);
+        root.setPadding(pad, pad, pad, pad);
 
         TextView header = new TextView(context);
         header.setText("Diagnostics");

@@ -66,7 +66,11 @@ final class SectionState extends LinearLayout {
 
         message = new TextView(context);
         message.setTextSize(TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_BODY_SIZE);
-        message.setTextColor(DesignTokens.Palette.ON_SURFACE_FAINT);
+        // Muted linen rather than the faint role: this sentence is the only thing
+        // the section has to say, and it sits right above the action that fixes it.
+        // Faint was for placeholders, and a placeholder that is the only content of
+        // a screen is a dead end wearing a label.
+        message.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
         message.setGravity(Gravity.CENTER);
         message.setVisibility(View.GONE);
         LayoutParams messageParams = new LayoutParams(LayoutParams.MATCH_PARENT,

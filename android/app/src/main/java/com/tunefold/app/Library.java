@@ -142,6 +142,13 @@ final class Library {
         if (track.providerUrl != null && !track.providerUrl.trim().isEmpty()) {
             sources.put(key, track.providerUrl.trim());
         }
+        // La duración también es de las cosas que una fila no puede sacar de la
+        // clave. Sin esto sólo vivía en memoria, mientras el proveedor la traía, y
+        // al reiniciar el proceso una descargada volvía a ser una identidad sin
+        // duración: el total del reproductor caía a "desconocido" y la barra se
+        // quedaba quieta en una canción que sí estaba sonando. Es el mismo motivo
+        // que la portada, y por eso se guarda igual que la portada.
+        if (track.durationMs > 0L) durations.put(key, track.durationMs);
     }
 
     /**
@@ -165,6 +172,7 @@ final class Library {
         labels.remove(key);
         thumbnails.remove(key);
         sources.remove(key);
+        durations.remove(key);
     }
 
     /** Number of L1K3D members. */
@@ -277,6 +285,7 @@ final class Library {
      *       of the line;</li>
      *   <li>{@code t} — the cover URL remembered for a member;</li>
      *   <li>{@code u} — the provider URL remembered for a member;</li>
+     *   <li>{@code d} — the duration in ms remembered for a member;</li>
      *   <li>{@code r} — a recently-played entry.</li>
      * </ul>
      *
@@ -315,6 +324,18 @@ final class Library {
                 if (!value.isEmpty()) thumbnails.put(key, value);
             } else if (kind == 'u') {
                 if (!value.isEmpty()) sources.put(key, value);
+            } else if (kind == 'd') {
+                // Un número, no un texto: cualquier cosa que no sea un entero
+                // positivo se considera desconocido en lugar de convertirse en 0,
+                // porque un 0 es un total que la app afirmaría y no sabe.
+                if (!value.isEmpty()) {
+                    try {
+                        long ms = Long.parseLong(value.trim());
+                        if (ms > 0L) durations.put(key, ms);
+                    } catch (NumberFormatException notANumber) {
+                        // Registro ilegible: se ignora, como cualquier otro.
+                    }
+                }
             } else if (kind == 'r') {
                 recent.add(key);
             }
@@ -324,6 +345,7 @@ final class Library {
         // keeps the rule independent of the order the records happen to be written in.
         dropUnremembered(thumbnails);
         dropUnremembered(sources);
+        durations.keySet().removeIf(key -> !liked.contains(key));
     }
 
     /** Forgets a remembered field whose identity is not a member any more. */
@@ -452,6 +474,15 @@ final class Library {
     private final java.util.Map<TrackKey, String> sources = new java.util.HashMap<>();
 
     /**
+     * Duración en ms recordada por identidad, o la ausencia de ella.
+     *
+     * <p>Un mapa de {@code Long} y no de {@code String} porque el valor es un número,
+     * y un número guardado como texto acaba impreso como un {@code 0} el día que
+     * quien lo lee lo parsee mal.
+     */
+    private final java.util.Map<TrackKey, Long> durations = new java.util.HashMap<>();
+
+    /**
      * One-line title.
      *
      * <p>Records are newline-delimited, so a line break in a title would forge a
@@ -460,6 +491,21 @@ final class Library {
      */
     private static String oneLine(String value) {
         return value.replace("\r\n", " ").replace('\n', ' ').replace('\r', ' ');
+    }
+
+    /**
+     * Duración recordada para una identidad, en ms, o {@code -1} si no se sabe.
+     *
+     * <p>Es lo que permite que una descargada siga con su tiempo después de un
+     * reinicio, cuando ya no queda ningún objeto de pista en memoria y la única
+     * identidad que sobrevive es la clave.
+     */
+    long durationFor(TrackKey key) {
+        if (key == null) return -1L;
+        synchronized (lock) {
+            Long known = durations.get(key);
+            return known == null ? -1L : known;
+        }
     }
 
     /** Label remembered for a liked identity, or {@code null} when unknown. */
@@ -510,6 +556,12 @@ final class Library {
                 // parsing exactly as it did.
                 appendField(text, 't', key, thumbnails.get(key));
                 appendField(text, 'u', key, sources.get(key));
+                Long duration = durations.get(key);
+                if (duration != null && duration > 0L) {
+                    text.append('d').append(SEPARATOR).append(key.provider())
+                            .append(SEPARATOR).append(key.providerTrackId())
+                            .append(SEPARATOR).append(duration).append('\n');
+                }
             }
             for (TrackKey key : recent) {
                 text.append('r').append(SEPARATOR).append(key.provider()).append(SEPARATOR)
@@ -535,6 +587,7 @@ final class Library {
             labels.clear();
             thumbnails.clear();
             sources.clear();
+            durations.clear();
             loaded = true;
             // Delegates to the one parser so tests cannot drift from disk.
             parse(text);

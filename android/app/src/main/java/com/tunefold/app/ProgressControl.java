@@ -28,6 +28,19 @@ final class ProgressControl extends LinearLayout {
     private final ProgressLineView line;
     private final TextView elapsed;
     private final TextView total;
+    /** Lo que se pone en el total cuando no se sabe cuánto dura la pista. */
+    private static final String UNKNOWN_TOTAL = "\u2014\u2014:";
+
+    /**
+     * "Todavía no he escrito nada", y no {@code -1}.
+     *
+     * <p>Con {@code -1} como centinela, una pista de duración desconocida llegaba con
+     * {@code durationMs == -1}, la comparación de la caché daba igual a igual y el
+     * total no se escribía nunca: se quedaba con el {@code "0:00"} del constructor.
+     * Un centinela que puede valer como dato es un centinela que algún día no
+     * distingue nada.
+     */
+    private static final long NOTHING_SHOWN = Long.MIN_VALUE;
 
     private final StringBuilder scratch = new StringBuilder(8);
     /** Segundo mostrado a la izquierda, o -1. */
@@ -35,7 +48,7 @@ final class ProgressControl extends LinearLayout {
     /** Identidad a la que pertenece el tiempo mostrado. */
     private TrackKey shownKey;
     /** Duración mostrada a la derecha, o -1. */
-    private long shownDuration = -1L;
+    private long shownDuration = NOTHING_SHOWN;
     /** Verdadero mientras la etiqueta izquierda muestra un destino, no la posición. */
     private boolean previewing;
     /** Color dado a la etiqueta izquierda, para no re-tintarla por fotograma. */
@@ -54,7 +67,7 @@ final class ProgressControl extends LinearLayout {
         LayoutParams lineParams = new LayoutParams(LayoutParams.MATCH_PARENT,
                 DesignTokens.dp(DesignTokens.PROGRESS_LINE_THICKNESS)
                         + DesignTokens.dp(DesignTokens.SOUNDBARS_HEAD_SIZE));
-        lineParams.topMargin = DesignTokens.dp(DesignTokens.SOUNDBARS_LANE_GAP);
+        lineParams.topMargin = DesignTokens.dp(DesignTokens.GAP_TIGHT);
         addView(line, lineParams);
 
         LinearLayout times = new LinearLayout(context);
@@ -123,13 +136,17 @@ final class ProgressControl extends LinearLayout {
             // sobrevive en la nueva, ni siquiera la duración.
             shownKey = key;
             shownSecond = -1L;
-            shownDuration = -1L;
+            shownDuration = NOTHING_SHOWN;
             previewing = false;
         }
-        if (durationMs > 0L && durationMs != shownDuration) {
+        // Una duración desconocida se dice que se desconoce. Se quedaba en el
+        // texto que ya traía el TextView —"0:00" deconstructor— mientras el elapsed
+        // seguía contando, así que la pantalla llegó a afirmar que una canción
+        // duraba cero segundos sin haber dejado de sonarla. Para quien lee esos
+        // números para saber cuánto queda, un total falso es peor que ninguno.
+        if (durationMs != shownDuration) {
             shownDuration = durationMs;
-            TimeFormat.time(durationMs, scratch);
-            total.setText(scratch.toString());
+            total.setText(totalFor(durationMs));
         }
         if (!previewing) {
             long second = ProgressScale.displayedSecond(positionMs);
@@ -142,11 +159,27 @@ final class ProgressControl extends LinearLayout {
         line.setPosition(positionMs, durationMs);
     }
 
+    /**
+     * Lo que dice el total para una duración dada.
+     *
+     * <p>Una duración desconocida se dice que se desconoce. El total se quedaba en
+     * el texto que traía el {@link TextView} —"0:00" de constructor— mientras el
+     * elapsed seguía contando, así que la pantalla llegó a afirmar que una canción
+     * duraba cero segundos sin haber dejado de sonarla. Para quien lee estos números
+     * para saber cuánto queda, un total falso es peor que ninguno.
+     *
+     * <p>Puro y sin vista, para que la regla se pueda comprobar en una prueba en vez
+     * de mirarla en un teléfono.
+     */
+    static String totalFor(long durationMs) {
+        return durationMs > 0L ? TimeFormat.time(durationMs) : UNKNOWN_TOTAL;
+    }
+
     /** Vacía la superficie; se usa cuando no suena nada. */
     void clear() {
         shownKey = null;
         shownSecond = -1L;
-        shownDuration = -1L;
+        shownDuration = NOTHING_SHOWN;
         previewing = false;
     }
 

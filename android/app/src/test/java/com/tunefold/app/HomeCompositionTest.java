@@ -91,6 +91,25 @@ public class HomeCompositionTest {
                 NowPlayingView.twoColumnFor(true, palette.derived));
     }
 
+    // ----------------------------------------------------- what a short window drops
+
+    /**
+     * In a window too short for everything, only the lyric goes.
+     *
+     * <p>The rule exists so it can be checked: the cover, the title, the state, the
+     * progress, the transport and the shelves all stay, because every one of them
+     * either carries a value or is an action. The lyric carries neither — it is
+     * context — so it is the one block that is allowed to be absent.
+     */
+    @Test public void onlyTheLyricYieldsInAShortWindow() {
+        assertFalse(NowPlayingView.lyricVisible(true, true));
+        assertTrue("a full window always has room for the line",
+                NowPlayingView.lyricVisible(false, true));
+        assertFalse("a track with no line shows no line in any window",
+                NowPlayingView.lyricVisible(false, false));
+        assertFalse(NowPlayingView.lyricVisible(true, false));
+    }
+
     // ------------------------------------------------------------ the palette
 
     /** The brand palette is not a cover offering two colours. */

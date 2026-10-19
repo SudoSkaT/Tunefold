@@ -173,8 +173,11 @@ public class LibraryTest {
         Library writer = new Library(directory);
         writer.toggleLiked(TestTracks.of("YouTube", "a", "Odd | Title\nSecond line", 1_000L));
         String document = writer.serialize();
-        assertEquals("a line break in a title cannot forge a second record", 1,
-                document.split("\n", -1).length - 1);
+        // Exactly one membership record. The document legitimately carries more lines
+        // than that (cover, source, duration); what must never happen is that the
+        // newline inside the title splits the membership record in two.
+        assertEquals("a line break in a title cannot forge a second membership record",
+                1, countRecords(document, 'l'));
 
         Library reader = new Library(directory);
         reader.loadFromForTest(document);
@@ -270,6 +273,61 @@ public class LibraryTest {
     // ------------------------------------------------------------ cover and source
 
     /** A track as the provider describes it: cover and source URL included. */
+    /**
+     * La duración de una descargada tiene que sobrevivir al proceso.
+     *
+     * <p>Sin esto la duración sólo vivía mientras el proveedor la traía en memoria.
+     * Al reiniciar, una descargada volvía a ser una identidad sin tiempo: el reproductor
+     * mostraba un total desconocido y una barra que no se movía en una canción que sí
+     * estaba sonando. Es el mismo contrato que la portada, y por eso tiene su prueba.
+     */
+    @Test public void aDurationSurvivesARestart() {
+        Library writer = new Library(directory);
+        writer.toggleLiked(described("a"));
+        writer.awaitWritesForTest();
+
+        Library reader = new Library(directory);
+        reader.loadFromForTest(readLibraryFile());
+        assertEquals(213_000L, reader.durationFor(TrackKey.of("YouTube", "a")));
+    }
+
+    /**
+     * Una duración desconocida se queda sin conocer.
+     *
+     * <p>Un 0 sería un total que la app afirmaría, y la app no lo sabe. Peor: el
+     * reproductor lo enseñaría como si fuera verdad.
+     */
+    @Test public void anUnknownDurationIsNeverStoredAsZero() {
+        Library writer = new Library(directory);
+        MediaTrack noDuration = new MediaTrack("YouTube", "z", "Sin tiempo", "Artist", "",
+                "", "artist", 0L, "", "", "{}");
+        writer.toggleLiked(noDuration);
+        writer.awaitWritesForTest();
+
+        Library reader = new Library(directory);
+        reader.loadFromForTest(readLibraryFile());
+        assertEquals("una duración no conocida no se inventa", -1L,
+                reader.durationFor(TrackKey.of("YouTube", "z")));
+    }
+
+    /** Dar de baja una canción se lleva su duración con ella. */
+    @Test public void unlikingForgetsTheDuration() {
+        Library writer = new Library(directory);
+        writer.toggleLiked(described("a"));
+        assertEquals(213_000L, writer.durationFor(TrackKey.of("YouTube", "a")));
+        writer.toggleLiked(TestTracks.of("YouTube", "a"));
+        assertEquals(-1L, writer.durationFor(TrackKey.of("YouTube", "a")));
+    }
+
+    /** How many records of one kind a serialized library holds. */
+    private static int countRecords(String document, char kind) {
+        int found = 0;
+        for (String line : document.split("\n")) {
+            if (!line.isEmpty() && line.charAt(0) == kind) found++;
+        }
+        return found;
+    }
+
     private static MediaTrack described(String id) {
         return new MediaTrack("YouTube", id, "Nice Title", "Artist", "", "", "artist",
                 213_000L, "https://img.example/" + id + ".jpg",
@@ -379,8 +437,10 @@ public class LibraryTest {
         writer.awaitWritesForTest();
 
         String document = readLibraryFile();
-        assertEquals("three records: membership, cover and source",
-                3, document.split("\n", -1).length - 1);
+        // Four records: membership, cover, source and duration. Each is its own line
+        // so a file written before any of them existed keeps parsing as it did.
+        assertEquals("four records: membership, cover, source and duration",
+                4, document.split("\n", -1).length - 1);
 
         Library reader = new Library(directory);
         reader.loadFromForTest(document);
