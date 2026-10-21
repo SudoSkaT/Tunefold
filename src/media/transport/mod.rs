@@ -14,10 +14,12 @@
 //! | [`TransportFailure`]| fallo clasificado sin detalles sensibles       |
 //!
 //! Validación por respuesta (nada se acepta en silencio): 206 esperado con
-//! Content-Range coherente; 200 solo tolerado si ignora el primer rango desde
-//! 0 (modo archivo-completo); truncamiento ⇒ reintento transitorio acotado;
-//! 403 posicional ⇒ restricción del servidor (no cuota por IP: ver probes);
-//! 416 ⇒ fin de archivo o respuesta inválida según posición.
+//! Content-Range coherente; 200 con `Content-Length` solo tolerado si ignora
+//! el primer rango desde 0 (modo archivo-completo); 200 sin longitud ⇒ modo
+//! secuencial de radio: se lee la ventana pedida y el cuerpo se mantiene
+//! abierto para las siguientes, sin seek. Truncamiento ⇒ reintento transitorio
+//! acotado; 403 posicional ⇒ restricción del servidor (no cuota por IP: ver
+//! probes); 416 ⇒ fin de archivo o respuesta inválida según posición.
 //!
 //! Observabilidad: cada petición registra request id, host (nunca la URL
 //! completa ni parámetros firmados), rango pedido, status, cabeceras clave,
@@ -26,6 +28,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use futures_util::StreamExt;
 
 use crate::media::FailureCategory;
 
@@ -188,7 +192,7 @@ pub struct RangePolicy {
     pub max_retries: u32,
     /// Backoff base entre reintentos (lineal: delay × intento).
     pub retry_delay: Duration,
-    /// Timeout de cada petición individual.
+    /// Timeout de cada petición y de cada espera de chunk en modo live.
     pub request_timeout: Duration,
 }
 
@@ -395,6 +399,12 @@ struct RequestFailure {
     headers_us: u64,
 }
 
+/// Cuerpo secuencial de una respuesta que no anuncia longitud (radio en
+/// directo). Se conserva abierto entre ventanas lógicas en vez de drenarlo
+/// entero en la apertura, que bloquearía para siempre con un stream infinito.
+type LiveChunkStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Vec<u8>, reqwest::Error>> + Send>>;
+
 /// Stream lógico continuo sobre peticiones HTTP Range encadenadas.
 pub struct HttpRangeStream {
     http: reqwest::Client,
@@ -411,6 +421,11 @@ pub struct HttpRangeStream {
     /// dentro de la ventana ya descargada y reutilizarla en vez de pedirla.
     window_start: u64,
     eof: bool,
+    /// Respuesta `200` sin `Content-Length`: se lee secuencialmente y no se
+    /// puede reposicionar. `None` para streams con rangos.
+    live: Option<tokio::sync::Mutex<LiveChunkStream>>,
+    /// Bytes ya leídos de `live` que exceden la ventana en curso.
+    live_remainder: Vec<u8>,
     rid: u64,
     metrics: TransportMetrics,
     trace: RangeTraceContext,
@@ -423,6 +438,7 @@ impl std::fmt::Debug for HttpRangeStream {
             .field("total", &self.total)
             .field("pos", &self.pos)
             .field("eof", &self.eof)
+            .field("live", &self.live.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -462,6 +478,8 @@ impl HttpRangeStream {
             cursor: 0,
             window_start: 0,
             eof: false,
+            live: None,
+            live_remainder: Vec::new(),
             rid: 0,
             metrics: TransportMetrics::default(),
             trace,
@@ -473,9 +491,20 @@ impl HttpRangeStream {
         Ok(s)
     }
 
-    /// Tamaño total del recurso descubierto en la apertura.
+    /// Tamaño total del recurso descubierto en la apertura. Cero si es un
+    /// stream secuencial sin longitud conocida.
     pub fn total(&self) -> u64 {
         self.total
+    }
+
+    /// `true` si la respuesta no soporta rangos y se entrega secuencialmente.
+    pub fn is_live(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Bytes ya recibidos y aún no consumidos por el lector lógico.
+    pub fn buffered_prefix(&self) -> &[u8] {
+        &self.pending[self.cursor.min(self.pending.len())..]
     }
 
     /// Bytes lógicos ya entregados.
@@ -493,6 +522,14 @@ impl HttpRangeStream {
     /// toda la ventana. Solo se pide una ventana nueva cuando el destino cae
     /// fuera de ella.
     pub async fn seek_to(&mut self, position: u64) -> Result<(), TransportFailure> {
+        if self.live.is_some() {
+            if position == self.pos {
+                return Ok(());
+            }
+            return Err(TransportFailure::InvalidResponse(
+                "un stream secuencial sin longitud no admite seek".to_string(),
+            ));
+        }
         self.metrics.seeks += 1;
         if self.trace.is_active() {
             self.trace.set_reader_position(position);
@@ -555,6 +592,10 @@ impl HttpRangeStream {
             if self.eof || (self.total > 0 && self.pos >= self.total) {
                 return Ok(None);
             }
+            if self.live.is_some() {
+                self.fill_from_live().await?;
+                continue;
+            }
             let len = self
                 .policy
                 .window_len_at(self.pos)
@@ -567,6 +608,42 @@ impl HttpRangeStream {
         }
     }
 
+    /// Avanza el cuerpo secuencial de un stream sin longitud conocida.
+    async fn fill_from_live(&mut self) -> Result<(), TransportFailure> {
+        if !self.live_remainder.is_empty() {
+            self.pending = std::mem::take(&mut self.live_remainder);
+            self.window_start = self.pos;
+            self.cursor = 0;
+            return Ok(());
+        }
+        let next = {
+            let live = self.live.as_ref().expect("live stream checked by caller");
+            let mut guard = live.lock().await;
+            match tokio::time::timeout(self.policy.request_timeout, guard.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    return Err(TransportFailure::Timeout(
+                        "el stream secuencial dejó de entregar datos".to_string(),
+                    ))
+                }
+            }
+        };
+        match next {
+            Some(Ok(bytes)) if bytes.is_empty() => Ok(()),
+            Some(Ok(bytes)) => {
+                self.pending = bytes;
+                self.window_start = self.pos;
+                self.cursor = 0;
+                Ok(())
+            }
+            Some(Err(error)) => Err(map_reqwest(error)),
+            None => {
+                self.eof = true;
+                Ok(())
+            }
+        }
+    }
+
     /// Una petición de ventana con validación completa y retries acotados.
     async fn fetch_window(&mut self, start: u64, len: u64) -> Result<Vec<u8>, TransportFailure> {
         let mut attempt: u32 = 0;
@@ -575,7 +652,21 @@ impl HttpRangeStream {
             self.metrics.requests += 1;
             let rid = self.rid;
             let started = Instant::now();
-            let outcome = self.single_request(rid, start, len, started).await;
+            let outcome = match tokio::time::timeout(
+                self.policy.request_timeout,
+                self.single_request(rid, start, len, started),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => Err(RequestFailure {
+                    failure: TransportFailure::Timeout(
+                        "la petición no terminó dentro del plazo".to_string(),
+                    ),
+                    status: None,
+                    headers_us: 0,
+                }),
+            };
             let elapsed = started.elapsed();
 
             match outcome {
@@ -696,7 +787,6 @@ impl HttpRangeStream {
         }
         let sent = req
             .header("Range", format!("bytes={start}-{end}"))
-            .timeout(self.policy.request_timeout)
             .send()
             .await;
         let resp = match sent {
@@ -735,15 +825,54 @@ impl HttpRangeStream {
 
         // Lectura del cuerpo; el truncamiento se detecta contra
         // Content-Range (206) o Content-Length al validar.
-        let mut body = resp.bytes_stream();
-        use futures_util::StreamExt;
+        let body = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
-        let read_err: Option<reqwest::Error> = loop {
-            match body.next().await {
-                Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
-                Some(Err(e)) => break Some(e),
-                None => break None,
+        let live_response = status == 200 && content_length.is_none();
+        let read_err: Option<reqwest::Error> = if live_response {
+            if start != 0 {
+                return Err(RequestFailure {
+                    failure: TransportFailure::InvalidResponse(
+                        "200 sin Content-Length fuera del byte 0".to_string(),
+                    ),
+                    status: Some(status),
+                    headers_us,
+                });
             }
+            // Un stream sin longitud (radio) nunca termina: leer solo la
+            // ventana pedida y conservar el resto del cuerpo abierto.
+            let mut live: LiveChunkStream = Box::pin(body.map(|chunk| chunk.map(|b| b.to_vec())));
+            let mut error = None;
+            while buf.len() < len as usize {
+                match live.next().await {
+                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                    Some(Err(e)) => {
+                        error = Some(e);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            if error.is_none() {
+                if buf.len() > len as usize {
+                    self.live_remainder = buf.split_off(len as usize);
+                }
+                self.live = Some(tokio::sync::Mutex::new(live));
+            }
+            error
+        } else {
+            let mut body = body;
+            let mut error = None;
+            loop {
+                match body.next().await {
+                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                    Some(Err(e)) => {
+                        error = Some(e);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            error
         };
 
         tracing::trace!(
@@ -815,8 +944,10 @@ impl HttpRangeStream {
                 // El cuerpo completo es la única entrega: se marca EOF para
                 // que el stream lógico termine con esta respuesta.
                 if start == 0 {
-                    self.total = content_length.unwrap_or(buf.len() as u64);
-                    self.eof = true;
+                    if self.live.is_none() {
+                        self.total = content_length.unwrap_or(buf.len() as u64);
+                        self.eof = true;
+                    }
                     Ok(RequestOutcome {
                         bytes: buf,
                         status,

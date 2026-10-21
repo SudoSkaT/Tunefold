@@ -39,11 +39,19 @@ final class MiniPlayer extends LinearLayout {
 
         /** Open the full Now Playing surface. */
         void onExpand();
+
+        /** Toggle L1K3D membership of the current track. */
+        default void onLike() { }
+
+        /** Advance the current track's download by one step. */
+        default void onDownload() { }
     }
 
     private final ArtworkView artwork;
     private final TextView title;
     private final TextView artist;
+    private final IconButton like;
+    private final IconButton download;
     private final IconButton playPause;
     private final Actions actions;
 
@@ -51,6 +59,8 @@ final class MiniPlayer extends LinearLayout {
     private CharSequence renderedArtist = "";
     private boolean renderedPlaying;
     private boolean renderedVisible;
+    private boolean renderedLiked;
+    private DownloadState.Phase renderedDownloadPhase = DownloadState.Phase.IDLE;
     private String renderedCover = "";
     private final StringBuilder scratch = new StringBuilder(96);
 
@@ -110,6 +120,22 @@ final class MiniPlayer extends LinearLayout {
         text.addView(artist, new LayoutParams(LayoutParams.MATCH_PARENT,
                 LayoutParams.WRAP_CONTENT));
 
+        like = new IconButton(context);
+        like.setAction(Icon.HEART, "Add to L1K3D");
+        like.setOnClickListener(view -> {
+            if (actions != null) actions.onLike();
+        });
+        addView(like, new LayoutParams(DesignTokens.dp(DesignTokens.CONTROL_TARGET),
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET)));
+
+        download = new IconButton(context);
+        download.setAction(Icon.DOWNLOAD, "Download");
+        download.setOnClickListener(view -> {
+            if (actions != null) actions.onDownload();
+        });
+        addView(download, new LayoutParams(DesignTokens.dp(DesignTokens.CONTROL_TARGET),
+                DesignTokens.dp(DesignTokens.CONTROL_TARGET)));
+
         playPause = new IconButton(context);
         playPause.setAction(Icon.PLAY, "Start playback");
         playPause.setOnClickListener(view -> {
@@ -155,6 +181,19 @@ final class MiniPlayer extends LinearLayout {
             renderedPlaying = playing;
             playPause.setAction(playing ? Icon.PAUSE : Icon.PLAY,
                     playing ? "Pause playback" : "Start playback");
+        }
+        boolean liked = snapshot.liked;
+        if (renderedLiked != liked) {
+            renderedLiked = liked;
+            like.setAction(liked ? Icon.HEART_FILLED : Icon.HEART,
+                    liked ? "Remove from L1K3D" : "Add to L1K3D");
+        }
+        DownloadState.Phase phase = snapshot.download == null
+                ? DownloadState.Phase.IDLE : snapshot.download.phase;
+        if (renderedDownloadPhase != phase) {
+            renderedDownloadPhase = phase;
+            download.setAction(PlaybackNotification.downloadIconFor(phase),
+                    PlaybackNotification.downloadTitleFor(phase));
         }
         String cover = track.thumbnail.isEmpty() ? "" : identityOf(track);
         if (!cover.equals(renderedCover)) {

@@ -49,7 +49,7 @@ impl PcmRing {
 
         let buf = unsafe { &mut *self.buffer.get() };
         for i in 0..frames_to_write {
-            let idx = ((head as usize + i) * CHANNELS) & (self.mask * CHANNELS);
+            let idx = ((head as usize + i) * CHANNELS) & ((self.mask + 1) * CHANNELS - 1);
             buf[idx] = frames[i * CHANNELS];
             buf[idx + 1] = frames[i * CHANNELS + 1];
         }
@@ -68,7 +68,7 @@ impl PcmRing {
 
         let buf = unsafe { &*self.buffer.get() };
         for i in 0..frames_to_read {
-            let idx = ((tail as usize + i) * CHANNELS) & (self.mask * CHANNELS);
+            let idx = ((tail as usize + i) * CHANNELS) & ((self.mask + 1) * CHANNELS - 1);
             out[i * CHANNELS] = buf[idx];
             out[i * CHANNELS + 1] = buf[idx + 1];
         }

@@ -3199,8 +3199,6 @@ dependencies = [
 [[package]]
 name = "symphonia-codec-aac"
 version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c263845aa86881416849c1729a54c7f55164f8b96111dba59de46849e73a790"
 dependencies = [
  "lazy_static",
  "log",
@@ -3752,7 +3750,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tunefold"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "arboard",

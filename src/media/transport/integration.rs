@@ -312,3 +312,31 @@ async fn short_forward_seeks_preserve_byte_order_and_bound_requests() {
         hops
     );
 }
+
+/// 200 sin Content-Length: se lee solo la primera ventana y el resto queda
+/// en el cuerpo secuencial; no se drena el stream entero en la apertura.
+#[tokio::test]
+async fn live_response_without_length_reads_one_window_and_remains_seekless() {
+    let data = payload(512 * 1024);
+    let server = FakeServer::start(Scenario::LiveNoLength(data.clone())).await;
+
+    let mut stream = open(&server, test_policy(64)).await;
+    assert!(stream.is_live(), "la respuesta sin longitud es secuencial");
+    assert_eq!(stream.total(), 0);
+    assert_eq!(
+        stream.buffered_prefix().len(),
+        32 * 1024,
+        "solo se leyó la ventana inicial"
+    );
+    assert!(
+        stream.seek_to(1).await.is_err(),
+        "un stream live no admite seek"
+    );
+
+    let mut got = Vec::new();
+    while let Some(chunk) = stream.next_chunk(64 * 1024).await.expect("lectura") {
+        got.extend_from_slice(&chunk);
+    }
+    assert_eq!(got.len(), data.len());
+    assert!(got == *data);
+}

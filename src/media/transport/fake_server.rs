@@ -19,6 +19,8 @@ pub enum Scenario {
     Normal(Arc<Vec<u8>>),
     /// Ignora Range: siempre 200 con el cuerpo completo.
     IgnoreRange(Arc<Vec<u8>>),
+    /// 200 sin Content-Length (radio en directo): cuerpo secuencial.
+    LiveNoLength(Arc<Vec<u8>>),
     /// Sirve el prefijo hasta `threshold` y responde 403 a cualquier rango
     /// que empiece en o después de él (techo posicional).
     ForbiddenBeyond { data: Arc<Vec<u8>>, threshold: u64 },
@@ -125,6 +127,11 @@ async fn serve(
         Scenario::IgnoreRange(data) => (
             "HTTP/1.1 200 OK",
             format!("Content-Length: {}\r\n", data.len()),
+            data.as_ref().clone(),
+        ),
+        Scenario::LiveNoLength(data) => (
+            "HTTP/1.1 200 OK",
+            "Content-Type: audio/aac\r\n".to_string(),
             data.as_ref().clone(),
         ),
         Scenario::ForbiddenBeyond { data, threshold } => {

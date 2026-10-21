@@ -452,6 +452,26 @@ public final class MainActivity extends Activity
             }
 
             @Override public void onExpand() { openPlayer(); }
+
+            @Override public void onLike() {
+                if (session == null) return;
+                session.toggleLike();
+                refreshLists();
+                render();
+            }
+
+            @Override public void onDownload() {
+                if (session == null || downloader == null) return;
+                MediaTrack track = session.snapshot().currentTrack;
+                if (track == null) return;
+                DownloadState state = downloader.stateOf(track);
+                if (state.isActive()) downloader.cancel(track);
+                else if (state.isRetryable()) downloader.retry(track);
+                else if (state.isDownloaded()) downloader.remove(track);
+                else downloader.start(track);
+                refreshLists();
+                render();
+            }
         });
         bottomBar.addView(mini, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,

@@ -6,6 +6,7 @@ import android.media.AudioTrack;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 
 final class AudioTrackOutput {
     interface Listener {
@@ -87,7 +88,7 @@ final class AudioTrackOutput {
 
     private void pump(long engine, PlaybackTrace trace, Runnable onOutputBegan) {
         AudioTrack localTrack = null;
-        boolean firstWriteMarked = false;
+        boolean trackPlaying = false;
         // Held in a local so firing it needs no locking; cleared after the call.
         Runnable began = onOutputBegan;
         // Sample rate is fixed for a source: re-reading it from JNI on every
@@ -96,6 +97,7 @@ final class AudioTrackOutput {
         int cachedRate = 0;
         ByteBuffer pcm = ByteBuffer.allocateDirect(CHUNK_FRAMES * 2 * Float.BYTES)
                 .order(ByteOrder.nativeOrder());
+        short[] pcm16 = new short[CHUNK_FRAMES * 2];
         try {
             while (running) {
                 int state = TunefoldBridge.getPlaybackState(engine);
@@ -134,11 +136,6 @@ final class AudioTrackOutput {
                 if (localTrack == null) {
                     localTrack = createTrack(sampleRate);
                     track = localTrack;
-                    localTrack.play();
-                    TunefoldBridge.setOutputState(engine, PlaybackController.PLAYING);
-                    if (trace != null) trace.mark(PlaybackTrace.AUDIOTRACK_START,
-                            "sample_rate=" + sampleRate);
-                    message("AudioTrack started at " + sampleRate + " Hz");
                 }
 
                 state = TunefoldBridge.getPlaybackState(engine);
@@ -149,7 +146,7 @@ final class AudioTrackOutput {
                     sleepMillis(50);
                     continue;
                 }
-                if (state == PlaybackController.LOADING
+                if (state == PlaybackController.LOADING && trackPlaying
                         && localTrack.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) {
                     localTrack.play();
                     TunefoldBridge.setOutputState(engine, PlaybackController.PLAYING);
@@ -161,21 +158,45 @@ final class AudioTrackOutput {
                     sleepMillis(20);
                     continue;
                 }
-                int bytes = frames * 2 * Float.BYTES;
+                int samples = frames * 2;
                 pcm.position(0);
-                pcm.limit(bytes);
-                while (running && pcm.hasRemaining()) {
-                    int written = localTrack.write(pcm, pcm.remaining(), AudioTrack.WRITE_BLOCKING);
-                    if (!firstWriteMarked && written > 0) {
-                        firstWriteMarked = true;
-                        if (trace != null) trace.markFirstPositiveWrite(written);
-                        if (began != null) {
-                            began.run();
-                            began = null;
-                        }
-                    }
+                pcm.limit(frames * 2 * Float.BYTES);
+                FloatBuffer floats = pcm.asFloatBuffer();
+                for (int i = 0; i < samples; i++) {
+                    float value = Math.max(-1.0f, Math.min(1.0f, floats.get(i)));
+                    pcm16[i] = (short) Math.round(value * 32767.0f);
+                }
+                int writtenBytes = 0;
+                int offset = 0;
+                while (running && offset < samples) {
+                    int written = localTrack.write(
+                            pcm16, offset, samples - offset, AudioTrack.WRITE_BLOCKING);
                     if (written < 0) {
                         throw new IllegalStateException("AudioTrack.write failed: " + written);
+                    }
+                    if (written == 0) {
+                        sleepMillis(2);
+                        continue;
+                    }
+                    offset += written;
+                    writtenBytes += written * 2;
+                }
+                // Start only once the track has data: an empty streaming track
+                // can underrun before the mixer wakes, and the decoder then fills
+                // the ring while the UI clock keeps advancing.
+                if (!trackPlaying && writtenBytes > 0) {
+                    trackPlaying = true;
+                    localTrack.play();
+                    TunefoldBridge.setOutputState(engine, PlaybackController.PLAYING);
+                    if (trace != null) {
+                        trace.mark(PlaybackTrace.AUDIOTRACK_START,
+                                "sample_rate=" + sampleRate);
+                        trace.markFirstPositiveWrite(writtenBytes);
+                    }
+                    message("AudioTrack started at " + sampleRate + " Hz");
+                    if (began != null) {
+                        began.run();
+                        began = null;
                     }
                 }
             }
@@ -208,15 +229,18 @@ final class AudioTrackOutput {
         int minBytes = AudioTrack.getMinBufferSize(
                 sampleRate,
                 AudioFormat.CHANNEL_OUT_STEREO,
-                AudioFormat.ENCODING_PCM_FLOAT);
+                AudioFormat.ENCODING_PCM_16BIT);
         if (minBytes <= 0) {
             throw new IllegalStateException("Unsupported AudioTrack format at " + sampleRate + " Hz");
         }
-        int requestedBytes = Math.max(minBytes, sampleRate * 2 * Float.BYTES / 5);
+        // A deep-buffer normal track is the configuration this HAL consumes
+        // reliably; the fast/low-latency path stays silent on this device even
+        // though AudioFlinger marks it active.
+        int requestedBytes = Math.max(minBytes, sampleRate * 2 * 2 / 2);
         AudioFormat format = new AudioFormat.Builder()
                 .setSampleRate(sampleRate)
                 .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .build();
         AudioAttributes attributes = new AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)

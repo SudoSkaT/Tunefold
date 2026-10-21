@@ -188,6 +188,7 @@ pub struct DecoderDiagnostics {
     pub(crate) first_pcm_us: AtomicU64,
     pub(crate) range_requests: AtomicU64,
     pub(crate) range_bytes: AtomicU64,
+    pub(crate) stream_bytes: AtomicU64,
     pub(crate) range_elapsed_ms: AtomicU64,
     /// Microsegundos desde el Play tap hasta la entrada al decoder.
     pub(crate) tap_to_decoder_us: AtomicU64,
@@ -212,6 +213,7 @@ impl DecoderDiagnostics {
             first_pcm_us: AtomicU64::new(0),
             range_requests: AtomicU64::new(0),
             range_bytes: AtomicU64::new(0),
+            stream_bytes: AtomicU64::new(0),
             range_elapsed_ms: AtomicU64::new(0),
             tap_to_decoder_us: AtomicU64::new(0),
             seeks: AtomicU64::new(0),
@@ -298,6 +300,7 @@ fn file_path_from_uri(uri: &str) -> Result<std::path::PathBuf, DecoderError> {
 struct HttpMediaSource {
     inner: Box<dyn MediaSource>,
     length: u64,
+    seekable: Arc<AtomicBool>,
 }
 
 impl HttpMediaSource {
@@ -305,6 +308,15 @@ impl HttpMediaSource {
         Self {
             inner: reader,
             length,
+            seekable: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn with_seekable(reader: Box<dyn MediaSource>, length: u64, seekable: Arc<AtomicBool>) -> Self {
+        Self {
+            inner: reader,
+            length,
+            seekable,
         }
     }
 }
@@ -321,23 +333,72 @@ impl std::io::Seek for HttpMediaSource {
     }
 }
 
+fn mp4_is_fast_start(prefix: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while offset + 8 <= prefix.len() {
+        let size = u32::from_be_bytes([
+            prefix[offset],
+            prefix[offset + 1],
+            prefix[offset + 2],
+            prefix[offset + 3],
+        ]) as u64;
+        let kind = &prefix[offset + 4..offset + 8];
+
+        if kind == b"moov" {
+            return true;
+        }
+        if kind == b"mdat" {
+            return false;
+        }
+
+        let length = match size {
+            0 => break,
+            1 => {
+                if offset + 16 > prefix.len() {
+                    break;
+                }
+                u64::from_be_bytes([
+                    prefix[offset + 8],
+                    prefix[offset + 9],
+                    prefix[offset + 10],
+                    prefix[offset + 11],
+                    prefix[offset + 12],
+                    prefix[offset + 13],
+                    prefix[offset + 14],
+                    prefix[offset + 15],
+                ])
+            }
+            _ => size,
+        };
+        if length < 8 {
+            break;
+        }
+        let next = offset as u64 + length;
+        if next > usize::MAX as u64 {
+            break;
+        }
+        offset = next as usize;
+    }
+    false
+}
+
 impl MediaSource for HttpMediaSource {
     fn is_seekable(&self) -> bool {
-        true
+        self.seekable.load(Ordering::Relaxed)
     }
 
     fn byte_len(&self) -> Option<u64> {
-        Some(self.length)
+        (self.length > 0).then_some(self.length)
     }
 }
 
 impl MediaSource for StreamReader {
     fn is_seekable(&self) -> bool {
-        true
+        !self.transport.is_live()
     }
 
     fn byte_len(&self) -> Option<u64> {
-        Some(self.transport.total())
+        (self.transport.total() > 0).then(|| self.transport.total())
     }
 }
 
@@ -365,6 +426,71 @@ pub struct AndroidDecoder {
     playing: Arc<AtomicBool>,
     diagnostics: Arc<DecoderDiagnostics>,
     trace: Arc<PlaybackTraceLog>,
+}
+
+/// Android's primary mixer is commonly fixed at 48 kHz. Creating a 44.1 kHz
+/// AudioTrack on such a device routes it through the normal mixer, which some
+/// HALs leave in standby: the track never drains, the PCM ring fills and the
+/// decoder blocks. Resampling to the device mixer rate keeps playback on the
+/// path that actually consumes samples.
+const ANDROID_OUTPUT_SAMPLE_RATE: u32 = 48_000;
+
+/// Stereo linear resampler with continuity across decoder packets.
+///
+/// It keeps one frame of lookahead: the next output position can fall between
+/// the last frame of one packet and the first frame of the next.
+struct StereoResampler {
+    step: f64,
+    pos: f64,
+    previous: Option<[f32; 2]>,
+}
+
+impl StereoResampler {
+    fn new(source_rate: u32, output_rate: u32) -> Self {
+        Self {
+            step: f64::from(source_rate) / f64::from(output_rate),
+            pos: 0.0,
+            previous: None,
+        }
+    }
+
+    fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
+        let frames = input.len() / 2;
+        if frames == 0 {
+            return;
+        }
+        if (self.step - 1.0).abs() < f64::EPSILON {
+            output.extend_from_slice(input);
+            return;
+        }
+
+        let previous = self.previous.unwrap_or([input[0], input[1]]);
+        let mut pos = self.pos;
+        loop {
+            let index = pos.floor() as isize;
+            if index + 1 >= frames as isize {
+                break;
+            }
+            let fraction = pos - index as f64;
+            let left = if index < 0 {
+                previous
+            } else {
+                let sample = index as usize * 2;
+                [input[sample], input[sample + 1]]
+            };
+            let next = (index + 1) as usize * 2;
+            let right = [input[next], input[next + 1]];
+            output.push(
+                (f64::from(left[0]) * (1.0 - fraction) + f64::from(right[0]) * fraction) as f32,
+            );
+            output.push(
+                (f64::from(left[1]) * (1.0 - fraction) + f64::from(right[1]) * fraction) as f32,
+            );
+            pos += self.step;
+        }
+        self.previous = Some([input[(frames - 1) * 2], input[(frames - 1) * 2 + 1]]);
+        self.pos = pos - frames as f64;
+    }
 }
 
 impl AndroidDecoder {
@@ -427,6 +553,9 @@ impl AndroidDecoder {
                 .metadata()
                 .map_err(|error| DecoderError::Stream(format!("local media stat failed: {error}")))?
                 .len();
+            self.diagnostics
+                .stream_bytes
+                .store(content_length, Ordering::Relaxed);
             self.set_diagnostic(format!("local media opened · {content_length} bytes"));
             self.trace.mark(
                 events::HTTP_OPEN_START,
@@ -437,13 +566,16 @@ impl AndroidDecoder {
             if content_length == 0 {
                 return Err(DecoderError::Stream("empty local media file".to_string()));
             }
-            MediaSourceStream::new(
-                Box::new(HttpMediaSource::new(Box::new(file), content_length)),
-                MediaSourceStreamOptions::default(),
+            (
+                MediaSourceStream::new(
+                    Box::new(HttpMediaSource::new(Box::new(file), content_length)),
+                    MediaSourceStreamOptions::default(),
+                ),
+                None,
             )
         } else {
             let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(20))
+                .connect_timeout(Duration::from_secs(10))
                 .build()
                 .map_err(|error| DecoderError::Stream(error.to_string()))?;
             let http_started = std::time::Instant::now();
@@ -471,20 +603,40 @@ impl AndroidDecoder {
                 .store(http_started.elapsed().as_micros() as u64, Ordering::Relaxed);
 
             let content_length = transport.total();
-            self.set_diagnostic(format!("HTTP stream opened · {content_length} bytes"));
-            if content_length == 0 {
+            let live = transport.is_live();
+            self.diagnostics
+                .stream_bytes
+                .store(content_length, Ordering::Relaxed);
+            self.trace.mark(
+                "HTTP_STREAM_TOTAL",
+                &format!(
+                    "bytes={content_length} live={live} buffered={}",
+                    transport.buffered_prefix().len()
+                ),
+            );
+            self.set_diagnostic(if live {
+                "HTTP stream opened · live sin longitud".to_string()
+            } else {
+                format!("HTTP stream opened · {content_length} bytes")
+            });
+            if content_length == 0 && !live {
                 return Err(DecoderError::Stream("empty stream".to_string()));
             }
 
+            let fast_start = !live && mp4_is_fast_start(transport.buffered_prefix());
+            let seekable = Arc::new(AtomicBool::new(!live && !fast_start));
             let reader = StreamReader::new(
                 transport,
                 self.diagnostics.clone(),
                 runtime.clone(),
                 trace_context,
             );
-            MediaSourceStream::new(
-                Box::new(HttpMediaSource::new(Box::new(reader), content_length)),
-                MediaSourceStreamOptions::default(),
+            let source =
+                HttpMediaSource::with_seekable(Box::new(reader), content_length, seekable.clone());
+            let probe_seekable = if live { None } else { Some(seekable) };
+            (
+                MediaSourceStream::new(Box::new(source), MediaSourceStreamOptions::default()),
+                probe_seekable,
             )
         };
 
@@ -497,9 +649,13 @@ impl AndroidDecoder {
 
         self.trace.mark(events::SYMPHONIA_PROBE_START, "");
         let probe_started = std::time::Instant::now();
+        let (mss, probe_seekable) = mss;
         let probed = symphonia::default::get_probe()
             .format(&hint, mss, &format_opts, &metadata_opts)
             .map_err(|e| DecoderError::Format(e.to_string()))?;
+        if let Some(seekable) = probe_seekable {
+            seekable.store(true, Ordering::Relaxed);
+        }
         self.diagnostics.probe_us.store(
             probe_started.elapsed().as_micros() as u64,
             Ordering::Relaxed,
@@ -528,15 +684,15 @@ impl AndroidDecoder {
             .channels
             .map_or(0, |channels| channels.count());
         self.set_diagnostic(format!(
-            "Symphonia track · codec {:?} · {sample_rate} Hz · {source_channels} source channels · PCM f32 interleaved stereo",
+            "Symphonia track · codec {:?} · {sample_rate} Hz · {source_channels} source channels · resampled to {ANDROID_OUTPUT_SAMPLE_RATE} Hz f32 stereo",
             track.codec_params.codec
         ));
         self.sample_rate
-            .store(sample_rate as u64, Ordering::Relaxed);
-        // The Android PCM ring and AudioTrack bridge are explicitly stereo.
-        // Analysis receives the same stereo contract after the channel map.
+            .store(u64::from(ANDROID_OUTPUT_SAMPLE_RATE), Ordering::Relaxed);
+        // The Android PCM ring and AudioTrack bridge are explicitly stereo at
+        // the device output rate. Analysis receives that same contract.
         self.analysis_tap.announce(StreamMeta {
-            sample_rate,
+            sample_rate: ANDROID_OUTPUT_SAMPLE_RATE,
             channels: 2,
         });
 
@@ -547,6 +703,9 @@ impl AndroidDecoder {
         let track_id = track.id;
         let mut sample_buf: Option<SampleBuffer<f32>> = None;
         let mut stereo = Vec::new();
+        let mut resampled = Vec::new();
+        let mut resampler = StereoResampler::new(sample_rate, ANDROID_OUTPUT_SAMPLE_RATE);
+        let mut stall_reported: Option<std::time::Instant> = None;
 
         loop {
             if self.cancel.load(Ordering::Relaxed) {
@@ -603,13 +762,21 @@ impl AndroidDecoder {
                     if let Some(ref mut buf) = sample_buf {
                         buf.copy_interleaved_ref(decoded);
                         let samples = buf.samples();
-                        if !self.feed_pcm(samples, channels, &mut stereo, decode_started) {
+                        if !self.feed_pcm(
+                            samples,
+                            channels,
+                            &mut stereo,
+                            &mut resampled,
+                            &mut resampler,
+                            decode_started,
+                            &mut stall_reported,
+                        ) {
                             return Ok(DecodeOutcome::Cancelled);
                         }
                     }
                     if packet_count == 1 || packet_count & 63 == 0 {
                         self.set_diagnostic(format!(
-                            "decoded {packet_count} packets · {} PCM frames · {sample_rate} Hz · {source_channels} source channels → f32 stereo",
+                            "decoded {packet_count} packets · {} PCM frames · {sample_rate} Hz · {source_channels} source channels → {ANDROID_OUTPUT_SAMPLE_RATE} Hz f32 stereo",
                             self.diagnostics.decoded_frames.load(Ordering::Relaxed),
                         ));
                     }
@@ -620,7 +787,7 @@ impl AndroidDecoder {
         }
 
         self.set_diagnostic(format!(
-            "decoder EOF · codec {:?} · {sample_rate} Hz · {source_channels} source channels → f32 interleaved stereo · {} packets · {} frames",
+            "decoder EOF · codec {:?} · {sample_rate} Hz · {source_channels} source channels → {ANDROID_OUTPUT_SAMPLE_RATE} Hz f32 interleaved stereo · {} packets · {} frames",
             track.codec_params.codec,
             self.diagnostics.decoded_packets.load(Ordering::Relaxed),
             self.diagnostics.decoded_frames.load(Ordering::Relaxed)
@@ -628,25 +795,33 @@ impl AndroidDecoder {
         Ok(DecodeOutcome::EndOfMedia)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn feed_pcm(
         &self,
         samples: &[f32],
         channels: u16,
         stereo: &mut Vec<f32>,
+        resampled: &mut Vec<f32>,
+        resampler: &mut StereoResampler,
         decode_started: std::time::Instant,
+        stall_reported: &mut Option<std::time::Instant>,
     ) -> bool {
         let channels = channels as usize;
-        let frames = samples.len() / channels;
+        let source_frames = samples.len() / channels;
         self.diagnostics
             .decoded_frames
-            .fetch_add(frames as u64, Ordering::Relaxed);
+            .fetch_add(source_frames as u64, Ordering::Relaxed);
         stereo.clear();
-        stereo.reserve(frames.saturating_mul(2));
+        stereo.reserve(source_frames.saturating_mul(2));
         for frame in samples.chunks_exact(channels) {
             let left = frame[0];
             let right = if channels == 1 { left } else { frame[1] };
             stereo.extend_from_slice(&[left, right]);
         }
+        resampled.clear();
+        resampled.reserve(stereo.len() + stereo.len() / 8);
+        resampler.process(stereo, resampled);
+        let frames = resampled.len() / 2;
         let mut offset_frames = 0;
         while offset_frames < frames {
             if self.cancel.load(Ordering::Acquire) {
@@ -660,13 +835,34 @@ impl AndroidDecoder {
 
             let free_frames = self.ring.free_frames();
             if free_frames == 0 {
+                let should_report =
+                    stall_reported.is_none_or(|last| last.elapsed() >= Duration::from_secs(1));
+                if should_report {
+                    self.set_diagnostic(format!(
+                        "decoder waiting: PCM ring full · pushed={}f analysis={}f buffered={}f",
+                        self.diagnostics.ring_frames.load(Ordering::Relaxed),
+                        self.diagnostics.analysis_frames.load(Ordering::Relaxed),
+                        self.ring.available_frames(),
+                    ));
+                    self.trace.mark(
+                        "DECODER_BUFFER_FULL",
+                        &format!(
+                            "free=0 pushed={} analysis={} buffered={}",
+                            self.diagnostics.ring_frames.load(Ordering::Relaxed),
+                            self.diagnostics.analysis_frames.load(Ordering::Relaxed),
+                            self.ring.available_frames(),
+                        ),
+                    );
+                    *stall_reported = Some(std::time::Instant::now());
+                }
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
+            *stall_reported = None;
             let chunk_frames = (frames - offset_frames).min(free_frames);
             let start_sample = offset_frames * 2;
             let end_sample = start_sample + chunk_frames * 2;
-            let written_frames = self.ring.push(&stereo[start_sample..end_sample]);
+            let written_frames = self.ring.push(&resampled[start_sample..end_sample]);
             if written_frames == 0 {
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
@@ -707,7 +903,7 @@ impl AndroidDecoder {
                     continue;
                 }
                 let accepted = self.analysis_tap.feed_stereo(
-                    &stereo
+                    &resampled
                         [offset_frames * 2 + analysis_offset..offset_frames * 2 + written_samples],
                 );
                 if accepted == 0 {
@@ -1173,5 +1369,30 @@ mod tests {
         assert_eq!(seek_request.reader_position, 200 * 1024);
         assert!(seek_request.received_bytes > 0);
         drop(server);
+    }
+
+    #[test]
+    fn resampler_preserves_duration_across_packets() {
+        let mut resampler = StereoResampler::new(44_100, 48_000);
+        let input: Vec<f32> = (0..2048).map(|i| (i as f32) / 2048.0).collect();
+        let mut output = Vec::new();
+        for _ in 0..100 {
+            resampler.process(&input, &mut output);
+        }
+        let expected = 100_i64 * 1024 * 48_000 / 44_100;
+        let frames = (output.len() / 2) as i64;
+        assert!(
+            (frames - expected).abs() <= 2,
+            "expected about {expected} frames, got {frames}"
+        );
+    }
+
+    #[test]
+    fn resampler_copies_when_rates_match() {
+        let mut resampler = StereoResampler::new(48_000, 48_000);
+        let input = [0.25, -0.5, 0.75, -1.0];
+        let mut output = Vec::new();
+        resampler.process(&input, &mut output);
+        assert_eq!(output, input);
     }
 }

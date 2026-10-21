@@ -298,6 +298,12 @@ fn lrclib_score(
 
     // Reglas anti falso positivo: el título idéntico basta; una variante exige
     // duración razonable; la contención exige además artista que coincida.
+    // La letra debe corresponder a la canción: un título idéntico de otro
+    // artista no es la misma canción, así que se descarta siempre que ambos
+    // artistas sean conocidos.
+    if !artist_ok && !a.is_empty() && !ha.is_empty() {
+        return None;
+    }
     match level {
         0 => {}
         1 => {

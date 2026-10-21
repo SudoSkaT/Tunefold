@@ -278,6 +278,7 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
     let decoder_diagnostics = engine.decoder_diagnostics.clone();
     let trace = engine.trace.clone();
 
+    let decoder_stage = decoder_diagnostics.clone();
     let handle = std::thread::spawn(move || {
         if let Some(analysis_tap) = analysis_tap {
             let decoder = crate::platform::android_decoder::AndroidDecoder::new(
@@ -302,6 +303,9 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
                     }
                 }
                 Err(error) => {
+                    if let Ok(mut diagnostic) = decoder_stage.stage.lock() {
+                        *diagnostic = format!("decoder error: {error}");
+                    }
                     if let Ok(mut slot) = last_error.lock() {
                         *slot = Some(error.to_string());
                     }
@@ -1290,7 +1294,7 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_getRuntimeDiagnostic
             waveform.left.peak().max(waveform.right.peak())
         });
     let message = format!(
-        "{diagnostic}\npackets={} decoded={}f ring={}f analysis={}f output={}f waveform={analysis_peak:.3}\nhttp_open_us={} first_response_us={} probe_us={} first_decode_us={} first_pcm_us={} range_requests={} range_bytes={} range_elapsed_ms={} range_headers_us={} seeks={} seek_requests={} tap_to_decoder_us={}",
+        "{diagnostic}\npackets={} decoded={}f ring={}f analysis={}f output={}f waveform={analysis_peak:.3}\nhttp_open_us={} first_response_us={} probe_us={} first_decode_us={} first_pcm_us={} range_requests={} range_bytes={} stream_bytes={} range_elapsed_ms={} range_headers_us={} seeks={} seek_requests={} tap_to_decoder_us={}",
         engine
             .decoder_diagnostics
             .decoded_packets
@@ -1315,6 +1319,7 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_getRuntimeDiagnostic
         engine.decoder_diagnostics.first_pcm_us.load(Ordering::Relaxed),
         engine.decoder_diagnostics.range_requests.load(Ordering::Relaxed),
         engine.decoder_diagnostics.range_bytes.load(Ordering::Relaxed),
+        engine.decoder_diagnostics.stream_bytes.load(Ordering::Relaxed),
         engine.decoder_diagnostics.range_elapsed_ms.load(Ordering::Relaxed),
         engine.decoder_diagnostics.headers_us.load(Ordering::Relaxed),
         engine.decoder_diagnostics.seeks.load(Ordering::Relaxed),

@@ -523,7 +523,7 @@ final class DesignTokens {
      * oído, que es como se corrigen las cosas que el usuario nota antes que el
      * cronómetro.
      */
-    static final long LYRIC_LEAD_MS = 400L;
+    static final long LYRIC_LEAD_MS = 475L;
     /**
      * Engine refresh cadence, in {@code ms}: the service poll that drives the
      * notification, the lock screen and the session's own state.

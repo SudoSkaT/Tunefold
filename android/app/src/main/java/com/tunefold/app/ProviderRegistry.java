@@ -402,6 +402,14 @@ final class ProviderRegistry implements AutoCloseable {
 
     void resolve(String url, PlaybackTrace trace, Callback<MediaTrack> callback) {
         worker.execute(() -> {
+            String trimmed = url == null ? "" : url.trim();
+            if (isDirectStreamUrl(trimmed)) {
+                if (trace != null) trace.mark("METADATA_RESOLUTION_START", "kind=direct_url");
+                MediaTrack track = directStreamTrack(trimmed);
+                if (trace != null) trace.mark(PlaybackTrace.METADATA_AVAILABLE, "kind=direct_url");
+                deliver(callback, track, null);
+                return;
+            }
             if (!available) { deliver(callback, null, "YouTube provider is not initialized"); return; }
             if (trace != null) trace.mark("METADATA_RESOLUTION_START");
             String response = TunefoldBridge.resolveYoutubeUrl(url);
@@ -412,6 +420,40 @@ final class ProviderRegistry implements AutoCloseable {
                         error != null ? error : tracks == null || tracks.isEmpty() ? "No track found" : null);
             });
         });
+    }
+
+    /**
+     * HTTP(S) URLs that are not YouTube links are played as direct streams.
+     *
+     * <p>The decoder has always accepted any http(s) source; only this facade
+     * insisted every pasted URL was a YouTube link. A radio stream (ADTS, MP3,
+     * Ogg, Icecast) therefore failed at metadata resolution even though the
+     * playback pipeline could handle it. YouTube links still go through the
+     * provider so they get signed stream URLs and full metadata.
+     */
+    private static boolean isDirectStreamUrl(String url) {
+        if (!(url.startsWith("http://") || url.startsWith("https://"))) return false;
+        return !isYoutubeUrl(url);
+    }
+
+    private static boolean isYoutubeUrl(String url) {
+        android.net.Uri parsed = android.net.Uri.parse(url);
+        String host = parsed.getHost();
+        if (host == null) return false;
+        host = host.toLowerCase(java.util.Locale.ROOT);
+        return host.equals("youtu.be")
+                || host.equals("youtube.com")
+                || host.endsWith(".youtube.com")
+                || host.equals("youtube-nocookie.com")
+                || host.endsWith(".youtube-nocookie.com");
+    }
+
+    private static MediaTrack directStreamTrack(String url) {
+        android.net.Uri parsed = android.net.Uri.parse(url);
+        String host = parsed.getHost();
+        String label = host == null || host.isEmpty() ? "Direct stream" : host;
+        return new MediaTrack("URL", url, label, "", "", "", "artist", -1,
+                "", url, "{}");
     }
 
     /**
@@ -455,6 +497,13 @@ final class ProviderRegistry implements AutoCloseable {
                 if (trace != null) trace.mark(PlaybackTrace.PLAYABLE_SOURCE_AVAILABLE,
                         "kind=local_media");
                 deliver(callback, new PlayableSource(localFile.toURI().toString(), "[]"), null);
+                return;
+            }
+            if ("URL".equals(track.provider)) {
+                if (trace != null) trace.mark(PlaybackTrace.SOURCE_RESOLUTION_START, "kind=direct_url");
+                if (trace != null) trace.mark(PlaybackTrace.PLAYABLE_SOURCE_AVAILABLE,
+                        "kind=direct_url");
+                deliver(callback, new PlayableSource(track.providerUrl, "[]"), null);
                 return;
             }
             if (fresh != null && !fresh.isFresh()) {
