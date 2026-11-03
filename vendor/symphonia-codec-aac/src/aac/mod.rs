@@ -11,7 +11,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::audio::{AsAudioBufferRef, AudioBuffer, AudioBufferRef, Signal, SignalSpec};
+use symphonia_core::audio::{AsAudioBufferRef, AudioBuffer, AudioBufferRef, Channels, Signal, SignalSpec};
 use symphonia_core::codecs::{CodecDescriptor, CodecParameters, CODEC_TYPE_AAC};
 use symphonia_core::codecs::{Decoder, DecoderOptions, FinalizeResult};
 use symphonia_core::errors::{unsupported_error, Result};
@@ -71,10 +71,7 @@ impl M4AInfo {
     fn read_sampling_frequency<B: ReadBitsLtr>(bs: &mut B) -> Result<u32> {
         match bs.read_bits_leq32(4)? {
             idx if idx < 15 => Ok(AAC_SAMPLE_RATES[idx as usize]),
-            _ => {
-                let srate = (0xf << 20) & bs.read_bits_leq32(20)?;
-                Ok(srate)
-            }
+            _ => Ok(bs.read_bits_leq32(24)?),
         }
     }
 
@@ -137,8 +134,11 @@ impl M4AInfo {
 
                 let extension_flag = bs.read_bool()?;
 
+                // GASpecificConfig: the PCE follows the core flags (not the
+                // channelConfiguration field, despite common confusion).
                 if self.channels == 0 {
-                    return unsupported_error("aac: program config element");
+                    let pce = read_program_config_element(&mut bs)?;
+                    self.channels = pce.channels;
                 }
 
                 if (self.otype == M4AType::Scalable) || (self.otype == M4AType::ER_AAC_Scalable) {
@@ -314,6 +314,36 @@ impl AacDecoder {
         Ok(())
     }
 
+    /// Applies a PCE found in-band. With `channel_configuration = 0` this is
+    /// the point where the output layout (and therefore the audio buffer)
+    /// becomes known.
+    fn apply_program_config(&mut self, pce: ProgramConfig) -> Result<()> {
+        if pce.object_type != M4AType::Lc {
+            return unsupported_error("aac: pce object type");
+        }
+
+        if self.m4ainfo.channels == 0 {
+            if pce.channels > 2 {
+                return unsupported_error("aac: aac too complex");
+            }
+
+            let Some(layout) = map_channels(pce.channels as u32) else {
+                return unsupported_error("aac: pce channel layout");
+            };
+
+            self.m4ainfo.channels = pce.channels;
+            self.params.with_channels(layout);
+
+            let spec = SignalSpec::new(self.m4ainfo.srate, layout);
+            self.buf = AudioBuffer::new(self.m4ainfo.samples as Duration * 4, spec);
+        }
+        else {
+            validate!(pce.channels == self.m4ainfo.channels);
+        }
+
+        Ok(())
+    }
+
     fn decode_ga<B: ReadBitsLtr + FiniteBitStream>(
         &mut self,
         bs: &mut B,
@@ -371,7 +401,8 @@ impl AacDecoder {
                     }
                     5 => {
                         // ID_PCE
-                        return unsupported_error("aac: program config");
+                        let pce = read_program_config_element(bs)?;
+                        self.apply_program_config(pce)?;
                     }
                     6 => {
                         // ID_FIL
@@ -392,6 +423,11 @@ impl AacDecoder {
                     _ => unreachable!(),
                 };
             }
+
+            // A raw_data_block is byte-aligned; without this, a packet
+            // carrying multiple ADTS frames decodes the next block from a
+            // bit-offset and produces garbage/errors.
+            bs.realign();
 
             let offset = block * self.m4ainfo.samples;
             self.buf.render_reserved(Some(self.m4ainfo.samples));
@@ -467,7 +503,11 @@ impl Decoder for AacDecoder {
                 layout.into_channels().count()
             }
             else {
-                return unsupported_error("aac: channels or channel layout is required");
+                // ADTS may carry `channel_configuration = 0` and describe the
+                // layout in the first raw_data_block's PCE. Defer the decision
+                // until decode; rodio builds its output spec from the first
+                // decoded buffer, not from `codec_params`.
+                0
             };
         }
 
@@ -477,7 +517,14 @@ impl Decoder for AacDecoder {
             return unsupported_error("aac: aac too complex");
         }
 
-        let spec = SignalSpec::new(m4ainfo.srate, map_channels(m4ainfo.channels as u32).unwrap());
+        // Placeholder until the in-band PCE (if any) reveals the real layout.
+        let layout = if m4ainfo.channels == 0 {
+            Some(Channels::FRONT_LEFT)
+        }
+        else {
+            map_channels(m4ainfo.channels as u32)
+        };
+        let spec = SignalSpec::new(m4ainfo.srate, layout.unwrap());
 
         let duration = m4ainfo.samples as Duration;
         let srate = m4ainfo.srate;

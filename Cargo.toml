@@ -1,6 +1,6 @@
 [package]
 name = "tunefold"
-version = "0.19.3"
+version = "0.19.4"
 edition = "2021"
 description = "TUI music player and recommendation engine. The YouTube/YouTube Music provider is an optional, GPL-3.0 component built with `--features youtube`."
 license = "GPL-3.0"
@@ -68,6 +68,7 @@ jni = { version = "0.21", optional = true }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["test-util"] }
+symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4"] }
 
 # rustypipe vendored con parche local (GPL-3.0; el código modificado vive en
 # vendor/rustypipe y se ofrece como fuente bajo los términos de la GPL):
@@ -81,9 +82,11 @@ tokio = { version = "1", features = ["test-util"] }
 #   cambio puramente sintáctico para poder mantener `clippy -D warnings`.
 [patch.crates-io]
 rustypipe = { path = "vendor/rustypipe" }
-# Symphonia 0.5.5 rechaza ADTS con más de un raw_data_block por paquete. El
-# parche los decodifica en un mismo AudioBuffer y mantiene el estado de
-# solapamiento entre bloques (MPL-2.0).
+# Symphonia 0.5.5 rechaza ADTS con más de un raw_data_block por paquete y AAC
+# con Program Config Element (`channel_configuration = 0`). El parche decodifica
+# varios bloques en un mismo AudioBuffer con realineado entre ellos, acepta PCE
+# en ASC/ADTS, corrige el sample rate ASC de 24 bits y soporta headers ADTS con
+# CRC y MPEG-2 (MPL-2.0).
 symphonia-codec-aac = { path = "vendor/symphonia-codec-aac" }
 
 # Los probes de YouTube dependen de la feature `youtube` (excluida del binario

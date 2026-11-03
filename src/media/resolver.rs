@@ -97,7 +97,11 @@ pub struct ResolveError {
 
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "no se pudo resolver «{}»", self.key)?;
+        if self.key.trim().is_empty() {
+            write!(f, "no se pudo resolver un track sin identidad")?;
+        } else {
+            write!(f, "no se pudo resolver «{}»", self.key)?;
+        }
         if !self.attempts.is_empty() {
             write!(f, " tras {} intento(s)", self.attempts.len())?;
             let chain: Vec<String> = self
@@ -430,6 +434,17 @@ mod tests {
         async fn check(&self, _r: &mut StreamResolution) -> bool {
             self.alive.load(std::sync::atomic::Ordering::SeqCst)
         }
+    }
+
+    #[test]
+    fn display_replaces_an_empty_key() {
+        let error = ResolveError {
+            key: String::new(),
+            attempts: Vec::new(),
+            root: ResolutionError::new(FailureCategory::NetworkFailure, Source::YouTube, "timeout"),
+        };
+        assert!(error.to_string().contains("sin identidad"));
+        assert!(!error.to_string().contains("«»"));
     }
 
     #[tokio::test]

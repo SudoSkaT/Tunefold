@@ -65,14 +65,35 @@ const STREAM_HEADERS: &[(&str, &str)] = &[
     ("Origin", "https://www.youtube.com"),
 ];
 
-/// Offset del sondeo anti-techo: desde el diagnóstico del límite de ~1 MiB,
-/// las URLs resueltas con clientes directos capados (ANDROID_VR/iOS) responden
-/// 403 en cualquier rango cuyo fin supere ~1 MiB. Un stream SANO responde 206
-/// ahí; uno capado, 403. Verificación obligatoria antes de comprometer la
-/// reproducción.
+/// Primer byte que puede quedar detrás del techo posicional que YouTube aplica
+/// a las URLs resueltas con clientes capados (ANDROID_VR/iOS): ~1 MiB. Un
+/// stream sano sirve cualquier byte del archivo; uno capado responde 403 a
+/// partir de esta frontera (ver `probe_clients`).
+const CAP_FLOOR: u64 = 1024 * 1024;
+/// Inicio del sondeo de prefijo: valida que el primer MiB servible responde.
+const PREFIX_PROBE_START: u64 = 512 * 1024;
+/// Sonda de respaldo cuando la respuesta inicial no permite conocer el tamaño
+/// total (206 sin `Content-Range` utilizable).
 const FAR_PROBE_START: u64 = 1536 * 1024;
-/// Longitud del sondeo lejano.
+/// Longitud de la sonda de respaldo.
 const FAR_PROBE_LEN: u64 = 64 * 1024;
+
+/// Resultado de una sonda Range: status HTTP y tamaño total declarado por la
+/// respuesta (`Content-Range`), si lo trae.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RangeProbe {
+    status: u16,
+    total: Option<u64>,
+}
+
+/// Tamaño declarado en el parámetro `clen` de la URL, como respaldo cuando la
+/// respuesta inicial no trae `Content-Range`.
+fn content_length_from_url(url: &str) -> Option<u64> {
+    url.split("clen=")
+        .nth(1)
+        .and_then(|value| value.split('&').next())
+        .and_then(|value| value.parse().ok())
+}
 
 /// Opciones de construcción del proveedor.
 #[derive(Debug, Clone, Default)]
@@ -208,52 +229,79 @@ impl YoutubeProvider {
     /// el motor de reproducción: contexto de cabeceras + `Range` cerrado.
     ///
     /// Tres sondas:
-    ///   1. `bytes=0-1023`: el stream vive y sirve rangos (206).
-    ///   2. `bytes=512K..1M-1`: el prefijo del primer MiB está servible.
-    ///   3. `bytes=1.5M..+64K` (solo si el archivo llega): detecta el techo
-    ///      posicional (~1 MiB) que YouTube aplica a las URLs resueltas con
-    ///      clientes capados; un stream sano responde 206 ahí. Sin esta sonda,
-    ///      una URL capada pasaría la verificación y cortaría a ~65 s.
+    ///   1. `bytes=0-1023`: el stream vive y sirve rangos (206). Su
+    ///      `Content-Range` da el tamaño real aunque la URL no traiga `clen`.
+    ///   2. `bytes=512K..min(total,1M)-1`: el prefijo del primer MiB está
+    ///      servible.
+    ///   3. último byte del archivo (solo si `total > 1 MiB`): es la prueba
+    ///      exacta del techo posicional. Si la cola responde 206, cualquier
+    ///      ventana que el motor pida antes también; si responde 403, la URL
+    ///      solo serviría un prefijo. La sonda fija de 1.5 MiB no cubría
+    ///      archivos de 1,1–1,6 MiB, que se cortaban a los ~65 s.
     async fn stream_url_ok(&self, url: &str) -> bool {
-        if self.range_probe(url, 0, 1023).await != Some(206) {
+        let Some(first) = self.range_probe(url, 0, 1023).await else {
             return false;
-        }
-        let clen = url
-            .split("clen=")
-            .nth(1)
-            .and_then(|v| v.split('&').next())
-            .and_then(|v| v.parse::<u64>().ok());
-        let Some(clen) = clen else {
-            return true;
         };
-        let start = 512 * 1024;
-        let end = clen.saturating_sub(1).min(1024 * 1024 - 1);
-        if start < end && !matches!(self.range_probe(url, start, end).await, Some(206 | 416)) {
+        if first.status != 206 {
             return false;
         }
-        // Sonda lejana: solo tiene sentido si el archivo supera la frontera.
-        if clen > FAR_PROBE_START + FAR_PROBE_LEN {
+        let Some(total) = first.total.or_else(|| content_length_from_url(url)) else {
+            // Sin tamaño no se puede ubicar la cola: sonda de respaldo.
             return matches!(
                 self.range_probe(url, FAR_PROBE_START, FAR_PROBE_START + FAR_PROBE_LEN - 1)
                     .await,
-                Some(206)
+                Some(RangeProbe { status: 206, .. })
+            );
+        };
+
+        let prefix_end = total.saturating_sub(1).min(CAP_FLOOR - 1);
+        if PREFIX_PROBE_START < prefix_end
+            && !matches!(
+                self.range_probe(url, PREFIX_PROBE_START, prefix_end).await,
+                Some(RangeProbe {
+                    status: 206 | 416,
+                    ..
+                })
+            )
+        {
+            return false;
+        }
+
+        // La cola es la comprobación definitiva del techo: si el último byte
+        // se sirve, el archivo completo es reproducible con cualquier ventana.
+        if total > CAP_FLOOR {
+            let tail = total - 1;
+            return matches!(
+                self.range_probe(url, tail, tail).await,
+                Some(RangeProbe { status: 206, .. })
             );
         }
         true
     }
 
-    /// GET con `Range` cerrado y contexto; devuelve el status HTTP o `None`
-    /// si la petición falló (timeout, conexión).
-    async fn range_probe(&self, url: &str, start: u64, end: u64) -> Option<u16> {
+    /// GET con `Range` cerrado y contexto; devuelve status y, si la respuesta
+    /// lo declara, el tamaño total del recurso (`Content-Range`). `None` si la
+    /// petición falló (timeout, conexión).
+    async fn range_probe(&self, url: &str, start: u64, end: u64) -> Option<RangeProbe> {
         let mut req = self.verify.get(url);
         for (k, v) in STREAM_HEADERS {
             req = req.header(*k, *v);
         }
-        req.header("Range", format!("bytes={start}-{end}"))
+        let response = req
+            .header("Range", format!("bytes={start}-{end}"))
             .send()
             .await
-            .map(|r| r.status().as_u16())
-            .ok()
+            .ok()?;
+        let total = response
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::media::transport::parse_content_range)
+            .and_then(|(_, _, total)| total);
+        Some(RangeProbe {
+            status: response.status().as_u16(),
+            total,
+        })
     }
 
     /// Stream en caché válido para `video_id`, si existe.
@@ -354,9 +402,10 @@ impl YoutubeProvider {
     ///
     /// Orden: VISIONOS SIEMPRE primero — es el único cliente directo actual
     /// cuyas URLs no tienen el techo posicional de ~1 MiB (diagnóstico
-    /// `probe_frontier`: ANDROID_VR/iOS sirven solo el prefijo; verificación
-    /// lejana en [`Self::stream_url_ok`] lo descarta). Android/iOS quedan como
-    /// respaldo rotando cuál va segundo.
+    /// `probe_frontier`: ANDROID_VR/iOS sirven solo el prefijo; la sonda de
+    /// cola de [`Self::stream_url_ok`] las descarta). Android/iOS quedan como
+    /// respaldo rotando cuál va segundo, válidos solo para archivos completos
+    /// por debajo del techo.
     async fn resolve_stream_inner(
         &self,
         video_id: &str,
@@ -782,6 +831,66 @@ impl CatalogProvider for YoutubeProvider {
 mod tests {
     use super::*;
     use crate::domain::track::Thumbnail as TrackThumbnail;
+    use crate::media::transport::fake_server::{FakeServer, Scenario};
+
+    fn test_provider(dir: &tempfile::TempDir) -> YoutubeProvider {
+        YoutubeProvider::with_options(YoutubeOptions {
+            disable_env_proxy: true,
+            cache_dir: Some(dir.path().to_path_buf()),
+        })
+    }
+
+    #[test]
+    fn content_length_is_read_from_the_url_when_present() {
+        assert_eq!(
+            content_length_from_url("https://cdn/x?itag=140&clen=2395999&dur=100"),
+            Some(2395999)
+        );
+        assert_eq!(content_length_from_url("https://cdn/x?itag=140"), None);
+    }
+
+    /// La URL del fake no trae `clen`: el total debe salir del `Content-Range`
+    /// de la primera sonda para poder localizar la cola.
+    #[tokio::test]
+    async fn verification_uses_content_range_to_accept_a_complete_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = test_provider(&dir);
+        let server = FakeServer::start(Scenario::Normal(Arc::new(vec![7; 1200 * 1024]))).await;
+
+        assert!(provider.stream_url_ok(&server.url()).await);
+    }
+
+    /// REGRESIÓN: una URL capada a ~1,06 MiB sobre un archivo de 1,2 MiB
+    /// pasaba la sonda fija de 1,5 MiB (que ni se ejecutaba por tamaño) y
+    /// cortaba la reproducción en el byte 1114112. La sonda de cola debe
+    /// rechazarla.
+    #[tokio::test]
+    async fn verification_rejects_a_capped_tail_of_a_short_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = test_provider(&dir);
+        let server = FakeServer::start(Scenario::ForbiddenBeyond {
+            data: Arc::new(vec![7; 1200 * 1024]),
+            threshold: 1_114_112,
+        })
+        .await;
+
+        assert!(!provider.stream_url_ok(&server.url()).await);
+    }
+
+    /// Un archivo que termina antes del techo no toca la región capada y debe
+    /// seguir aceptándose aunque el servidor tuviera un techo declarado.
+    #[tokio::test]
+    async fn verification_accepts_a_file_that_ends_before_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = test_provider(&dir);
+        let server = FakeServer::start(Scenario::ForbiddenBeyond {
+            data: Arc::new(vec![7; 900 * 1024]),
+            threshold: 1_114_112,
+        })
+        .await;
+
+        assert!(provider.stream_url_ok(&server.url()).await);
+    }
 
     #[test]
     fn thumbnail_candidates_prefer_api_then_rebuild() {

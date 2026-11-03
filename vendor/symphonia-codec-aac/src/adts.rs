@@ -42,7 +42,7 @@ impl QueryDescriptor for AdtsReader {
             "Audio Data Transport Stream (native AAC)",
             &["aac"],
             &["audio/aac"],
-            &[&[0xff, 0xf1]]
+            &[&[0xff, 0xf1], &[0xff, 0xf0], &[0xff, 0xf8], &[0xff, 0xf9]]
         )]
     }
 
@@ -59,29 +59,44 @@ struct AdtsHeader {
     sample_rate: u32,
     frame_len: usize,
     num_aac_frames: u32,
+    header_size: usize,
 }
 
 impl AdtsHeader {
     const SIZE: usize = 7;
+    const SIZE_CRC: usize = 9;
 
-    fn sync<B: ReadBytes>(reader: &mut B) -> Result<()> {
+    fn sync<B: ReadBytes>(reader: &mut B) -> Result<u16> {
         let mut sync = 0u16;
 
-        while sync != 0xfff1 {
+        loop {
             sync = (sync << 8) | u16::from(reader.read_u8()?);
-        }
 
-        Ok(())
+            // Accept MPEG-4 (ID=0) and MPEG-2 (ID=1), with or without CRC.
+            if (sync & 0xfff6) == 0xfff0 {
+                return Ok(sync);
+            }
+        }
     }
 
     fn read<B: ReadBytes>(reader: &mut B) -> Result<Self> {
-        AdtsHeader::sync(reader)?;
+        let sync = AdtsHeader::sync(reader)?;
 
-        // The header may be 5 or 7 bytes (without or with protection).
-        let mut buf = [0u8; 7];
-        reader.read_buf_exact(&mut buf[..5])?;
+        // The header is 7 bytes without protection, 9 bytes with a CRC. The
+        // CRC covers the fixed header (and optionally the payload); either way
+        // it must be skipped before the raw_data_block.
+        let header_size = if sync & 1 == 1 {
+            AdtsHeader::SIZE
+        }
+        else {
+            AdtsHeader::SIZE_CRC
+        };
+        let mut buf = [0u8; AdtsHeader::SIZE_CRC];
+        buf[0] = (sync >> 8) as u8;
+        buf[1] = sync as u8;
+        reader.read_buf_exact(&mut buf[2..header_size])?;
 
-        let mut bs = BitReaderLtr::new(&buf);
+        let mut bs = BitReaderLtr::new(&buf[2..AdtsHeader::SIZE]);
 
         // Profile
         let profile = M4A_TYPES[bs.read_bits_leq32(2)? as usize + 1];
@@ -105,10 +120,10 @@ impl AdtsHeader {
         // Originality, Home, Copyrighted ID bit, Copyright ID start bits. Only used for encoding.
         bs.ignore_bits(4)?;
 
-        // Frame length = Header size (7) + AAC frame size
+        // Frame length = header size (7 or 9) + AAC frame size.
         let frame_len = bs.read_bits_leq32(13)? as usize;
 
-        if frame_len < AdtsHeader::SIZE {
+        if frame_len < header_size {
             return decode_error("adts: invalid adts frame length");
         }
 
@@ -119,8 +134,9 @@ impl AdtsHeader {
             profile,
             channels,
             sample_rate,
-            frame_len: frame_len - AdtsHeader::SIZE,
+            frame_len: frame_len - header_size,
             num_aac_frames,
+            header_size,
         })
     }
 }
@@ -142,7 +158,7 @@ impl FormatReader for AdtsReader {
         }
 
         // Rewind back to the start of the frame.
-        source.seek_buffered_rev(AdtsHeader::SIZE);
+        source.seek_buffered_rev(header.header_size);
 
         let first_frame_pos = source.pos();
 
@@ -243,7 +259,7 @@ impl FormatReader for AdtsReader {
             if self.next_packet_ts + SAMPLES_PER_AAC_PACKET * u64::from(header.num_aac_frames)
                 > required_ts
             {
-                self.reader.seek_buffered_rev(AdtsHeader::SIZE);
+                self.reader.seek_buffered_rev(header.header_size);
                 break;
             }
 
@@ -292,7 +308,7 @@ fn approximate_frame_count(mut source: &mut MediaSourceStream) -> Result<Option<
             }
 
             parsed_n_frames += 1;
-            n_bytes += header.frame_len + AdtsHeader::SIZE;
+            n_bytes += header.frame_len + header.header_size;
         }
 
         let _ = source.seek_buffered(original_pos);
@@ -321,7 +337,7 @@ fn approximate_frame_count(mut source: &mut MediaSourceStream) -> Result<Option<
                 }
 
                 parsed_n_frames += u64::from(header.num_aac_frames);
-                n_bytes += header.frame_len + AdtsHeader::SIZE;
+                n_bytes += header.frame_len + header.header_size;
             }
         }
 

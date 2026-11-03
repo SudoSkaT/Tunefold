@@ -9,6 +9,7 @@ use crate::app::aggregator::SearchOutcome;
 use crate::app::audio::PlaybackStatus;
 use crate::app::thumbnail::ThumbnailState;
 use crate::domain::{source::Source, track::Track};
+use crate::dsp::DspParams;
 use crate::infrastructure::config::ConfigForm;
 use crate::infrastructure::storage::{HistoryEntry, PlaylistRow, TrackListeningStats};
 use crate::playback::queue::{QueueItemOrigin, RepeatMode};
@@ -57,6 +58,8 @@ pub enum BackendEvent {
     ListeningStats(Vec<TrackListeningStats>),
     Sources(Vec<Source>),
     Settings(ConfigForm),
+    /// Estado actual del pipeline DSP.
+    Dsp(DspParams),
     Playback(PlaybackStatus),
     /// Recuperación en caliente del MISMO track (re-resolución del stream):
     /// el motor reinició la canción desde el prefijo servible, así que la UI

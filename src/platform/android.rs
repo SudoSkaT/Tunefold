@@ -33,6 +33,10 @@ pub struct AndroidEngine {
     sample_rate: Arc<AtomicU64>,
     volume: Arc<Mutex<f32>>,
     cancel: Arc<AtomicBool>,
+    /// Serializa play/stop/destroy. Sin esto, un `stop` podía tomar el slot de
+    /// decoder antes de que `play` instalara el handle recién creado, dejando
+    /// vivo un hilo que el stop creía haber retirado.
+    lifecycle: Mutex<()>,
     decoder_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     state: Arc<AtomicU8>,
     decoder_finished: Arc<AtomicBool>,
@@ -125,6 +129,7 @@ pub extern "C" fn tunefold_oboe_create_engine() -> *mut AndroidEngine {
         sample_rate: Arc::new(AtomicU64::new(0)),
         volume: Arc::new(Mutex::new(1.0)),
         cancel: Arc::new(AtomicBool::new(false)),
+        lifecycle: Mutex::new(()),
         decoder_handle: Arc::new(Mutex::new(None)),
         state: Arc::new(AtomicU8::new(STATE_IDLE)),
         decoder_finished: Arc::new(AtomicBool::new(false)),
@@ -168,6 +173,10 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
         return;
     }
     let engine = &*engine;
+    let _lifecycle = engine
+        .lifecycle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let url_str = std::ffi::CStr::from_ptr(url).to_string_lossy().into_owned();
     // `file:` reaches the decoder's local-media branch: a downloaded track is
@@ -182,10 +191,9 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
     }
 
     engine.cancel.store(true, Ordering::Release);
-    if let Ok(mut handle) = engine.decoder_handle.lock() {
-        if let Some(h) = handle.take() {
-            let _ = h.join();
-        }
+    let previous = engine.decoder_handle.lock().ok().and_then(|mut h| h.take());
+    if let Some(h) = previous {
+        let _ = h.join();
     }
 
     let mut header_vec = Vec::new();
@@ -226,6 +234,10 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
     engine
         .decoder_diagnostics
         .decoded_frames
+        .store(0, Ordering::Release);
+    engine
+        .decoder_diagnostics
+        .decode_errors
         .store(0, Ordering::Release);
     engine
         .decoder_diagnostics
@@ -303,6 +315,14 @@ pub unsafe extern "C" fn tunefold_oboe_play_stream(
                     }
                 }
                 Err(error) => {
+                    // A stop/track-change flips `cancel` before joining this
+                    // thread. Its blocked transport returns an error, but that
+                    // is not a playback failure and must not overwrite the new
+                    // track's state with STATE_ERROR.
+                    if cancel.load(Ordering::Acquire) {
+                        decoder_finished.store(true, Ordering::Release);
+                        return;
+                    }
                     if let Ok(mut diagnostic) = decoder_stage.stage.lock() {
                         *diagnostic = format!("decoder error: {error}");
                     }
@@ -341,16 +361,19 @@ pub unsafe extern "C" fn tunefold_oboe_stop(engine: *mut AndroidEngine) {
         return;
     }
     let engine = &*engine;
+    let _lifecycle = engine
+        .lifecycle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     engine.playing.store(false, Ordering::Release);
     engine.cancel.store(true, Ordering::Release);
     engine.decoder_finished.store(true, Ordering::Release);
     if engine.state.load(Ordering::Acquire) != STATE_ERROR {
         engine.state.store(STATE_STOPPED, Ordering::Release);
     }
-    if let Ok(mut handle) = engine.decoder_handle.lock() {
-        if let Some(h) = handle.take() {
-            let _ = h.join();
-        }
+    let previous = engine.decoder_handle.lock().ok().and_then(|mut h| h.take());
+    if let Some(h) = previous {
+        let _ = h.join();
     }
     // Cleared AFTER the join, not before. `PcmRing` is single-producer /
     // single-consumer, and its producer is the decoder thread this join retires;
@@ -505,11 +528,14 @@ pub unsafe extern "C" fn tunefold_oboe_seek(engine: *mut AndroidEngine, position
     if engine.is_null() {
         return;
     }
-    let engine = &*engine;
-    engine.ring.clear();
-    if let Ok(mut pos) = engine.position_ms.lock() {
-        *pos = position_ms;
-    }
+    // The decoder is a forward-only HTTP reader; seeking would require
+    // reopening the source at a byte offset and recreating the decoder.
+    // Clearing the ring from this thread while the producer may be inside
+    // `push` is a data race on the logical stream (and was audible as stale
+    // PCM). The Kotlin controller advertises `supportsSeek() == false`;
+    // rejecting the call keeps the position clock and the ring consistent.
+    let _ = (engine, position_ms);
+    tracing::warn!("android_seek_rejected: seeking is not supported by the streaming decoder");
 }
 
 /// # Safety

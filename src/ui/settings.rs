@@ -20,12 +20,20 @@ struct FieldDef {
     set: fn(&mut ConfigForm, String),
 }
 
-const FIELDS: [FieldDef; 1] = [FieldDef {
-    label: "Backend de reproducción (auto/rodio)",
-    hint: "auto enruta por fuente; 'rodio' fuerza el motor local.",
-    get: |f| &f.playback_policy,
-    set: |f, v| f.playback_policy = v,
-}];
+const FIELDS: [FieldDef; 2] = [
+    FieldDef {
+        label: "Backend de reproducción (auto/rodio)",
+        hint: "auto enruta por fuente; 'rodio' fuerza el motor local.",
+        get: |f| &f.playback_policy,
+        set: |f, v| f.playback_policy = v,
+    },
+    FieldDef {
+        label: "DSP (JSON)",
+        hint: "Parámetros del pipeline DSP serializados; Enter guarda y aplica en vivo.",
+        get: |f| &f.dsp_json,
+        set: |f, v| f.dsp_json = v,
+    },
+];
 
 /// Estado del editor de ajustes.
 pub struct SettingsForm {

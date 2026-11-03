@@ -1380,6 +1380,9 @@ impl App {
                 self.settings = Some(SettingsForm::new(form));
                 self.status = Some("Ajustes · Enter guarda en .env, Esc vuelve.".to_string());
             }
+            BackendEvent::Dsp(_) => {
+                self.status = Some("DSP actualizado.".to_string());
+            }
             BackendEvent::Playback(mut status) => {
                 // Solo se aceptan ticks del track pedido (pending) o del que la
                 // UI ya muestra: los ticks obsoletos (p. ej. la respuesta de un

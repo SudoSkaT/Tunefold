@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::app::audio::PlaybackPolicy;
 use crate::domain::source::Source;
+use crate::dsp::DspParams;
 
 /// Flags de funcionalidad (spec §32).
 ///
@@ -104,6 +105,9 @@ fn parse_bool(raw: &str) -> Option<bool> {
 pub struct Config {
     pub playback_policy: PlaybackPolicy,
     pub flags: FeatureFlags,
+    /// Parámetros del pipeline DSP (preamp, EQ, estéreo, normalización,
+    /// limitador). Se publican en el motor sin reconstruirlo.
+    pub dsp: DspParams,
 }
 
 impl Config {
@@ -127,9 +131,15 @@ impl Config {
             PlaybackPolicy::Global(playback_policy)
         };
 
+        let dsp: DspParams = std::env::var("DSP_PARAMS")
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+
         Config {
             playback_policy,
             flags: FeatureFlags::from_env(),
+            dsp: dsp.sanitized(),
         }
     }
 
@@ -158,6 +168,7 @@ impl Config {
     pub fn form(&self) -> ConfigForm {
         ConfigForm {
             playback_policy: self.playback_policy_display(),
+            dsp_json: serde_json::to_string(&self.dsp).unwrap_or_default(),
             proxy: std::env::var("HTTP_PROXY")
                 .or_else(|_| std::env::var("HTTPS_PROXY"))
                 .or_else(|_| std::env::var("ALL_PROXY"))
@@ -181,6 +192,11 @@ impl Config {
             } else {
                 PlaybackPolicy::Global(form.playback_policy.trim().to_string())
             };
+        if !form.dsp_json.trim().is_empty() {
+            if let Ok(params) = serde_json::from_str::<DspParams>(form.dsp_json.trim()) {
+                self.dsp = params.sanitized();
+            }
+        }
     }
 
     /// Persiste un formulario al `.env` canónico (`~/.config/tunefold/.env`)
@@ -189,7 +205,15 @@ impl Config {
     /// Los feature flags NO se persisten aquí: su superficie de control es el
     /// entorno/`.env` manual (apagable sin recompilar y sin tocar ajustes UI).
     pub fn persist(form: &ConfigForm) -> anyhow::Result<()> {
-        let updates: [(&str, Option<&str>); 1] = [kv("PLAYBACK_POLICY", &form.playback_policy)];
+        let dsp_json = if form.dsp_json.trim().is_empty() {
+            None
+        } else {
+            Some(form.dsp_json.trim())
+        };
+        let updates: [(&str, Option<&str>); 2] = [
+            kv("PLAYBACK_POLICY", &form.playback_policy),
+            ("DSP_PARAMS", dsp_json),
+        ];
         let path = super::dirs::env_path();
         upsert_env_file(path.to_str().unwrap_or(".env"), &updates)?;
         Ok(())
@@ -200,6 +224,8 @@ impl Config {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConfigForm {
     pub playback_policy: String,
+    /// Parámetros DSP serializados en JSON (editable y persistente).
+    pub dsp_json: String,
     /// Estado del proxy del entorno (solo lectura, no se persiste).
     pub proxy: String,
     /// Resumen de feature flags de proveedores (solo lectura).
@@ -287,6 +313,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.apply_form(&ConfigForm {
             playback_policy: "rodio".to_string(),
+            dsp_json: String::new(),
             proxy: String::new(),
             providers: String::new(),
         });

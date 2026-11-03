@@ -66,15 +66,56 @@ impl Track {
     }
 
     /// Identificador estable para comparar copias del mismo track
-    /// (recomendaciones, autoplay). Usa el id externo si existe; si no, una
-    /// firma de título + primer artista.
+    /// (recomendaciones, autoplay). Usa el id externo si existe y no está
+    /// vacío; si no, una firma de título + primer artista, y como último
+    /// recurso `desconocido:<id>` para no producir claves vacías.
     pub fn identifier(&self) -> String {
-        self.external_id.clone().unwrap_or_else(|| {
-            format!(
-                "{}|{}",
-                self.title,
-                self.primary_artist_name().unwrap_or("")
-            )
-        })
+        if let Some(external_id) = self
+            .external_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|external_id| !external_id.is_empty())
+        {
+            return external_id.to_string();
+        }
+
+        let title = self.title.trim();
+        let artist = self.primary_artist_name().unwrap_or("").trim();
+        if title.is_empty() && artist.is_empty() {
+            format!("desconocido:{}", self.id)
+        } else {
+            format!("{title}|{artist}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::artist::Artist;
+
+    #[test]
+    fn identifier_rejects_an_empty_external_id_and_falls_back_to_title() {
+        let mut track = Track::new(
+            "Canción".to_string(),
+            vec![Artist::new("Artista".to_string(), None, None, None)],
+            Source::YouTube,
+        );
+        track.external_id = Some("   ".to_string());
+
+        assert_eq!(track.identifier(), "Canción|Artista");
+    }
+
+    #[test]
+    fn identifier_without_any_metadata_is_not_empty() {
+        let track = Track::new(String::new(), Vec::new(), Source::YouTube);
+        assert_eq!(track.identifier(), "desconocido:0");
+    }
+
+    #[test]
+    fn identifier_keeps_the_provider_external_id() {
+        let mut track = Track::new(String::new(), Vec::new(), Source::YouTube);
+        track.external_id = Some("abc123".to_string());
+        assert_eq!(track.identifier(), "abc123");
     }
 }

@@ -2,6 +2,7 @@
 //! en segundo plano (para no bloquear el renderizado) y devuelve eventos.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use crate::app::playback::PlaybackRouter;
 use crate::app::search::SearchEngine;
 use crate::app::thumbnail::{ThumbnailService, ThumbnailState};
 use crate::domain::track::Track;
+use crate::dsp::DspParams;
 use crate::infrastructure::config::{Config, ConfigForm};
 use crate::infrastructure::db::Db;
 use crate::infrastructure::playback;
@@ -36,6 +38,10 @@ pub enum BackendCommand {
     ResolveLink(String, u64),
     SaveTrack(Box<Track>),
     SaveSettings(Box<ConfigForm>),
+    /// Publica parámetros DSP en el motor en vivo (sin reconstruirlo).
+    SetDsp(Box<DspParams>),
+    /// Solicita el estado DSP actual.
+    LoadDsp,
     LoadHistory,
     LoadListeningStats,
     LoadSources,
@@ -130,6 +136,8 @@ pub struct Backend {
     search: SearchEngine,
     history: History,
     config: Config,
+    /// Control compartido del pipeline DSP (en vivo, sin reconstruir motores).
+    dsp: crate::dsp::DspControl,
     http: reqwest::Client,
     router: Arc<PlaybackRouter>,
     /// Resolución de streams: caché → router de proveedores → política de
@@ -154,6 +162,13 @@ pub struct Backend {
     acoustic_since: Arc<tokio::sync::Mutex<Option<AcousticAggregator>>>,
     /// Presupuesto de auto-recuperación: UN refresco de stream por track.
     recovery_budget: Arc<tokio::sync::Mutex<RecoveryBudget>>,
+    /// Época de intención de reproducción: cada `Play`/skip/autoplay incrementa
+    /// este contador al aceptarse. Una resolución lenta de una orden vieja no
+    /// puede pisar la canción que el usuario pidió después.
+    playback_epoch: Arc<AtomicU64>,
+    /// Serializa el commit de una reproducción (mutación de current/queue y
+    /// arranque del motor). La resolución de red queda fuera del lock.
+    playback_commit: Arc<tokio::sync::Mutex<()>>,
     /// Preparación anticipada del SIGUIENTE track (warm de caché).
     preload: Arc<crate::playback::PreloadManager>,
     /// Bus de features del análisis de audio (`None` si el flag está OFF).
@@ -205,7 +220,7 @@ impl Backend {
         // análisis de audio (si está habilitado) entrega además sus buses de
         // features y forma de onda a los consumidores (visualización).
         let (bus, joined) = EventBus::channel();
-        let (engine_config, features, waveform) =
+        let (engine_config, features, waveform, dsp) =
             playback::build_engines(&config, bus, http.clone());
         let router = Arc::new(PlaybackRouter::new(engine_config, joined));
 
@@ -221,6 +236,7 @@ impl Backend {
             http,
             db,
             config,
+            dsp,
             router,
             resolver: composed.stream_resolver,
             autoplay: Arc::new(tokio::sync::Mutex::new(true)),
@@ -229,6 +245,8 @@ impl Backend {
             current_context: Arc::new(tokio::sync::Mutex::new(None)),
             acoustic_since: Arc::new(tokio::sync::Mutex::new(None)),
             recovery_budget: Arc::new(tokio::sync::Mutex::new(RecoveryBudget::default())),
+            playback_epoch: Arc::new(AtomicU64::new(0)),
+            playback_commit: Arc::new(tokio::sync::Mutex::new(())),
             preload,
             features,
             waveform,
@@ -250,6 +268,11 @@ impl Backend {
         self.waveform.as_ref()
     }
 
+    /// Control compartido del pipeline DSP (publicación no bloqueante).
+    pub fn dsp_control(&self) -> crate::dsp::DspControl {
+        self.dsp.clone()
+    }
+
     /// Reconstruye el agregador de proveedores a partir de la configuración actual.
     fn rebuild_providers(&mut self) {
         let composed = crate::api::compose_media(self.db.clone(), &self.config.flags);
@@ -260,25 +283,51 @@ impl Backend {
         self.thumbnails = Arc::new(ThumbnailService::new(self.http.clone(), aggregator));
     }
 
-    /// Resuelve el stream de un track y lo entrega al motor de reproducción.
-    ///
-    /// Toda la estrategia (caché caliente, caché fría SQLite con verificación,
-    /// reintentos acotados, fallback entre proveedores, expiración) vive en el
-    /// [`crate::media::StreamResolver`]; aquí solo queda la entrega al motor.
-    async fn play_track(&self, track: &Track) -> Result<PlaybackStatus, String> {
+    /// Nueva intención de reproducción. Se registra ANTES de resolver para que
+    /// una orden anterior que termine más tarde sepa que ya no es la vigente.
+    async fn begin_playback_epoch(&self) -> u64 {
+        let epoch = self.playback_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Si el motor anterior todavía estaba llenando su buffer inicial,
+        // está a punto de entrar en el commit de OTRA orden. Cancelarlo ahora
+        // evita que la nueva orden espere hasta el timeout de prebuffer.
+        if self.router.is_buffering().await {
+            let _ = self.router.stop().await;
+        }
+
+        epoch
+    }
+
+    fn playback_is_current(&self, epoch: u64) -> bool {
+        self.playback_epoch.load(Ordering::SeqCst) == epoch
+    }
+
+    fn superseded_error() -> String {
+        "reproducción reemplazada por otra orden".to_string()
+    }
+
+    /// `true` cuando el error solo significa que otra orden ganó la carrera:
+    /// no debe mostrarse como fallo de la canción vigente.
+    fn is_superseded(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("reemplazad") || lower.contains("cancelad")
+    }
+
+    /// Resuelve el stream de un track. Toda la estrategia (caché caliente,
+    /// caché fría SQLite con verificación, reintentos acotados, fallback entre
+    /// proveedores, expiración) vive en [`crate::media::StreamResolver`].
+    async fn resolve_playable(
+        &self,
+        track: &Track,
+    ) -> Result<crate::domain::stream::MediaSource, String> {
         let resolution = self
             .resolver
             .resolve(track)
             .await
             .map_err(|e| e.to_string())?;
-        let media_source = resolution
+        resolution
             .media_source()
-            .ok_or_else(|| format!("resolución no reproducible para {}", track.source))?;
-
-        self.router
-            .play(track, Some(media_source))
-            .await
-            .map_err(|e| e.to_string())
+            .ok_or_else(|| format!("resolución no reproducible para {}", track.source))
     }
 
     /// Arranca una reproducción y solo después la hace visible como escucha
@@ -299,15 +348,53 @@ impl Backend {
         ),
         String,
     > {
-        // Ancla de la cola, track en curso y presupuesto de recuperación se
-        // actualizan ANTES de intentar reproducir (semántica histórica).
+        // La época se toma al aceptar la orden, no al terminar la resolución:
+        // si dos canciones se resuelven en paralelo, gana la que el usuario
+        // pidió después, aunque su red tarde más.
+        let epoch = self.begin_playback_epoch().await;
         let key = track.identifier();
+        tracing::info!(epoch, key = %key, ?context, "playback_intent");
+
+        // Resolución de red/caché FUERA del lock de commit: no bloquea a una
+        // orden posterior mientras se espera al proveedor.
+        let media_source = match self.resolve_playable(&track).await {
+            Ok(media_source) => media_source,
+            // Un fallo de resolución de una orden ya reemplazada no debe
+            // mostrarse como error de la canción vigente.
+            Err(_) if !self.playback_is_current(epoch) => {
+                tracing::debug!(epoch, key = %key, "playback_intent_superseded");
+                return Err(Self::superseded_error());
+            }
+            Err(error) => return Err(error),
+        };
+        if !self.playback_is_current(epoch) {
+            tracing::debug!(epoch, key = %key, "playback_intent_superseded");
+            return Err(Self::superseded_error());
+        }
+
+        // Commit serializado: solo la época vigente muta current/cola y
+        // arranca el motor. Una orden vieja que llegue aquí después pierde.
+        let _commit = self.playback_commit.lock().await;
+        if !self.playback_is_current(epoch) {
+            tracing::debug!(epoch, key = %key, "playback_commit_superseded");
+            return Err(Self::superseded_error());
+        }
         self.queue.lock().await.mark_played(&key);
         *self.current.lock().await = Some(track.clone());
         *self.current_context.lock().await = Some(context);
         self.recovery_budget.lock().await.arm(&key);
 
-        let mut status = self.play_track(&track).await?;
+        let played = self.router.play(&track, Some(media_source)).await;
+        // Si otra orden (p. ej. Stop) cambió la época mientras el motor
+        // arrancaba, no se persiste nada: además hay que parar el audio que
+        // este `play` pudo haber llegado a arrancar después del stop.
+        if !self.playback_is_current(epoch) {
+            let _ = self.router.stop().await;
+            tracing::debug!(epoch, key = %key, "playback_start_superseded");
+            return Err(Self::superseded_error());
+        }
+        let mut status = played.map_err(|e| e.to_string())?;
+        tracing::info!(epoch, key = %key, "playback_committed");
         let mut persisted = status.track.clone().unwrap_or(track);
         if persisted.duration.is_none() {
             persisted.duration = status.duration;
@@ -390,13 +477,21 @@ impl Backend {
                 // Reconstruye router y motores con la nueva política/config
                 // (el Drop del AnalysisRuntime viejo detiene su hilo).
                 let (bus, joined) = EventBus::channel();
-                let (engine_config, features, waveform) =
+                let (engine_config, features, waveform, dsp) =
                     playback::build_engines(&self.config, bus, self.http.clone());
                 self.router = Arc::new(PlaybackRouter::new(engine_config, joined));
                 self.features = features;
                 self.waveform = waveform;
+                self.dsp = dsp;
                 Some(BackendEvent::Settings(self.config.form()))
             }
+            BackendCommand::SetDsp(params) => {
+                let params = *params;
+                self.config.dsp = params.sanitized();
+                self.dsp.set(self.config.dsp);
+                Some(BackendEvent::Dsp(self.config.dsp))
+            }
+            BackendCommand::LoadDsp => Some(BackendEvent::Dsp(self.config.dsp)),
             BackendCommand::LoadHistory => match self.history.recent(30).await {
                 Ok(entries) => Some(BackendEvent::History(entries)),
                 Err(e) => Some(BackendEvent::Error(format!("historial: {e}"))),
@@ -437,10 +532,15 @@ impl Backend {
                     Some(BackendEvent::Playback(status))
                 }
             }
-            BackendCommand::Stop => match self.router.stop().await {
-                Ok(status) => Some(BackendEvent::Playback(status)),
-                Err(e) => Some(BackendEvent::PlaybackError(e.to_string())),
-            },
+            BackendCommand::Stop => {
+                // Invalida cualquier `Play`/recuperación en vuelo: un stop no
+                // puede ser revivido por una resolución que termine después.
+                self.playback_epoch.fetch_add(1, Ordering::SeqCst);
+                match self.router.stop().await {
+                    Ok(status) => Some(BackendEvent::Playback(status)),
+                    Err(e) => Some(BackendEvent::PlaybackError(e.to_string())),
+                }
+            }
             BackendCommand::Volume(vol) => match self.router.set_volume(vol).await {
                 Ok(status) => Some(BackendEvent::Playback(status)),
                 Err(e) => Some(BackendEvent::PlaybackError(e.to_string())),
@@ -551,6 +651,7 @@ impl Backend {
                 // `autoplay_next`.)
                 match self.start_and_record(*track, PlayContext::Manual).await {
                     Ok((status, stats)) => vec![BackendEvent::PlaybackStarted { status, stats }],
+                    Err(e) if Self::is_superseded(&e) => Vec::new(),
                     Err(e) => vec![BackendEvent::PlaybackError(e)],
                 }
             }
@@ -564,17 +665,20 @@ impl Backend {
                     .await
                 {
                     Ok((status, stats)) => vec![BackendEvent::PlaybackStarted { status, stats }],
+                    Err(e) if Self::is_superseded(&e) => Vec::new(),
                     Err(e) => vec![BackendEvent::PlaybackError(e)],
                 }
             }
             BackendCommand::NextTrack => match self.skip_track(true).await {
                 Ok(Some((status, stats))) => vec![BackendEvent::PlaybackStarted { status, stats }],
                 Ok(None) => Vec::new(),
+                Err(e) if Self::is_superseded(&e) => Vec::new(),
                 Err(e) => vec![BackendEvent::Message(e)],
             },
             BackendCommand::PrevTrack => match self.skip_track(false).await {
                 Ok(Some((status, stats))) => vec![BackendEvent::PlaybackStarted { status, stats }],
                 Ok(None) => Vec::new(),
+                Err(e) if Self::is_superseded(&e) => Vec::new(),
                 Err(e) => vec![BackendEvent::Message(e)],
             },
             BackendCommand::LoadRelated(track, generation) => {
@@ -877,6 +981,7 @@ impl Backend {
                             Ok((status, stats)) => {
                                 ev.push(BackendEvent::PlaybackStarted { status, stats })
                             }
+                            Err(e) if Self::is_superseded(&e) => {}
                             Err(e) => ev.push(BackendEvent::PlaybackError(e)),
                         }
                         ev
@@ -1406,19 +1511,56 @@ impl Backend {
         let Some(track) = self.current.lock().await.clone() else {
             return RecoveryOutcome::Failed(original_notice);
         };
-        tracing::warn!(key = %track.identifier(), "playback_recovery_started");
+        let key = track.identifier();
+        // La recuperación pertenece a la sesión que falló. Si el usuario ya
+        // eligió otra canción, no debe re-resolver ni arrancar la vieja.
+        let epoch = self.playback_epoch.load(Ordering::SeqCst);
+        tracing::warn!(epoch, key = %key, "playback_recovery_started");
         let fresh = async { self.resolver.refresh(&track).await.ok()?.media_source() };
-        match fresh.await {
-            Some(media_source) => match self.router.play(&track, Some(media_source)).await {
-                Ok(status) => {
-                    tracing::info!(key = %track.identifier(), "playback_recovery_success");
-                    RecoveryOutcome::Resumed(status)
+        let Some(media_source) = fresh.await else {
+            if !self.playback_is_current(epoch) {
+                tracing::info!(epoch, key = %key, "playback_recovery_superseded");
+                return RecoveryOutcome::Superseded;
+            }
+            tracing::warn!(epoch, key = %key, "playback_recovery_resolve_failed");
+            return RecoveryOutcome::Failed(original_notice);
+        };
+        let _commit = self.playback_commit.lock().await;
+        if !self.playback_is_current(epoch) {
+            tracing::info!(epoch, key = %key, "playback_recovery_superseded");
+            return RecoveryOutcome::Superseded;
+        }
+        let still_current = self
+            .current
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|current| current.identifier() == key);
+        if !still_current {
+            tracing::info!(epoch, key = %key, "playback_recovery_superseded");
+            return RecoveryOutcome::Superseded;
+        }
+        match self.router.play(&track, Some(media_source)).await {
+            Ok(status) if self.playback_is_current(epoch) => {
+                tracing::info!(epoch, key = %key, "playback_recovery_success");
+                RecoveryOutcome::Resumed(status)
+            }
+            Ok(_) => {
+                // El `play` pudo arrancar antes de que Stop invalidara la
+                // época: no dejar sonando una recuperación ya obsoleta.
+                let _ = self.router.stop().await;
+                tracing::info!(epoch, key = %key, "playback_recovery_superseded");
+                RecoveryOutcome::Superseded
+            }
+            Err(_) => {
+                if !self.playback_is_current(epoch) {
+                    let _ = self.router.stop().await;
+                    tracing::info!(epoch, key = %key, "playback_recovery_superseded");
+                    RecoveryOutcome::Superseded
+                } else {
+                    tracing::warn!(epoch, key = %key, "playback_recovery_failed");
+                    RecoveryOutcome::Failed(original_notice)
                 }
-                Err(_) => RecoveryOutcome::Failed(original_notice),
-            },
-            None => {
-                tracing::warn!(key = %track.identifier(), "playback_recovery_failed");
-                RecoveryOutcome::Failed(original_notice)
             }
         }
     }
@@ -1428,6 +1570,8 @@ impl Backend {
 #[allow(clippy::large_enum_variant)] // mismo patrón que BackendEvent
 enum RecoveryOutcome {
     Resumed(PlaybackStatus),
+    /// Otra reproducción ganó la carrera: no hay nada que avisar.
+    Superseded,
     /// No se pudo: se informa con el aviso ORIGINAL (nunca ocultar la causa).
     Failed(String),
 }
@@ -1545,8 +1689,9 @@ pub fn spawn_backend(
                                         // una reproducción nueva del usuario
                                         // mientras se resolvía la cola (ese
                                         // fallo de autoplay es irrelevante).
-                                        if backend.queue.lock().await.last_played()
-                                            == finished_after.as_deref()
+                                        if !Backend::is_superseded(&e)
+                                            && backend.queue.lock().await.last_played()
+                                                == finished_after.as_deref()
                                         {
                                             let _ = event_tx.send(BackendEvent::PlaybackError(e));
                                         }
@@ -1601,7 +1746,7 @@ pub fn spawn_backend(
                                     match backend.recover_current(msg.clone()).await {
                                         RecoveryOutcome::Resumed(status) => {
                                             let _ = event_tx.send(BackendEvent::Message(
-                                                "stream renovado tras un fallo; seguimos donde estabas.".to_string(),
+                                                "stream renovado tras un fallo; la reproducción se reinició desde el inicio.".to_string(),
                                             ));
                                             // Evento DEDICADO: la UI debe tratar el
                                             // reinicio como replay del mismo track
@@ -1611,6 +1756,7 @@ pub fn spawn_backend(
                                             // posición previa.
                                             let _ = event_tx.send(BackendEvent::RecoveryResumed(status));
                                         }
+                                        RecoveryOutcome::Superseded => {}
                                         RecoveryOutcome::Failed(original) => {
                                             let _ = event_tx.send(BackendEvent::StreamError(original));
                                         }
@@ -1784,6 +1930,16 @@ mod tests {
         assert_eq!(t.identifier(), "vid");
         t.external_id = None;
         assert_eq!(t.identifier(), "Canción|Banda");
+    }
+
+    #[test]
+    fn only_race_losses_are_treated_as_superseded_errors() {
+        assert!(Backend::is_superseded(
+            "reproducción reemplazada por otra orden"
+        ));
+        assert!(Backend::is_superseded("salto: operación cancelada"));
+        assert!(!Backend::is_superseded("no se pudo resolver «x»"));
+        assert!(!Backend::is_superseded("formato no soportado"));
     }
 
     /// Los cortes de estado del motor se reenvían a la UI INMEDIATAMENTE (para

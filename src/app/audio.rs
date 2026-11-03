@@ -155,6 +155,13 @@ pub trait PlaybackEngine: fmt::Debug + Send + Sync {
 
     /// Snapshot actual del estado.
     fn status(&self) -> PlaybackStatus;
+
+    /// `true` si el motor está llenando su buffer inicial. Se usa para
+    /// cancelar un prebuffer viejo al aceptar una orden nueva sin provocar los
+    /// efectos laterales de `status()` (p. ej. publicar `Finished`).
+    fn is_buffering(&self) -> bool {
+        self.status().state == PlaybackState::Buffering
+    }
 }
 
 /// Política de selección de backend.

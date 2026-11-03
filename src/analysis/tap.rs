@@ -24,12 +24,16 @@ impl<S> TapSource<S>
 where
     S: rodio::source::Source<Item = f32>,
 {
-    /// Envuelve `inner` anunciando su formato al motor de análisis.
+    /// Envuelve `inner` anunciando su formato y declarando una fuente nueva.
+    ///
+    /// El anuncio solo resetea el análisis si cambia el formato; `begin_source`
+    /// garantiza el reset aunque dos pistas consecutivas compartan formato.
     pub fn new(inner: S, tap: PcmTap) -> Self {
         tap.announce(StreamMeta {
             sample_rate: inner.sample_rate().get(),
             channels: inner.channels().get(),
         });
+        tap.begin_source();
         Self { inner, tap }
     }
 
@@ -74,6 +78,14 @@ where
     fn total_duration(&self) -> Option<std::time::Duration> {
         None
     }
+
+    fn try_seek(&mut self, pos: std::time::Duration) -> Result<(), rodio::source::SeekError> {
+        self.inner.try_seek(pos)?;
+        // Las features describen la posición nueva desde cero; sin este reset
+        // el reloj de análisis seguiría sumando hops de la posición anterior.
+        self.tap.begin_source();
+        Ok(())
+    }
 }
 
 #[cfg(all(test, feature = "rodio"))]
@@ -107,6 +119,9 @@ mod tests {
         fn sample_rate(&self) -> std::num::NonZeroU32 {
             self.rate
         }
+        fn try_seek(&mut self, _pos: std::time::Duration) -> Result<(), rodio::source::SeekError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -126,5 +141,17 @@ mod tests {
         let forwarded: Vec<f32> = tapped.collect();
         assert_eq!(forwarded.len(), data.len());
         assert_eq!(forwarded[..100], data[..100], "muestra a muestra intacta");
+    }
+
+    #[test]
+    fn tap_forwards_seek_to_the_decoder() {
+        let runtime = AnalysisRuntime::spawn(crate::analysis::AnalysisConfig::default());
+        let source = VecSource {
+            samples: Vec::new().into_iter(),
+            rate: 44_100.try_into().unwrap(),
+            channels: 2.try_into().unwrap(),
+        };
+        let mut tapped = TapSource::new(source, runtime.tap());
+        assert!(tapped.try_seek(std::time::Duration::from_secs(3)).is_ok());
     }
 }

@@ -117,14 +117,19 @@ diagnosticado con evidencia HTTP (probes en `examples/probe_*.rs`):
 
 - googlevideo exige `Range` cerrado: un GET completo responde **403**.
 - Las URLs resueltas con clientes directos capados (ANDROID_VR/iOS) tienen un
-  **techo posicional por URL** (~1,02–1,07 MiB): cualquier rango cuyo fin lo
-  supere responde **403**; las repeticiones dentro del techo se sirven
-  al instante a plena velocidad. **No es cuota por IP** ni expiración.
+  **techo posicional por URL** (~1,02–1,07 MiB): a partir de esa frontera
+  responden **403**; las repeticiones dentro del techo se sirven al instante a
+  plena velocidad. **No es cuota por IP** ni expiración.
 - Las URLs del cliente **VISIONOS** (usado como primario desde el parche del
   vendored rustypipe) no tienen ese techo y sirven el archivo completo.
-- El provider verifica cada stream con una sonda más allá de 1 MiB antes de
-  aceptarlo (`stream_url_ok`); si VISIONOS fallara, Android/iOS quedan de
-  respaldo (con prefijo servible + aviso honesto `Cut`, nunca autoplay ciego).
+- El provider verifica cada stream antes de aceptarlo (`stream_url_ok`): dos
+  sondas de prefijo y una del **último byte** del archivo. El tamaño total sale
+  del `Content-Range`, no solo del `clen` de la URL; así detecta techos de
+  cualquier tamaño, incluidos los archivos de 1,1–1,6 MiB y las URLs sin
+  `clen` que antes pasaban la sonda fija de 1,5 MiB y cortaban la reproducción.
+  Android/iOS solo quedan de respaldo si el archivo cabe completo bajo el
+  techo; una URL que solo sirve un prefijo se descarta en vez de cortar la
+  reproducción a mitad.
 - La descarga usa ventanas Range encadenadas con validación estricta
   ([`HttpRangeStream`], capa Media): retries acotados solo para fallos
   transitorios; 403/416/200-forzado/Content-Range inválido se clasifican sin

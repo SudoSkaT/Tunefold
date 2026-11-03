@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use symphonia::core::audio::SampleBuffer;
+use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
@@ -179,6 +179,7 @@ pub struct DecoderDiagnostics {
     pub(crate) stage: std::sync::Mutex<String>,
     pub(crate) decoded_packets: AtomicU64,
     pub(crate) decoded_frames: AtomicU64,
+    pub(crate) decode_errors: AtomicU64,
     pub(crate) ring_frames: AtomicU64,
     pub(crate) analysis_frames: AtomicU64,
     pub(crate) http_open_us: AtomicU64,
@@ -204,6 +205,7 @@ impl DecoderDiagnostics {
             stage: std::sync::Mutex::new("engine initialized".to_string()),
             decoded_packets: AtomicU64::new(0),
             decoded_frames: AtomicU64::new(0),
+            decode_errors: AtomicU64::new(0),
             ring_frames: AtomicU64::new(0),
             analysis_frames: AtomicU64::new(0),
             http_open_us: AtomicU64::new(0),
@@ -589,15 +591,22 @@ impl AndroidDecoder {
             // posteriores: reqwest reutiliza la conexión del pool en el
             // executor donde se estableció, así que cambiar de runtime deja
             // su tarea de I/O aparcada y bloquea la siguiente ventana.
-            let transport = runtime
-                .block_on(crate::media::transport::HttpRangeStream::open_with_trace(
+            let transport = match runtime.block_on(
+                crate::media::transport::HttpRangeStream::open_with_trace_and_cancel(
                     client,
                     url,
                     headers,
                     crate::media::transport::RangePolicy::default(),
                     trace_context.clone(),
-                ))
-                .map_err(|e| DecoderError::Stream(e.to_string()))?;
+                    Some(self.cancel.clone()),
+                ),
+            ) {
+                Ok(transport) => transport,
+                Err(_) if self.cancel.load(Ordering::Relaxed) => {
+                    return Ok(DecodeOutcome::Cancelled)
+                }
+                Err(e) => return Err(DecoderError::Stream(e.to_string())),
+            };
             self.diagnostics
                 .http_open_us
                 .store(http_started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -650,9 +659,16 @@ impl AndroidDecoder {
         self.trace.mark(events::SYMPHONIA_PROBE_START, "");
         let probe_started = std::time::Instant::now();
         let (mss, probe_seekable) = mss;
-        let probed = symphonia::default::get_probe()
-            .format(&hint, mss, &format_opts, &metadata_opts)
-            .map_err(|e| DecoderError::Format(e.to_string()))?;
+        let probed = match symphonia::default::get_probe().format(
+            &hint,
+            mss,
+            &format_opts,
+            &metadata_opts,
+        ) {
+            Ok(probed) => probed,
+            Err(_) if self.cancel.load(Ordering::Relaxed) => return Ok(DecodeOutcome::Cancelled),
+            Err(e) => return Err(DecoderError::Format(e.to_string())),
+        };
         if let Some(seekable) = probe_seekable {
             seekable.store(true, Ordering::Relaxed);
         }
@@ -674,12 +690,12 @@ impl AndroidDecoder {
             .ok_or_else(|| DecoderError::UnsupportedCodec("no audio track".to_string()))?
             .clone();
 
-        let sample_rate = track
+        let mut sample_rate = track
             .codec_params
             .sample_rate
             .filter(|sample_rate| *sample_rate > 0)
             .ok_or_else(|| DecoderError::Format("audio track has no sample rate".to_string()))?;
-        let source_channels = track
+        let mut source_channels = track
             .codec_params
             .channels
             .map_or(0, |channels| channels.count());
@@ -702,10 +718,12 @@ impl AndroidDecoder {
 
         let track_id = track.id;
         let mut sample_buf: Option<SampleBuffer<f32>> = None;
+        let mut sample_buf_spec: Option<SignalSpec> = None;
         let mut stereo = Vec::new();
         let mut resampled = Vec::new();
         let mut resampler = StereoResampler::new(sample_rate, ANDROID_OUTPUT_SAMPLE_RATE);
         let mut stall_reported: Option<std::time::Instant> = None;
+        let mut consecutive_decode_errors = 0u32;
 
         loop {
             if self.cancel.load(Ordering::Relaxed) {
@@ -724,6 +742,9 @@ impl AndroidDecoder {
                     if e.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
                     break;
+                }
+                Err(_) if self.cancel.load(Ordering::Relaxed) => {
+                    return Ok(DecodeOutcome::Cancelled)
                 }
                 Err(e) => return Err(DecoderError::Decode(e.to_string())),
             };
@@ -752,11 +773,31 @@ impl AndroidDecoder {
                         .decoded_packets
                         .fetch_add(1, Ordering::Relaxed)
                         + 1;
-                    let channels = decoded.spec().channels.count().max(1) as u16;
-                    if sample_buf.is_none() {
-                        let spec = *decoded.spec();
+                    consecutive_decode_errors = 0;
+                    let spec = *decoded.spec();
+                    let channels = spec.channels.count().max(1) as u16;
+                    if sample_buf_spec != Some(spec) {
+                        // A codec can change layout mid-stream (e.g. an in-band
+                        // PCE or a stream discontinuity). Reusing the old
+                        // SampleBuffer would copy the wrong channel count and
+                        // the resampler would carry a stale step.
                         let duration = decoded.capacity() as u64;
                         sample_buf = Some(SampleBuffer::new(duration, spec));
+                        sample_buf_spec = Some(spec);
+                        source_channels = spec.channels.count();
+                        sample_rate = spec.rate;
+                        resampler = StereoResampler::new(sample_rate, ANDROID_OUTPUT_SAMPLE_RATE);
+                        self.analysis_tap.announce(StreamMeta {
+                            sample_rate: ANDROID_OUTPUT_SAMPLE_RATE,
+                            channels: 2,
+                        });
+                        self.trace.mark(
+                            "DECODER_SPEC_CHANGED",
+                            &format!(
+                                "rate={} channels={} output_rate={ANDROID_OUTPUT_SAMPLE_RATE}",
+                                spec.rate, source_channels
+                            ),
+                        );
                     }
 
                     if let Some(ref mut buf) = sample_buf {
@@ -781,9 +822,51 @@ impl AndroidDecoder {
                         ));
                     }
                 }
-                Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+                Err(symphonia::core::errors::Error::DecodeError(error)) => {
+                    let total = self
+                        .diagnostics
+                        .decode_errors
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    consecutive_decode_errors += 1;
+
+                    if total <= 3 || total & 63 == 0 {
+                        self.trace.mark(
+                            "DECODER_DECODE_ERROR",
+                            &format!(
+                                "count={total} consecutive={consecutive_decode_errors} error={error}"
+                            ),
+                        );
+                        tracing::warn!(
+                            count = total,
+                            consecutive = consecutive_decode_errors,
+                            error = %error,
+                            "android_decoder_decode_error"
+                        );
+                    }
+
+                    // One bad packet can be skipped, but a stream that cannot
+                    // produce its first samples (or fails eight times in a row)
+                    // is broken. Infinite skipping used to surface as a silent
+                    // endless "buffering" state.
+                    if (total >= 3 && self.diagnostics.decoded_packets.load(Ordering::Relaxed) == 0)
+                        || consecutive_decode_errors >= 8
+                    {
+                        return Err(DecoderError::Decode(format!(
+                            "too many consecutive decode errors: {error}"
+                        )));
+                    }
+                    continue;
+                }
+                Err(_) if self.cancel.load(Ordering::Relaxed) => {
+                    return Ok(DecodeOutcome::Cancelled)
+                }
                 Err(e) => return Err(DecoderError::Decode(e.to_string())),
             }
+        }
+
+        if self.cancel.load(Ordering::Acquire) {
+            return Ok(DecodeOutcome::Cancelled);
         }
 
         self.set_diagnostic(format!(
@@ -938,7 +1021,7 @@ impl AndroidDecoder {
 /// A reader that wraps `HttpRangeStream` and implements `Read + Seek`.
 ///
 /// IMPORTANT — un solo runtime: el `HttpRangeStream` reutiliza conexiones del
-/// pool de reqwest cuya tarea de I/O se县级以上n en el executor donde se
+/// pool de reqwest cuya tarea de I/O se aparca en el executor donde se
 /// establecieron. Si la apertura y estas lecturas se condujeran con runtimes
 /// distintos, la conexión aparcada nunca volvería a bombear y la siguiente
 /// ventana HTTP se quedaría bloqueada para siempre. Por eso `runtime` es el
@@ -1212,7 +1295,7 @@ mod tests {
             trace_context,
         );
 
-        // Lectura много-ventana: exige encadenar peticiones sobre la conexión
+        // Lectura multi-ventana: exige encadenar peticiones sobre la conexión
         // del pool, que es exactamente donde el runtime previo se colgaba.
         let mut got = Vec::new();
         let mut buf = [0u8; 8192];

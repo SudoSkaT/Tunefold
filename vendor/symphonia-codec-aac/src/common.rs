@@ -12,6 +12,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use symphonia_core::audio::Channels;
+use symphonia_core::errors::{decode_error, Result};
+use symphonia_core::io::ReadBitsLtr;
 
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +164,97 @@ pub const AAC_SAMPLE_RATES: [u32; 16] = [
 ];
 
 pub const AAC_CHANNELS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 8];
+
+/// Program Config Element (PCE).
+///
+/// A PCE describes the channel layout of an AAC stream when the Audio Specific
+/// Config (or the ADTS header) uses `channel_configuration = 0`. It is a
+/// variable-length syntax element, so it must be consumed exactly even when
+/// the decoder already knows the layout from the container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgramConfig {
+    pub object_type: M4AType,
+    pub sample_rate: u32,
+    pub channels: usize,
+}
+
+/// Reads a `program_config_element()` and consumes its comment field.
+///
+/// This implements the syntax from ISO/IEC 13818-7 / 14496-3. The element
+/// instance tag is intentionally validated only for sanity; the caller is
+/// responsible for deciding whether the profile is supported.
+pub fn read_program_config_element<B: ReadBitsLtr>(bs: &mut B) -> Result<ProgramConfig> {
+    let _element_instance_tag = bs.read_bits_leq32(4)?;
+
+    let object_type = match bs.read_bits_leq32(2)? {
+        idx @ 0..=2 => M4A_TYPES[(idx + 1) as usize],
+        _ => M4AType::Reserved,
+    };
+
+    let sample_rate = match bs.read_bits_leq32(4)? {
+        idx if idx < 13 => AAC_SAMPLE_RATES[idx as usize],
+        15 => bs.read_bits_leq32(24)?,
+        _ => return decode_error("aac: pce reserved sample rate"),
+    };
+
+    let num_front = bs.read_bits_leq32(4)? as usize;
+    let num_side = bs.read_bits_leq32(4)? as usize;
+    let num_back = bs.read_bits_leq32(4)? as usize;
+    let num_lfe = bs.read_bits_leq32(2)? as usize;
+    let num_assoc_data = bs.read_bits_leq32(3)? as usize;
+    let num_valid_cc = bs.read_bits_leq32(4)? as usize;
+
+    if bs.read_bool()? {
+        let _mono_mixdown = bs.read_bits_leq32(4)?;
+    }
+    if bs.read_bool()? {
+        let _stereo_mixdown = bs.read_bits_leq32(4)?;
+    }
+    if bs.read_bool()? {
+        let _matrix_mixdown_idx = bs.read_bits_leq32(2)?;
+        let _pseudo_surround_enable = bs.read_bool()?;
+    }
+
+    let mut channels = 0usize;
+
+    for _ in 0..num_front {
+        let is_pair = bs.read_bool()?;
+        let _tag = bs.read_bits_leq32(4)?;
+        channels += if is_pair { 2 } else { 1 };
+    }
+    for _ in 0..num_side {
+        let is_pair = bs.read_bool()?;
+        let _tag = bs.read_bits_leq32(4)?;
+        channels += if is_pair { 2 } else { 1 };
+    }
+    for _ in 0..num_back {
+        let is_pair = bs.read_bool()?;
+        let _tag = bs.read_bits_leq32(4)?;
+        channels += if is_pair { 2 } else { 1 };
+    }
+    for _ in 0..num_lfe {
+        let _tag = bs.read_bits_leq32(4)?;
+        channels += 1;
+    }
+    for _ in 0..num_assoc_data {
+        let _tag = bs.read_bits_leq32(4)?;
+    }
+    for _ in 0..num_valid_cc {
+        let _is_ind_sw = bs.read_bool()?;
+        let _tag = bs.read_bits_leq32(4)?;
+    }
+
+    bs.realign();
+
+    let comment_bytes = bs.read_bits_leq32(8)?;
+    bs.ignore_bits(comment_bytes * 8)?;
+
+    if channels == 0 || sample_rate == 0 {
+        return decode_error("aac: invalid program config element");
+    }
+
+    Ok(ProgramConfig { object_type, sample_rate, channels })
+}
 
 pub fn map_channels(channels: u32) -> Option<Channels> {
     match channels {

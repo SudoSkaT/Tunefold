@@ -172,6 +172,7 @@ fn failure_label(failure: &TransportFailure) -> &'static str {
         TransportFailure::InvalidResponse(_) => "invalid_response",
         TransportFailure::Timeout(_) => "timeout",
         TransportFailure::Network(_) => "network",
+        TransportFailure::Cancelled => "cancelled",
     }
 }
 
@@ -190,7 +191,9 @@ pub struct RangePolicy {
     /// Reintentos máximos SOLO para fallos transitorios (red/timeout/trunca-
     /// miento/5xx). 403/401/404/416/respuesta inválida NO se reintentan.
     pub max_retries: u32,
-    /// Backoff base entre reintentos (lineal: delay × intento).
+    /// Backoff base entre reintentos. El retardo efectivo es exponencial
+    /// (base × 2^(intento-1), con techo de 8 s) más una jitter determinista
+    /// acotada para evitar ráfagas sincronizadas.
     pub retry_delay: Duration,
     /// Timeout de cada petición y de cada espera de chunk en modo live.
     pub request_timeout: Duration,
@@ -234,6 +237,21 @@ impl RangePolicy {
             self.window_size
         }
     }
+
+    /// Retardo del reintento `attempt` (1 = primer reintento). Exponencial con
+    /// techo y jitter determinista derivado de `request_id`; nunca cero, para
+    /// no convertir un servidor saturado en un bucle de martilleo.
+    pub fn retry_backoff(&self, attempt: u32, request_id: u64) -> Duration {
+        let exp = attempt.saturating_sub(1).min(5);
+        let base = self.retry_delay.saturating_mul(1u32 << exp);
+        let ceiling = Duration::from_secs(8);
+        let capped = base.min(ceiling);
+        let jitter_span = (capped.as_millis() as u64 / 4).max(1);
+        let mut seed = request_id.wrapping_mul(6364136223846793005).wrapping_add(1);
+        seed ^= seed >> 33;
+        let jitter = seed % jitter_span;
+        (capped + Duration::from_millis(jitter)).min(ceiling)
+    }
 }
 
 /// Fallo de transporte clasificado. El mensaje NUNCA incluye la URL completa
@@ -258,6 +276,11 @@ pub enum TransportFailure {
     Timeout(String),
     #[error("fallo de red: {0}")]
     Network(String),
+    /// La operación se interrumpió porque el consumidor pidió cancelar
+    /// (cambio de pista o stop). No es un error del servidor ni debe
+    /// reintentarse ni clasificarse como fallo de reproducción visible.
+    #[error("operación cancelada")]
+    Cancelled,
 }
 
 impl TransportFailure {
@@ -270,10 +293,12 @@ impl TransportFailure {
             TransportFailure::InvalidResponse(_) => FailureCategory::InvalidResponse,
             TransportFailure::Timeout(_) => FailureCategory::Timeout,
             TransportFailure::Network(_) => FailureCategory::NetworkFailure,
+            TransportFailure::Cancelled => FailureCategory::PlaybackFailure,
         }
     }
 
     /// Solo los transitorios merecen reintento (idempotente por rango).
+    /// La cancelación es explícita: reintentarla sería desobedecer el stop.
     fn is_transient(&self) -> bool {
         matches!(
             self,
@@ -405,6 +430,19 @@ struct RequestFailure {
 type LiveChunkStream =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Vec<u8>, reqwest::Error>> + Send>>;
 
+/// Espera hasta que el token de cancelación se active. Sin token, la future
+/// nunca completa, de modo que `select!` deja ganar siempre a la I/O.
+async fn wait_cancel(token: &Option<Arc<AtomicBool>>) {
+    match token {
+        Some(token) => {
+            while !token.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Stream lógico continuo sobre peticiones HTTP Range encadenadas.
 pub struct HttpRangeStream {
     http: reqwest::Client,
@@ -429,6 +467,10 @@ pub struct HttpRangeStream {
     rid: u64,
     metrics: TransportMetrics,
     trace: RangeTraceContext,
+    /// Token opcional del consumidor (Android): si se activa, las esperas de
+    /// red dejan de bloquear el hilo del decoder y `next_chunk` devuelve
+    /// [`TransportFailure::Cancelled`] en vez de esperar al timeout.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for HttpRangeStream {
@@ -463,7 +505,21 @@ impl HttpRangeStream {
         url: impl Into<String>,
         headers: Vec<(String, String)>,
         policy: RangePolicy,
+        trace: RangeTraceContext,
+    ) -> Result<Self, TransportFailure> {
+        Self::open_with_trace_and_cancel(http, url, headers, policy, trace, None).await
+    }
+
+    /// Variante con token de cancelación externo. La usa el decoder Android
+    /// para que `stop()` no tenga que esperar hasta 30 s a que una lectura de
+    /// red bloqueada expire.
+    pub async fn open_with_trace_and_cancel(
+        http: reqwest::Client,
+        url: impl Into<String>,
+        headers: Vec<(String, String)>,
+        policy: RangePolicy,
         mut trace: RangeTraceContext,
+        cancel: Option<Arc<AtomicBool>>,
     ) -> Result<Self, TransportFailure> {
         let url = url.into();
         trace.set_host(host_of(&url).to_string());
@@ -483,12 +539,25 @@ impl HttpRangeStream {
             rid: 0,
             metrics: TransportMetrics::default(),
             trace,
+            cancel,
         };
         let len = s.policy.window_len_at(0);
         s.pending = s.fetch_window(0, len).await?;
         s.cursor = 0;
         s.window_start = 0;
         Ok(s)
+    }
+
+    fn check_cancelled(&self) -> Result<(), TransportFailure> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|token| token.load(Ordering::Relaxed))
+        {
+            Err(TransportFailure::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 
     /// Tamaño total del recurso descubierto en la apertura. Cero si es un
@@ -582,6 +651,7 @@ impl HttpRangeStream {
     /// cuando se agota; el consumidor nunca percibe los límites HTTP.
     pub async fn next_chunk(&mut self, max: usize) -> Result<Option<Vec<u8>>, TransportFailure> {
         loop {
+            self.check_cancelled()?;
             if self.cursor < self.pending.len() {
                 let end = (self.cursor + max).min(self.pending.len());
                 let chunk = self.pending[self.cursor..end].to_vec();
@@ -610,21 +680,29 @@ impl HttpRangeStream {
 
     /// Avanza el cuerpo secuencial de un stream sin longitud conocida.
     async fn fill_from_live(&mut self) -> Result<(), TransportFailure> {
+        self.check_cancelled()?;
         if !self.live_remainder.is_empty() {
             self.pending = std::mem::take(&mut self.live_remainder);
             self.window_start = self.pos;
             self.cursor = 0;
             return Ok(());
         }
+        let cancel = self.cancel.clone();
         let next = {
             let live = self.live.as_ref().expect("live stream checked by caller");
             let mut guard = live.lock().await;
-            match tokio::time::timeout(self.policy.request_timeout, guard.next()).await {
-                Ok(next) => next,
-                Err(_) => {
-                    return Err(TransportFailure::Timeout(
-                        "el stream secuencial dejó de entregar datos".to_string(),
-                    ))
+            tokio::select! {
+                biased;
+                _ = wait_cancel(&cancel) => return Err(TransportFailure::Cancelled),
+                next = tokio::time::timeout(self.policy.request_timeout, guard.next()) => {
+                    match next {
+                        Ok(next) => next,
+                        Err(_) => {
+                            return Err(TransportFailure::Timeout(
+                                "el stream secuencial dejó de entregar datos".to_string(),
+                            ))
+                        }
+                    }
                 }
             }
         };
@@ -648,6 +726,7 @@ impl HttpRangeStream {
     async fn fetch_window(&mut self, start: u64, len: u64) -> Result<Vec<u8>, TransportFailure> {
         let mut attempt: u32 = 0;
         loop {
+            self.check_cancelled()?;
             self.rid += 1;
             self.metrics.requests += 1;
             let rid = self.rid;
@@ -725,7 +804,13 @@ impl HttpRangeStream {
                     if f.failure.is_transient() && attempt < self.policy.max_retries {
                         attempt += 1;
                         self.metrics.retries += 1;
-                        tokio::time::sleep(self.policy.retry_delay * attempt).await;
+                        tokio::select! {
+                            biased;
+                            _ = wait_cancel(&self.cancel) => {
+                                return Err(TransportFailure::Cancelled);
+                            }
+                            _ = tokio::time::sleep(self.policy.retry_backoff(attempt, rid)) => {}
+                        }
                         continue;
                     }
                     return Err(f.failure);
@@ -785,10 +870,18 @@ impl HttpRangeStream {
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
-        let sent = req
-            .header("Range", format!("bytes={start}-{end}"))
-            .send()
-            .await;
+        let cancel = self.cancel.clone();
+        let sent = tokio::select! {
+            biased;
+            _ = wait_cancel(&cancel) => {
+                return Err(RequestFailure {
+                    failure: TransportFailure::Cancelled,
+                    status: None,
+                    headers_us: request_started.elapsed().as_micros() as u64,
+                });
+            }
+            sent = req.header("Range", format!("bytes={start}-{end}")).send() => sent,
+        };
         let resp = match sent {
             Ok(resp) => resp,
             Err(error) => {
@@ -843,7 +936,18 @@ impl HttpRangeStream {
             let mut live: LiveChunkStream = Box::pin(body.map(|chunk| chunk.map(|b| b.to_vec())));
             let mut error = None;
             while buf.len() < len as usize {
-                match live.next().await {
+                let next = tokio::select! {
+                    biased;
+                    _ = wait_cancel(&cancel) => {
+                        return Err(RequestFailure {
+                            failure: TransportFailure::Cancelled,
+                            status: Some(status),
+                            headers_us,
+                        });
+                    }
+                    next = live.next() => next,
+                };
+                match next {
                     Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
                     Some(Err(e)) => {
                         error = Some(e);
@@ -863,7 +967,18 @@ impl HttpRangeStream {
             let mut body = body;
             let mut error = None;
             loop {
-                match body.next().await {
+                let next = tokio::select! {
+                    biased;
+                    _ = wait_cancel(&cancel) => {
+                        return Err(RequestFailure {
+                            failure: TransportFailure::Cancelled,
+                            status: Some(status),
+                            headers_us,
+                        });
+                    }
+                    next = body.next() => next,
+                };
+                match next {
                     Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
                     Some(Err(e)) => {
                         error = Some(e);
@@ -944,6 +1059,18 @@ impl HttpRangeStream {
                 // El cuerpo completo es la única entrega: se marca EOF para
                 // que el stream lógico termine con esta respuesta.
                 if start == 0 {
+                    if let Some(expected) = content_length {
+                        if buf.len() as u64 != expected {
+                            // El cuerpo completo prometido no llegó. Es
+                            // transitorio (la petición es idempotente), pero
+                            // aceptarlo silenciosamente entregaría audio
+                            // truncado al decoder.
+                            return Err(invalid(TransportFailure::Network(format!(
+                                "cuerpo 200 truncado: {} de {expected} bytes",
+                                buf.len()
+                            ))));
+                        }
+                    }
                     if self.live.is_none() {
                         self.total = content_length.unwrap_or(buf.len() as u64);
                         self.eof = true;
@@ -1078,10 +1205,30 @@ mod tests {
             TransportFailure::Network("w".into()).category(),
             FailureCategory::NetworkFailure
         );
+        assert_eq!(
+            TransportFailure::Cancelled.category(),
+            FailureCategory::PlaybackFailure
+        );
     }
 
     #[test]
-    fn only_transient_failures_retry() {
+    fn retry_backoff_is_exponential_bounded_and_jittered() {
+        let policy = RangePolicy {
+            retry_delay: Duration::from_millis(100),
+            ..RangePolicy::default()
+        };
+        let first = policy.retry_backoff(1, 1);
+        let second = policy.retry_backoff(2, 1);
+        assert!(first >= Duration::from_millis(100));
+        assert!(first < Duration::from_millis(130));
+        assert!(second > first);
+        assert!(policy.retry_backoff(1, 2) >= Duration::from_millis(100));
+        assert!(policy.retry_backoff(64, 1) <= Duration::from_secs(8));
+        assert!(!TransportFailure::Cancelled.is_transient());
+    }
+
+    #[test]
+    fn transient_failures_retry_but_structural_ones_do_not() {
         assert!(TransportFailure::Timeout("t".into()).is_transient());
         assert!(TransportFailure::Network("n".into()).is_transient());
         assert!(!TransportFailure::Restricted {

@@ -33,10 +33,21 @@ pub enum Scenario {
         count: usize,
         served: Arc<AtomicUsize>,
     },
+    /// Primera respuesta 200 con `Content-Length` completo pero cuerpo
+    /// truncado; las siguientes son completas. Un 200 truncado no debe
+    /// entregarse como si fuera el archivo entero.
+    Truncate200First {
+        data: Arc<Vec<u8>>,
+        served: Arc<AtomicUsize>,
+    },
     /// 206 con Content-Range MALFORMADO.
     BadContentRange(Arc<Vec<u8>>),
     /// Retardo fijo antes de cada respuesta (timeout).
     Slow(Duration, Arc<Vec<u8>>),
+    /// Envía cabeceras y la primera mitad del cuerpo, luego se detiene antes
+    /// de enviar el resto. Permite probar cancelación durante la lectura del
+    /// cuerpo, no solo durante la apertura.
+    SlowBody { data: Arc<Vec<u8>>, delay: Duration },
 }
 
 pub struct FakeServer {
@@ -167,6 +178,15 @@ async fn serve(
             }
             return send(socket, status, &headers, &body).await;
         }
+        Scenario::Truncate200First { data, served } => {
+            let headers = format!("Content-Length: {}\r\n", data.len());
+            let body = if served.fetch_add(1, Ordering::SeqCst) == 0 {
+                data[..data.len() / 2].to_vec()
+            } else {
+                data.as_ref().clone()
+            };
+            ("HTTP/1.1 200 OK", headers, body)
+        }
         Scenario::BadContentRange(data) => {
             let total = data.len() as u64;
             if start < total {
@@ -191,6 +211,18 @@ async fn serve(
         Scenario::Slow(delay, data) => {
             tokio::time::sleep(*delay).await;
             reply_range(start, end, data)
+        }
+        Scenario::SlowBody { data, delay } => {
+            let (status, headers, body) = reply_range(start, end, data);
+            let response = format!("{status}\r\n{headers}Connection: close\r\n\r\n");
+            socket.write_all(response.as_bytes()).await?;
+            let half = body.len() / 2;
+            socket.write_all(&body[..half]).await?;
+            socket.flush().await?;
+            tokio::time::sleep(*delay).await;
+            socket.write_all(&body[half..]).await?;
+            socket.flush().await?;
+            return Ok(());
         }
     };
 

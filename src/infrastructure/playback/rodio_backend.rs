@@ -47,6 +47,7 @@ use crate::app::audio::{
 use crate::domain::source::Source;
 use crate::domain::stream::MediaSource;
 use crate::domain::track::Track;
+use crate::dsp::{DspControl, DspSource};
 use crate::infrastructure::playback::is_http_source;
 use crate::infrastructure::playback::output::SharedOutput;
 use crate::media::transport::{HttpRangeStream, RangePolicy, TransportFailure};
@@ -170,6 +171,14 @@ pub struct RodioBackend {
     /// Análisis de audio opcional (flag AUDIO_ANALYSIS_ENABLED): runtime con
     /// hilo+anillo+bus; `None` ⇒ el decoder va directo al player.
     analysis: Option<AnalysisRuntime>,
+    /// Pausa pedida por el usuario mientras un `play` todavía está
+    /// prebuffereando. Sin esto, el `play()` final reanudaba el audio y perdía
+    /// la pausa que el usuario acababa de pulsar.
+    pause_requested: AtomicBool,
+    /// Parámetros del pipeline DSP. Cada fuente nueva lee la configuración
+    /// vigente sin reconstruir el motor; los cambios posteriores se publican
+    /// de forma no bloqueante y se aplican entre bloques.
+    dsp: DspControl,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -196,6 +205,7 @@ impl RodioBackend {
         bus: EventBus,
         disable_env_proxy: bool,
         analysis: Option<AnalysisRuntime>,
+        dsp: DspControl,
     ) -> Self {
         let mut builder = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT);
         if disable_env_proxy {
@@ -210,6 +220,8 @@ impl RodioBackend {
             _output: output,
             generation: Arc::new(AtomicU64::new(0)),
             analysis,
+            pause_requested: AtomicBool::new(false),
+            dsp,
             inner: Arc::new(Mutex::new(Inner {
                 track: None,
                 duration: None,
@@ -217,6 +229,14 @@ impl RodioBackend {
                 buffer: None,
             })),
         }
+    }
+
+    /// Handle para publicar parámetros DSP sin reconstruir el motor.
+    ///
+    /// El audio lee la configuración con `try_lock`; ninguna escritura de la
+    /// UI puede bloquear el callback.
+    pub fn dsp_control(&self) -> DspControl {
+        self.dsp.clone()
     }
 
     fn status_locked(player: &Player, inner: &Inner) -> PlaybackStatus {
@@ -233,13 +253,20 @@ impl RodioBackend {
         }
     }
 
-    /// Cancela el buffer anterior (si lo hay), liberando un decodificador que
-    /// estuviera bloqueado esperando datos. Se llama antes de `player.clear()`.
-    fn cancel_previous(&self) {
+    /// Inicia una generación nueva de forma atómica respecto al monitor y a
+    /// `status()`: el incremento ocurre bajo el mismo mutex que las escrituras
+    /// de estado. Cancela el buffer anterior y publica el track/estado inicial.
+    fn begin_generation(&self, track: Option<Track>, state: PlaybackState) -> u64 {
         let mut inner = self.inner.lock().unwrap();
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(prev) = inner.buffer.take() {
             prev.cancel();
         }
+        inner.track = track;
+        inner.duration = None;
+        inner.state = state;
+        self.bus.emit(PlaybackEvent::Buffering);
+        gen
     }
 
     /// Restaura el estado interno tras un fallo de `play()` antes de arrancar.
@@ -251,6 +278,9 @@ impl RodioBackend {
         if let Some(b) = buffer {
             b.cancel();
         }
+        // Re-comprobar DENTRO del lock: entre la comprobación y la escritura
+        // una orden nueva puede haber cambiado de generación.
+        let mut inner = self.inner.lock().unwrap();
         if self.generation.load(Ordering::SeqCst) != gen {
             return;
         }
@@ -258,7 +288,6 @@ impl RodioBackend {
         // Detiene cualquier fuente que quedara en el player (p. ej. la canción
         // de un autoplay que ganó la carrera contra este play).
         self.player.stop();
-        let mut inner = self.inner.lock().unwrap();
         inner.state = PlaybackState::Stopped;
         inner.track = None;
         inner.duration = None;
@@ -324,10 +353,16 @@ impl RodioBackend {
             // El monitor arranca justo después del buffer inicial: reproduciendo.
             let mut playing = true;
             loop {
-                if generation.load(Ordering::SeqCst) != my_gen {
-                    break;
-                }
-                let state = inner.lock().unwrap().state;
+                let state = {
+                    // La generación se incrementa bajo este mismo lock: leer
+                    // estado y generación juntos evita que un monitor viejo
+                    // observe la canción nueva y escriba sobre ella.
+                    let inner = inner.lock().unwrap();
+                    if generation.load(Ordering::SeqCst) != my_gen {
+                        break;
+                    }
+                    inner.state
+                };
                 // El usuario pausó: no tocar la reproducción.
                 if state == PlaybackState::Paused {
                     tokio::time::sleep(MONITOR_INTERVAL).await;
@@ -353,15 +388,15 @@ impl RodioBackend {
                 // cancelaciones por cambio de canción se filtran arriba por la
                 // generación, así que aquí solo llegan errores reales.
                 if let Some(err) = buffer.error() {
+                    let mut inner = inner.lock().unwrap();
                     if generation.load(Ordering::SeqCst) != my_gen {
                         break;
                     }
-                    bus.emit(PlaybackEvent::Error(err));
-                    let mut inner = inner.lock().unwrap();
                     inner.state = PlaybackState::Stopped;
                     inner.track = None;
                     inner.duration = None;
                     inner.buffer = None;
+                    bus.emit(PlaybackEvent::Error(err));
                     break;
                 }
                 // Corte por límite del CDN: el prefijo descargado sigue
@@ -371,12 +406,15 @@ impl RodioBackend {
                 // continuar la reproducción (siguiente o repetir) y avisar.
                 if let Some(msg) = buffer.cut() {
                     if player.empty() {
-                        bus.emit(PlaybackEvent::Cut(msg));
                         let mut inner = inner.lock().unwrap();
+                        if generation.load(Ordering::SeqCst) != my_gen {
+                            break;
+                        }
                         inner.state = PlaybackState::Stopped;
                         inner.track = None;
                         inner.duration = None;
                         inner.buffer = None;
+                        bus.emit(PlaybackEvent::Cut(msg));
                         break;
                     }
                 }
@@ -389,20 +427,32 @@ impl RodioBackend {
                 }
                 match policy_decide(playing, buffered_secs, eof) {
                     BufferAction::PauseAndRefill => {
-                        player.pause();
-                        inner.lock().unwrap().state = PlaybackState::Buffering;
+                        {
+                            let mut inner = inner.lock().unwrap();
+                            if generation.load(Ordering::SeqCst) != my_gen {
+                                break;
+                            }
+                            player.pause();
+                            inner.state = PlaybackState::Buffering;
+                            bus.emit(PlaybackEvent::Buffering);
+                        }
                         buffer.set_stalled(true);
-                        bus.emit(PlaybackEvent::Buffering);
                         playing = false;
                     }
                     BufferAction::Warn => {
                         buffer.set_stalled(true);
                     }
                     BufferAction::Resume => {
-                        player.play();
-                        inner.lock().unwrap().state = PlaybackState::Playing;
+                        {
+                            let mut inner = inner.lock().unwrap();
+                            if generation.load(Ordering::SeqCst) != my_gen {
+                                break;
+                            }
+                            player.play();
+                            inner.state = PlaybackState::Playing;
+                            bus.emit(PlaybackEvent::Playing);
+                        }
                         buffer.set_stalled(false);
-                        bus.emit(PlaybackEvent::Playing);
                         playing = true;
                     }
                     BufferAction::None => {
@@ -441,15 +491,16 @@ impl PlaybackEngine for RodioBackend {
         source: Option<MediaSource>,
     ) -> Result<PlaybackStatus, PlaybackError> {
         // Nueva generación: invalida cualquier tarea de la canción anterior.
-        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.cancel_previous();
-        self.bus.emit(PlaybackEvent::Buffering);
-        {
-            let mut inner = self.inner.lock().unwrap();
-            inner.track = Some(track.clone());
-            inner.duration = None;
-            inner.state = PlaybackState::Buffering;
-        }
+        // Una pausa pedida DURANTE el prebuffer se conserva (se resetea aquí,
+        // antes de que el nuevo play empiece a aceptar órdenes).
+        self.pause_requested.store(false, Ordering::Release);
+        let gen = self.begin_generation(Some(track.clone()), PlaybackState::Buffering);
+        tracing::info!(
+            session_id = gen,
+            source = ?track.source,
+            key = %track.identifier(),
+            "playback_session_start"
+        );
 
         let Some(MediaSource::Remote(stream)) = source else {
             let msg = if source.is_some() {
@@ -457,6 +508,8 @@ impl PlaybackEngine for RodioBackend {
             } else {
                 format!("{} no ofrece stream", track.source)
             };
+            self.reset_after_failed_play(None, gen);
+            tracing::warn!(session_id = gen, error = %msg, "playback_session_failed");
             return Err(PlaybackError::Transport(msg));
         };
 
@@ -474,6 +527,7 @@ impl PlaybackEngine for RodioBackend {
         .await
         .map_err(|f| {
             self.reset_after_failed_play(None, gen);
+            tracing::warn!(session_id = gen, category = %f.category(), error = %f, "playback_transport_open_failed");
             PlaybackError::Transport(format!("abrir stream: {f}"))
         })?;
         let content_length = transport.total() as f64;
@@ -546,17 +600,36 @@ impl PlaybackEngine for RodioBackend {
         // bloqueo para no ocupar un worker de tokio mientras bufferea.
         let reader = StreamReader::new(buffer.clone());
         let bus_decode = self.bus.clone();
-        let source = tokio::task::spawn_blocking(move || {
+        let generation_decode = self.generation.clone();
+        let source = match tokio::task::spawn_blocking(move || {
             Decoder::new(reader).map_err(|e| {
-                bus_decode.emit(PlaybackEvent::Error(format!("decodificar stream: {e}")));
-                PlaybackError::Decode(format!("decodificar stream: {e}"))
+                // Si la generación cambió mientras symphonia inicializaba el
+                // decoder, este error pertenece a una sesión vieja: no debe
+                // publicarse en el bus (la UI lo asociaría al track nuevo).
+                if generation_decode.load(Ordering::SeqCst) == gen {
+                    bus_decode.emit(PlaybackEvent::Error(format!("decodificar stream: {e}")));
+                    PlaybackError::Decode(format!("decodificar stream: {e}"))
+                } else {
+                    PlaybackError::Transport("reproducción reemplazada por otra orden".to_string())
+                }
             })
         })
         .await
-        .map_err(|e| {
-            self.reset_after_failed_play(Some(&buffer), gen);
-            PlaybackError::Transport(format!("decodificar stream: {e}"))
-        })??;
+        {
+            Ok(Ok(source)) => source,
+            Ok(Err(error)) => {
+                self.reset_after_failed_play(Some(&buffer), gen);
+                tracing::warn!(session_id = gen, error = %error, "playback_decode_init_failed");
+                return Err(error);
+            }
+            Err(join_error) => {
+                self.reset_after_failed_play(Some(&buffer), gen);
+                tracing::warn!(session_id = gen, error = %join_error, "playback_decode_init_join_failed");
+                return Err(PlaybackError::Transport(format!(
+                    "decodificar stream: {join_error}"
+                )));
+            }
+        };
 
         // Duración del contenedor ANTES de envolver (el tap la reporta None).
         let decoded_duration = source.total_duration();
@@ -571,6 +644,13 @@ impl PlaybackEngine for RodioBackend {
         #[cfg(not(feature = "rodio"))]
         let source: Box<dyn rodio::Source<Item = f32> + Send> = Box::new(source);
 
+        // El análisis queda ANTES del DSP: las recomendaciones y la
+        // visualización describen la señal de origen, no la ecualización del
+        // usuario. El bloque procesado es lo que realmente llega al player.
+        #[cfg(feature = "rodio")]
+        let source: Box<dyn rodio::Source<Item = f32> + Send> =
+            Box::new(DspSource::new(source, self.dsp.clone()));
+
         // Duration del contenedor si está disponible; si no, la de metadatos.
         let total = decoded_duration.or(track.duration);
         let total_secs = total.map(|d| d.as_secs_f64()).unwrap_or(1.0).max(1.0);
@@ -583,6 +663,13 @@ impl PlaybackEngine for RodioBackend {
 
         {
             let mut inner = self.inner.lock().unwrap();
+            if self.generation.load(Ordering::SeqCst) != gen {
+                drop(inner);
+                buffer.cancel();
+                return Err(PlaybackError::Transport(
+                    "reproducción reemplazada por otra orden".to_string(),
+                ));
+            }
             inner.duration = total;
             inner.buffer = Some(buffer.clone());
         }
@@ -599,6 +686,7 @@ impl PlaybackEngine for RodioBackend {
                     .error()
                     .unwrap_or_else(|| "stream interrumpido".to_string());
                 self.reset_after_failed_play(Some(&buffer), gen);
+                tracing::warn!(session_id = gen, error = %msg, "playback_initial_fill_failed");
                 return Err(PlaybackError::Transport(msg));
             }
             if buffer.eof() {
@@ -616,34 +704,48 @@ impl PlaybackEngine for RodioBackend {
                 let msg = "el stream no llena el buffer inicial (red demasiado lenta o cortada)"
                     .to_string();
                 self.reset_after_failed_play(Some(&buffer), gen);
+                tracing::warn!(session_id = gen, error = %msg, "playback_initial_fill_timeout");
                 return Err(PlaybackError::Transport(msg));
             }
             tokio::time::sleep(MONITOR_INTERVAL).await;
         }
         if let Some(err) = buffer.error() {
             self.reset_after_failed_play(Some(&buffer), gen);
+            tracing::warn!(session_id = gen, error = %err, "playback_initial_fill_aborted");
             return Err(PlaybackError::Transport(err));
         }
 
-        // Si mientras se descargaba/llenaba el buffer inicial llegó otra orden
-        // (canción nueva o stop), este play quedó obsoleto: no debe arrancar ni
-        // pisar la reproducción en curso.
-        if self.generation.load(Ordering::SeqCst) != gen {
-            buffer.cancel();
-            return Err(PlaybackError::Transport(
-                "reproducción reemplazada por otra orden".to_string(),
-            ));
-        }
-
-        // Cancela la canción anterior (ya liberada arriba) y arranca.
-        self.player.clear();
-        self.player.append(source);
-        self.player.play();
+        // El commit (comprobar generación + limpiar/añadir/arrancar) ocurre
+        // bajo el lock de estado. Si una orden nueva incrementó la generación
+        // mientras se llenaba el buffer, este play no debe tocar el player ni
+        // el estado de la orden vigente.
+        let paused_at_commit = self.pause_requested.load(Ordering::Acquire);
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.state = PlaybackState::Playing;
+            if self.generation.load(Ordering::SeqCst) != gen {
+                drop(inner);
+                buffer.cancel();
+                return Err(PlaybackError::Transport(
+                    "reproducción reemplazada por otra orden".to_string(),
+                ));
+            }
+            self.player.clear();
+            self.player.append(source);
+            if paused_at_commit {
+                self.player.pause();
+                inner.state = PlaybackState::Paused;
+                self.bus.emit(PlaybackEvent::Paused);
+            } else {
+                self.player.play();
+                inner.state = PlaybackState::Playing;
+                self.bus.emit(PlaybackEvent::Playing);
+            }
         }
-        self.bus.emit(PlaybackEvent::Playing);
+        tracing::info!(
+            session_id = gen,
+            paused = paused_at_commit,
+            "playback_audio_started"
+        );
         self.spawn_monitor(buffer.clone(), gen);
 
         let inner = self.inner.lock().unwrap();
@@ -651,6 +753,7 @@ impl PlaybackEngine for RodioBackend {
     }
 
     async fn pause(&self) -> Result<PlaybackStatus, PlaybackError> {
+        self.pause_requested.store(true, Ordering::Release);
         let mut inner = self.inner.lock().unwrap();
         self.player.pause();
         inner.state = PlaybackState::Paused;
@@ -659,6 +762,7 @@ impl PlaybackEngine for RodioBackend {
     }
 
     async fn resume(&self) -> Result<PlaybackStatus, PlaybackError> {
+        self.pause_requested.store(false, Ordering::Release);
         let mut inner = self.inner.lock().unwrap();
         self.player.play();
         inner.state = PlaybackState::Playing;
@@ -667,8 +771,9 @@ impl PlaybackEngine for RodioBackend {
     }
 
     async fn stop(&self) -> Result<PlaybackStatus, PlaybackError> {
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.pause_requested.store(false, Ordering::Release);
         let mut inner = self.inner.lock().unwrap();
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(buf) = inner.buffer.take() {
             buf.cancel();
         }
@@ -676,22 +781,23 @@ impl PlaybackEngine for RodioBackend {
         inner.track = None;
         inner.duration = None;
         inner.state = PlaybackState::Stopped;
+        tracing::info!(session_id = gen, "playback_session_stopped");
         self.bus.emit(PlaybackEvent::Stopped);
         Ok(Self::status_locked(&self.player, &inner))
     }
 
     async fn seek(&self, pos: Duration) -> Result<PlaybackStatus, PlaybackError> {
-        // No mantener el lock mientras `try_seek` espera (puede bloquearse
-        // hasta que la región objetivo esté descargada).
-        let (paused, had_play, has_buffer) = {
+        // No mantener el lock mientras `prefetch_seek_region` espera (puede
+        // tardar hasta que la región objetivo esté descargada).
+        let (had_play, has_buffer, gen) = {
             let inner = self.inner.lock().unwrap();
             (
-                inner.state == PlaybackState::Paused,
                 matches!(
                     inner.state,
                     PlaybackState::Playing | PlaybackState::Buffering | PlaybackState::Seeking
                 ),
                 inner.buffer.is_some(),
+                self.generation.load(Ordering::SeqCst),
             )
         };
         if !has_buffer {
@@ -703,6 +809,9 @@ impl PlaybackEngine for RodioBackend {
         self.bus.emit(PlaybackEvent::SeekStarted);
         {
             let mut inner = self.inner.lock().unwrap();
+            if self.generation.load(Ordering::SeqCst) != gen {
+                return Ok(Self::status_locked(&self.player, &inner));
+            }
             inner.state = PlaybackState::Seeking;
         }
         // Antes de pedirle a rodio el salto hay que asegurar la región
@@ -715,52 +824,69 @@ impl PlaybackEngine for RodioBackend {
         // Separamos el SEEK REAL del audio (try_seek + confirmación) de la
         // actualización optimista del reloj: el estado solo avanza si el
         // backend confirma el salto.
-        let seek_result = if self.prefetch_seek_region(pos).await {
-            self.player.try_seek(pos)
-        } else {
-            Err(rodio::source::SeekError::NotSupported {
-                underlying_source: "stream",
-            })
-        };
-
-        // Restaura el estado de reproducción previo (pausado se queda pausado
-        // en la NUEVA posición; reproduciendo sigue reproduciendo). Esto solo
-        // es válido si el seek real ocurrió; si falló, no hay nada que pausar
-        // en una posición distinta.
-        if seek_result.is_ok() && paused {
-            self.player.pause();
-        }
+        let seek_result: Result<(), rodio::source::SeekError> =
+            if self.prefetch_seek_region(pos).await {
+                let mut inner = self.inner.lock().unwrap();
+                // Una canción nueva pudo empezar durante el prefetch: el seek es
+                // obsoleto y no debe tocar el player ni el estado de la nueva.
+                if self.generation.load(Ordering::SeqCst) != gen {
+                    return Ok(Self::status_locked(&self.player, &inner));
+                }
+                let paused = inner.state == PlaybackState::Paused;
+                let buffering = inner.state == PlaybackState::Buffering;
+                let result = self.player.try_seek(pos);
+                // Restaura la pausa/refill: el seek no debe reanudar audio que el
+                // usuario (o el monitor) tenía detenido.
+                if result.is_ok() && (paused || buffering) {
+                    self.player.pause();
+                }
+                match result {
+                    Ok(()) => {
+                        inner.state = if paused {
+                            PlaybackState::Paused
+                        } else if buffering {
+                            PlaybackState::Buffering
+                        } else {
+                            PlaybackState::Playing
+                        };
+                        self.bus.emit(PlaybackEvent::SeekCompleted);
+                        return Ok(Self::status_locked(&self.player, &inner));
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                Err(rodio::source::SeekError::NotSupported {
+                    underlying_source: "stream",
+                })
+            };
 
         let mut inner = self.inner.lock().unwrap();
-        match seek_result {
-            Ok(()) => {
-                // Confirmado por el backend: el audio real está en `pos`.
-                inner.state = if paused {
-                    PlaybackState::Paused
-                } else {
-                    PlaybackState::Playing
-                };
-                self.bus.emit(PlaybackEvent::SeekCompleted);
-                Ok(Self::status_locked(&self.player, &inner))
-            }
-            Err(e) => {
-                // El seek falló: el audio NO cambió de posición. Recuperamos
-                // el estado anterior, sin fingir un salto.
-                inner.state = if had_play {
-                    PlaybackState::Playing
-                } else {
-                    PlaybackState::Stopped
-                };
-                self.bus.emit(PlaybackEvent::SeekFailed);
-                Err(PlaybackError::Transport(format!("no se pudo buscar: {e}")))
-            }
+        if self.generation.load(Ordering::SeqCst) != gen {
+            return Ok(Self::status_locked(&self.player, &inner));
         }
+        // El seek falló: el audio NO cambió de posición. Recuperamos el estado
+        // anterior, sin fingir un salto.
+        inner.state = if inner.state == PlaybackState::Paused {
+            PlaybackState::Paused
+        } else if had_play {
+            PlaybackState::Playing
+        } else {
+            PlaybackState::Stopped
+        };
+        self.bus.emit(PlaybackEvent::SeekFailed);
+        Err(PlaybackError::Transport(format!(
+            "no se pudo buscar: {seek_result:?}"
+        )))
     }
 
     async fn set_volume(&self, volume: u8) -> Result<PlaybackStatus, PlaybackError> {
         let inner = self.inner.lock().unwrap();
         self.player.set_volume(volume as f32 / 100.0);
         Ok(Self::status_locked(&self.player, &inner))
+    }
+
+    fn is_buffering(&self) -> bool {
+        self.inner.lock().unwrap().state == PlaybackState::Buffering
     }
 
     fn status(&self) -> PlaybackStatus {

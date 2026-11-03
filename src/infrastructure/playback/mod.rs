@@ -17,6 +17,7 @@ use std::sync::Arc;
 use crate::app::audio::{EventBus, PlaybackEngine};
 use crate::app::playback::RouterConfig;
 use crate::domain::source::Source;
+use crate::dsp::DspControl;
 use crate::infrastructure::config::Config;
 
 #[cfg(feature = "rodio")]
@@ -41,8 +42,10 @@ pub fn build_engines(
     RouterConfig,
     Option<crate::analysis::FeatureBus>,
     Option<crate::analysis::WaveformBus>,
+    DspControl,
 ) {
     let mut engines: Vec<Arc<dyn PlaybackEngine>> = Vec::new();
+    let dsp = DspControl::new(config.dsp);
 
     // Análisis de audio opcional: un runtime por construcción de motores; su
     // Drop detiene el hilo al reconstruirse (ajustes). Los buses viajan hacia
@@ -64,11 +67,12 @@ pub fn build_engines(
             bus.clone(),
             !config.flags.proxy,
             analysis,
+            dsp.clone(),
         )));
     }
 
     let policy = config.playback_policy.clone();
-    (RouterConfig { engines, policy }, features, waveform)
+    (RouterConfig { engines, policy }, features, waveform, dsp)
 }
 
 /// Fuentes que reproducen stream HTTP directo. Todos los orígenes actuales lo son.

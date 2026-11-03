@@ -4,7 +4,7 @@
 //! (obligatorio), truncado con recuperación, 403 posicional (restricción),
 //! 403 total, 200 que ignora Range, Content-Range inválido, timeout y EOF.
 
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -136,6 +136,80 @@ async fn truncated_response_is_retried_and_stream_continues() {
     let got = drain(&mut s).await.expect("el truncado se recupera");
     assert_eq!(got, *data);
     assert!(server.request_count() > 3, "hubo reintento(s)");
+}
+
+/// Un 200 con Content-Length completo pero cuerpo corto es truncamiento, no
+/// un archivo válido: se reintenta y, si la siguiente respuesta es completa,
+/// el stream continúa sin audio perdido.
+#[tokio::test]
+async fn truncated_200_body_is_not_accepted_as_complete_file() {
+    let data = payload(256 * 1024);
+    let server = FakeServer::start(Scenario::Truncate200First {
+        data: data.clone(),
+        served: Arc::new(AtomicUsize::new(0)),
+    })
+    .await;
+
+    let mut stream = open(&server, test_policy(64)).await;
+    let got = drain(&mut stream)
+        .await
+        .expect("el 200 truncado se reintenta");
+    assert_eq!(got, *data);
+    assert!(server.request_count() >= 2);
+}
+
+#[tokio::test]
+async fn cancellation_token_stops_the_open_before_network_io() {
+    let data = payload(64 * 1024);
+    let server = FakeServer::start(Scenario::Normal(data)).await;
+    let cancel = Arc::new(AtomicBool::new(true));
+
+    let err = HttpRangeStream::open_with_trace_and_cancel(
+        reqwest::Client::new(),
+        server.url(),
+        Vec::new(),
+        test_policy(64),
+        super::RangeTraceContext::disabled(),
+        Some(cancel),
+    )
+    .await
+    .expect_err("la apertura cancelada no debe completarse");
+    assert!(matches!(err, TransportFailure::Cancelled));
+    assert_eq!(server.request_count(), 0, "no debe tocar la red");
+}
+
+#[tokio::test]
+async fn cancellation_token_interrupts_a_slow_body() {
+    let data = payload(64 * 1024);
+    let server = FakeServer::start(Scenario::SlowBody {
+        data,
+        delay: Duration::from_secs(10),
+    })
+    .await;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let token = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        token.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    let started = Instant::now();
+    let err = HttpRangeStream::open_with_trace_and_cancel(
+        reqwest::Client::new(),
+        server.url(),
+        Vec::new(),
+        test_policy(64),
+        super::RangeTraceContext::disabled(),
+        Some(cancel),
+    )
+    .await
+    .expect_err("la lectura del cuerpo debe cancelarse");
+    assert!(matches!(err, TransportFailure::Cancelled));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "la cancelación no debe esperar al timeout del cuerpo"
+    );
+    assert_eq!(server.request_count(), 1);
 }
 
 /// Servidor que ignora Range: modo monolítico desde 0 (una sola respuesta

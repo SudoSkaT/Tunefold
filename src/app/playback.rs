@@ -127,6 +127,14 @@ impl PlaybackRouter {
             .unwrap_or_else(PlaybackStatus::idle)
     }
 
+    /// Estado de prebuffer sin efectos laterales (no publica `Finished`).
+    pub async fn is_buffering(&self) -> bool {
+        let source = *self.current_source.lock().await;
+        self.engine_for(source)
+            .map(|e| e.is_buffering())
+            .unwrap_or(false)
+    }
+
     /// Devuelve `&dyn` no es viable con async_trait; clonamos el Arc del motor.
     async fn current_engine(&self) -> Arc<dyn PlaybackEngine> {
         let source = *self.current_source.lock().await;

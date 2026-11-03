@@ -20,6 +20,7 @@ pub mod api;
 pub mod app;
 pub mod catalog;
 pub mod domain;
+pub mod dsp;
 pub mod infrastructure;
 pub mod media;
 pub mod platform;

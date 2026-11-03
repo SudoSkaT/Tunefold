@@ -167,7 +167,7 @@ fn lrclib_group_is_noise(inner: &str) -> bool {
 
 /// El título como lo escribiría una discografía.
 ///
-/// ```
+/// ```text
 /// use tunefold::providers::lyrics::lrclib_query_title;
 ///
 /// assert_eq!(lrclib_query_title("One More Time (Radio Edit)"), "One More Time");
