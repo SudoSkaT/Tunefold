@@ -3,6 +3,7 @@
 
 pub mod album;
 pub mod artist;
+pub mod external_playlist;
 pub mod genre;
 pub mod lyrics;
 pub mod playlist;

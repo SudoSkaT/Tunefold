@@ -1,65 +1,58 @@
 # AGENTS.md
 
-Guía para agentes y asistentes de código que trabajen en este repositorio.
+Compact entry point for agents working on TuneFold. Read this first, then load only the specialized docs needed for the task.
 
-## Contexto del proyecto
+## Identity
 
-Tunefold (antes **PlayFusion**) es un reproductor musical TUI en Rust. El
-repositorio pasó por una auditoría de liberación/propiedad: todo es **GPL-3.0**,
-la marca fue renombrada a Tunefold, y el proveedor de YouTube vive **solo** tras
-la feature de Cargo `youtube` (excluida del binario oficial por los TdS de
-YouTube).
+Tunefold is a TUI music player and recommendation engine in Rust (GPL-3.0). The YouTube provider is optional behind the Cargo feature `youtube` and is excluded from official binaries.
 
-## Estructura relevante
+## Non-negotiable rules
 
-- `src/providers/` — adaptadores externos. `youtube/` está tras
-  `#[cfg(feature = "youtube")]`; `lyrics.rs` (LRCLIB) se compila **siempre**.
-- `src/api/mod.rs` — punto único de composición de providers (frontera
-  permitida entre providers y el resto del sistema).
-- `src/platform/android_rank.rs` — contrato JNI de ranking (Fase 5): puro
-  JSON estadoless sobre `recommendation::rank_sync`, con fail-open a orden
-  del proveedor; **no** depende de `providers/youtube`.
-- `docs/recommendations.md` — pesos, señales y pipeline de recomendaciones
-  (fuente canónica del motor; actualizar al tocar `recommendation/`).
-- `src/infrastructure/dirs.rs` — rutas XDG; **nunca** usar `data/` en código
-  nuevo (solo migración no destructiva legacy→canónico).
-- `src/main.rs` — CLI de desarrollo; `--version` usa `CARGO_PKG_VERSION`.
-- `vendor/rustypipe` — crate GPL-3.0 parcheado localmente (NO editar fuera de
-  la justificación documentada en `Cargo.toml`).
+1. Rebrand: no `playfusion`/`PlayFusion` in new code, visible text, or paths (legacy env alias `PLAYFUSION_RANGE_WINDOW_KIB` excepted).
+2. YouTube only in `src/providers/youtube/` and feature `youtube`; default builds must not compile rustypipe or touch YouTube network.
+3. GPL-3.0; dependencies only per `docs/policies.md`.
+4. User data and DB via `src/infrastructure/dirs.rs::*`; never CWD-relative paths.
+5. User data migration copies, never deletes.
 
-## Reglas de hierro
-
-1. **Respeta el rebranding**: nada de `playfusion`/`PlayFusion` en código,
-   texto visible o rutas nuevas (salvo el alias legacy de entorno
-   `PLAYFUSION_RANGE_WINDOW_KIB` y referencias históricas intencionales).
-2. **Nada de YouTube fuera de `src/providers/youtube/`** ni de la feature
-   `youtube`. El código default NO debe compilar `rustypipe` ni tocar red de
-   YouTube.
-3. **GPL-3.0**: no añadir dependencias no permitidas (ver `docs/policies.md`).
-4. **Rutas**: los datos de usuario y la BD van por `dirs::*`; jamás rutas
-   relativas al CWD.
-5. **Datos del usuario**: la migración copia, nunca borra.
-
-## Comandos de verificación obligatorios
+## Essential commands
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test --lib
 cargo test --lib --features youtube
 cargo check --offline
 cargo check --offline --features youtube
 ```
 
-## Notas
+See `engineering/VERIFICATION.md` for the full matrix.
 
-- Los `examples/probe_*` requieren la feature `youtube`
-  (`required-features` en Cargo.toml); `bench_hotpaths` no.
-- `Cargo.lock` se regenera al renombrar crates; verifica que no queden nombres
-  viejos.
-- La versión canónica se mantiene en `Cargo.toml` (y `--version`); las releases
-  usan tags numéricos SIN `v` (`X.Y.Z`) que deben coincidir con `Cargo.toml` y
-  `Cargo.lock` (ver checklist en `docs/policies.md`); solo el workflow
-  `release` publica assets.
-- Las políticas (privacidad, licencias, semver) están en `docs/policies.md` y
-  `PRIVACY.md`; se aplican en CI.
+## Context discovery
+
+- Level 1 (always): this file + `engineering/CORE.md`.
+- Level 2 (by task): `engineering/MODULE_INDEX.md`, `engineering/ARCHITECTURE.md`, `engineering/VERIFICATION.md`, `engineering/KNOWN_ISSUES.md`, relevant `engineering/systems/*.md`.
+- Level 3 (after locating modules): specific source files.
+- Generate task package: `scripts/engineering/context-report --task "..." --system <system> [--format text|markdown|json]`.
+
+## Where to look
+
+| Need | Doc |
+|---|---|
+| Modules/deps | `engineering/MODULE_INDEX.md`, `engineering/DEPENDENCIES.md` |
+| Architecture | `engineering/ARCHITECTURE.md`, `docs/architecture/*` |
+| Android | `engineering/systems/android.md`, `docs/android/*` |
+| DSP | `engineering/systems/dsp.md`, `docs/architecture/dsp-pipeline.md` |
+| Recommendations | `engineering/systems/recommendations.md`, `docs/recommendations.md` |
+| Verification | `engineering/VERIFICATION.md`, `docs/testing/audio-validation.md` |
+| Known issues | `engineering/KNOWN_ISSUES.md` |
+| Decisions | `engineering/decisions/*` |
+
+## Historical docs
+
+`docs/audit/*`, `docs/roadmap/*`, and `android/*_REPORT.md` are historical. Do not treat them as current implementation state.
+
+## Notes
+
+- `examples/probe_*` require feature `youtube`; `bench_hotpaths` does not.
+- Version source: `Cargo.toml` (`CARGO_PKG_VERSION`); releases use numeric tags without `v`.
+- Policies: `docs/policies.md`, `PRIVACY.md`.

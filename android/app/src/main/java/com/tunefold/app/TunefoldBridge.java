@@ -55,6 +55,9 @@ final class TunefoldBridge {
 
     static native boolean initializeYoutube(String cacheDir);
     static native String searchYoutube(String query, int limit);
+    static native String searchAlbumsYoutube(String query, int limit);
+    static native String searchArtistsYoutube(String query, int limit);
+    static native String albumTracksYoutube(String albumId);
     static native String resolveYoutubeUrl(String url);
     /**
      * Provider metadata for a video id, for a remembered track.
@@ -75,6 +78,7 @@ final class TunefoldBridge {
     static native String resolveYoutubeSource(String trackJson);
     /** Provider "related to this video" list, for Home and autoplay. */
     static native String relatedYoutube(String videoId, int limit);
+    static native String playlistYoutube(String playlistId);
 
     /**
      * Reorders recommendation candidates by personal taste (Fase 5).
@@ -90,3 +94,4 @@ final class TunefoldBridge {
      */
     static native String rankRelated(String request);
 }
+

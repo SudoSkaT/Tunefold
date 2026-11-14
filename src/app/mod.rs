@@ -6,6 +6,7 @@
 
 pub mod aggregator;
 pub mod audio;
+pub mod external_playlists;
 pub mod history;
 pub mod playback;
 pub mod search;

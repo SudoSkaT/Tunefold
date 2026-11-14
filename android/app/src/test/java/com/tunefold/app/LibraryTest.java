@@ -439,8 +439,8 @@ public class LibraryTest {
         String document = readLibraryFile();
         // Four records: membership, cover, source and duration. Each is its own line
         // so a file written before any of them existed keeps parsing as it did.
-        assertEquals("four records: membership, cover, source and duration",
-                4, document.split("\n", -1).length - 1);
+        assertEquals("five records: membership, cover, source, duration and artist",
+                5, document.split("\n", -1).length - 1);
 
         Library reader = new Library(directory);
         reader.loadFromForTest(document);

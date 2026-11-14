@@ -149,6 +149,15 @@ final class Library {
         // quedaba quieta en una canción que sí estaba sonando. Es el mismo motivo
         // que la portada, y por eso se guarda igual que la portada.
         if (track.durationMs > 0L) durations.put(key, track.durationMs);
+        // El artista es lo mismo que la portada y la duración: una fila
+        // reconstruida a partir de la identidad no puede sacarlo de ningún sitio,
+        // y sin él la lista vuelve sin nombre de artista después de un reinicio.
+        String rememberedArtist = (track.artist == null || track.artist.trim().isEmpty())
+                ? (track.channel == null ? "" : track.channel.trim())
+                : track.artist.trim();
+        if (!rememberedArtist.isEmpty()) artists.put(key, rememberedArtist);
+        String rememberedAlbum = track.album == null ? "" : track.album.trim();
+        if (!rememberedAlbum.isEmpty()) albums.put(key, rememberedAlbum);
     }
 
     /**
@@ -173,6 +182,8 @@ final class Library {
         thumbnails.remove(key);
         sources.remove(key);
         durations.remove(key);
+        artists.remove(key);
+        albums.remove(key);
     }
 
     /** Number of L1K3D members. */
@@ -336,6 +347,10 @@ final class Library {
                         // Registro ilegible: se ignora, como cualquier otro.
                     }
                 }
+            } else if (kind == 'a') {
+                if (!value.isEmpty()) artists.put(key, value.trim());
+            } else if (kind == 'b') {
+                if (!value.isEmpty()) albums.put(key, value.trim());
             } else if (kind == 'r') {
                 recent.add(key);
             }
@@ -346,6 +361,8 @@ final class Library {
         dropUnremembered(thumbnails);
         dropUnremembered(sources);
         durations.keySet().removeIf(key -> !liked.contains(key));
+        dropUnremembered(artists);
+        dropUnremembered(albums);
     }
 
     /** Forgets a remembered field whose identity is not a member any more. */
@@ -481,6 +498,9 @@ final class Library {
      * quien lo lee lo parsee mal.
      */
     private final java.util.Map<TrackKey, Long> durations = new java.util.HashMap<>();
+    /** Artist (or channel) remembered per liked identity. */
+    private final java.util.Map<TrackKey, String> artists = new java.util.HashMap<>();
+    private final java.util.Map<TrackKey, String> albums = new java.util.HashMap<>();
 
     /**
      * One-line title.
@@ -538,6 +558,18 @@ final class Library {
         synchronized (lock) { return sources.get(key); }
     }
 
+    /** Artist remembered for a liked identity, or {@code null} when unknown. */
+    String artistFor(TrackKey key) {
+        if (key == null) return null;
+        synchronized (lock) { return artists.get(key); }
+    }
+
+    /** Album remembered for a liked identity, or {@code null} when unknown. */
+    String albumFor(TrackKey key) {
+        if (key == null) return null;
+        synchronized (lock) { return albums.get(key); }
+    }
+
     String serialize() {
         StringBuilder text = new StringBuilder();
         synchronized (lock) {
@@ -562,6 +594,8 @@ final class Library {
                             .append(SEPARATOR).append(key.providerTrackId())
                             .append(SEPARATOR).append(duration).append('\n');
                 }
+                appendField(text, 'a', key, artists.get(key));
+                appendField(text, 'b', key, albums.get(key));
             }
             for (TrackKey key : recent) {
                 text.append('r').append(SEPARATOR).append(key.provider()).append(SEPARATOR)
@@ -588,6 +622,8 @@ final class Library {
             thumbnails.clear();
             sources.clear();
             durations.clear();
+            artists.clear();
+            albums.clear();
             loaded = true;
             // Delegates to the one parser so tests cannot drift from disk.
             parse(text);

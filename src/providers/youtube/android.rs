@@ -19,6 +19,7 @@ use crate::domain::artist::Artist;
 use crate::domain::lyrics::SyncLyrics;
 use crate::domain::source::Source;
 use crate::domain::track::Track;
+use crate::domain::album::Album;
 use crate::infrastructure::config::FeatureFlags;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -54,6 +55,14 @@ fn failure(category: &str, message: impl Into<String>) -> Value {
 
 fn encode_tracks(tracks: Vec<Track>) -> Value {
     json!({"ok": true, "tracks": tracks})
+}
+
+fn encode_albums(albums: Vec<Album>) -> Value {
+    json!({"ok": true, "albums": albums})
+}
+
+fn encode_artists(artists: Vec<Artist>) -> Value {
+    json!({"ok": true, "artists": artists})
 }
 
 fn catalog_error_category(error: &CatalogError) -> &'static str {
@@ -124,6 +133,68 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_searchYoutube(
     })();
     match result {
         Ok(tracks) => return_json(&mut env, encode_tracks(tracks)),
+        Err((category, message)) => return_json(&mut env, failure(category, message)),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_searchAlbumsYoutube(
+    mut env: JNIEnv,
+    _class: JClass,
+    query: JString,
+    limit: jint,
+) -> jstring {
+    let query = match read_string(&mut env, &query) {
+        Ok(query) if !query.trim().is_empty() => query,
+        _ => return return_json(&mut env, failure("search_failed", "Search query is empty")),
+    };
+    let result = (|| {
+        let media = MEDIA.get().ok_or_else(|| {
+            ("provider_unavailable", "provider is not initialized".to_string())
+        })?;
+        let provider = media.catalog.get(Source::YouTube).ok_or_else(|| {
+            ("provider_unavailable", "YouTube catalog is disabled".to_string())
+        })?;
+        runtime().block_on(async {
+            provider
+                .search_albums(&query, limit.clamp(1, 25) as u32)
+                .await
+                .map_err(|error| (catalog_error_category(&error), error.to_string()))
+        })
+    })();
+    match result {
+        Ok(albums) => return_json(&mut env, encode_albums(albums)),
+        Err((category, message)) => return_json(&mut env, failure(category, message)),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_searchArtistsYoutube(
+    mut env: JNIEnv,
+    _class: JClass,
+    query: JString,
+    limit: jint,
+) -> jstring {
+    let query = match read_string(&mut env, &query) {
+        Ok(query) if !query.trim().is_empty() => query,
+        _ => return return_json(&mut env, failure("search_failed", "Search query is empty")),
+    };
+    let result = (|| {
+        let media = MEDIA.get().ok_or_else(|| {
+            ("provider_unavailable", "provider is not initialized".to_string())
+        })?;
+        let provider = media.catalog.get(Source::YouTube).ok_or_else(|| {
+            ("provider_unavailable", "YouTube catalog is disabled".to_string())
+        })?;
+        runtime().block_on(async {
+            provider
+                .search_artists(&query, limit.clamp(1, 25) as u32)
+                .await
+                .map_err(|error| (catalog_error_category(&error), error.to_string()))
+        })
+    })();
+    match result {
+        Ok(artists) => return_json(&mut env, encode_artists(artists)),
         Err((category, message)) => return_json(&mut env, failure(category, message)),
     }
 }
@@ -294,6 +365,43 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_syncedLyrics(
     }
 }
 
+/// Metadata and entries for an external YouTube playlist.
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_playlistYoutube(
+    mut env: JNIEnv,
+    _class: JClass,
+    playlist_id: JString,
+) -> jstring {
+    let playlist_id = match read_string(&mut env, &playlist_id) {
+        Ok(id) if !id.trim().is_empty() => id,
+        _ => return return_json(&mut env, failure("invalid_request", "playlist id is empty")),
+    };
+    let result = (|| {
+        let media = MEDIA.get().ok_or_else(|| {
+            (
+                "provider_unavailable",
+                "provider is not initialized".to_string(),
+            )
+        })?;
+        let provider = media.catalog.get(Source::YouTube).ok_or_else(|| {
+            (
+                "provider_unavailable",
+                "YouTube catalog is disabled".to_string(),
+            )
+        })?;
+        runtime().block_on(async {
+            provider
+                .playlist(&playlist_id)
+                .await
+                .map_err(|error| (catalog_error_category(&error), error.to_string()))
+        })
+    })();
+    match result {
+        Ok(playlist) => return_json(&mut env, json!({"ok": true, "playlist": playlist})),
+        Err((category, message)) => return_json(&mut env, failure(category, message)),
+    }
+}
+
 /// Metadata for a video the caller only holds an identity for.
 ///
 /// `resolveYoutubeUrl` needs a link to parse; a remembered track has only the
@@ -335,6 +443,36 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_metadataYoutube(
     })();
     match result {
         Ok(track) => return_json(&mut env, encode_tracks(vec![track])),
+        Err((category, message)) => return_json(&mut env, failure(category, message)),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_albumTracksYoutube(
+    mut env: JNIEnv,
+    _class: JClass,
+    album_id: JString,
+) -> jstring {
+    let album_id = match read_string(&mut env, &album_id) {
+        Ok(id) if !id.trim().is_empty() => id,
+        _ => return return_json(&mut env, failure("invalid_request", "album id is empty")),
+    };
+    let result = (|| {
+        let media = MEDIA.get().ok_or_else(|| {
+            ("provider_unavailable", "provider is not initialized".to_string())
+        })?;
+        let provider = media.catalog.get(Source::YouTube).ok_or_else(|| {
+            ("provider_unavailable", "YouTube catalog is disabled".to_string())
+        })?;
+        runtime().block_on(async {
+            provider
+                .get_album_tracks(&album_id)
+                .await
+                .map_err(|error| (catalog_error_category(&error), error.to_string()))
+        })
+    })();
+    match result {
+        Ok(tracks) => return_json(&mut env, encode_tracks(tracks)),
         Err((category, message)) => return_json(&mut env, failure(category, message)),
     }
 }

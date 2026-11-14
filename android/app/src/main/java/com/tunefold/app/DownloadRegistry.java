@@ -49,6 +49,12 @@ final class DownloadRegistry {
      * it was downloaded with.
      */
     private final Map<TrackKey, String> thumbnails = new LinkedHashMap<>();
+    /** Artist remembered per downloaded identity. */
+    private final Map<TrackKey, String> artists = new LinkedHashMap<>();
+    /** Album remembered per downloaded identity. */
+    private final Map<TrackKey, String> albums = new LinkedHashMap<>();
+    /** Duration in ms remembered per downloaded identity. */
+    private final Map<TrackKey, Long> durations = new LinkedHashMap<>();
     private final StoredProbe probe;
     /** True once a full store enumeration has been seeded. */
     private volatile boolean scanComplete;
@@ -202,6 +208,59 @@ final class DownloadRegistry {
         return true;
     }
 
+    /** Remembers an artist for an identity, replacing any earlier one. */
+    boolean rememberArtist(TrackKey key, String artist) {
+        if (key == null || artist == null || artist.trim().isEmpty()) return false;
+        String cleaned = artist.trim();
+        synchronized (states) {
+            if (cleaned.equals(artists.get(key))) return false;
+            artists.put(key, cleaned);
+        }
+        return true;
+    }
+
+    /** Remembers an album for an identity, replacing any earlier one. */
+    boolean rememberAlbum(TrackKey key, String album) {
+        if (key == null || album == null || album.trim().isEmpty()) return false;
+        String cleaned = album.trim();
+        synchronized (states) {
+            if (cleaned.equals(albums.get(key))) return false;
+            albums.put(key, cleaned);
+        }
+        return true;
+    }
+
+    /** Album remembered for an identity, or {@code null}. */
+    String albumOf(TrackKey key) {
+        if (key == null) return null;
+        synchronized (states) { return albums.get(key); }
+    }
+
+    /** Artist remembered for an identity, or {@code null}. */
+    String artistOf(TrackKey key) {
+        if (key == null) return null;
+        synchronized (states) { return artists.get(key); }
+    }
+
+    /** Remembers a duration for an identity, replacing any earlier one. */
+    boolean rememberDuration(TrackKey key, long durationMs) {
+        if (key == null || durationMs <= 0L) return false;
+        synchronized (states) {
+            if (durationMs == (durations.get(key) == null ? -1L : durations.get(key))) return false;
+            durations.put(key, durationMs);
+        }
+        return true;
+    }
+
+    /** Duration remembered for an identity, in ms, or {@code -1} when unknown. */
+    long durationOf(TrackKey key) {
+        if (key == null) return -1L;
+        synchronized (states) {
+            Long known = durations.get(key);
+            return known == null ? -1L : known;
+        }
+    }
+
     /**
      * Cover URL remembered for an identity, or {@code null}.
      *
@@ -251,6 +310,9 @@ final class DownloadRegistry {
             // leave a label behind for a track `Descargadas` no longer lists.
             titles.remove(key);
             thumbnails.remove(key);
+            artists.remove(key);
+            albums.remove(key);
+            durations.remove(key);
         }
         DownloadState next = stateOf(key);
         if (previous != null && previous.isDownloaded()) revision.incrementAndGet();
@@ -282,6 +344,9 @@ final class DownloadRegistry {
             // And so does the cover: the sidecar was written with the artwork the
             // track had when it was saved, which is the only copy left of it.
             rememberThumbnail(entry.key, entry.thumbnail());
+            rememberArtist(entry.key, entry.artist());
+            rememberAlbum(entry.key, entry.album());
+            rememberDuration(entry.key, entry.durationMs());
         }
         // Every stored identity is now known, so later reads answer from memory.
         scanComplete = true;

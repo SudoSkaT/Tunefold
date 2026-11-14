@@ -9,6 +9,8 @@ use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::app::aggregator::MetadataAggregator;
+#[cfg(feature = "youtube")]
+use crate::app::aggregator::SearchOutcome;
 use crate::app::audio::{EventBus, PlaybackEvent, PlaybackState, PlaybackStatus};
 use crate::app::history::History;
 use crate::app::playback::PlaybackRouter;
@@ -1055,9 +1057,44 @@ impl Backend {
                         Err(e) => vec![BackendEvent::Error(format!("enlace: {e}"))],
                     }
                 }
-                LinkKind::PlaylistId(list) => vec![BackendEvent::Message(format!(
-                    "Playlist remota {list}: créala local (n) e importa sus canciones como copia local; sin espejo sincronizado."
-                ))],
+                LinkKind::PlaylistId(list) => {
+                    if self.search.aggregator().is_empty() {
+                        return vec![BackendEvent::Message(
+                            "No hay fuentes de catálogo activas (revisa los feature flags en .env)."
+                                .to_string(),
+                        )];
+                    }
+                    let Some(provider) = self
+                        .search
+                        .aggregator()
+                        .providers()
+                        .get(crate::domain::source::Source::YouTube)
+                    else {
+                        return vec![BackendEvent::Error(
+                            "YouTube no está disponible en este binario.".to_string(),
+                        )];
+                    };
+                    match provider.playlist(&list).await {
+                        Ok(pl) => {
+                            let title = if pl.title.is_empty() {
+                                format!("Mix {list}")
+                            } else {
+                                pl.title
+                            };
+                            let outcome = SearchOutcome {
+                                items: pl.tracks,
+                                errors: Vec::new(),
+                                related_from: 0,
+                            };
+                            let _ = title;
+                            vec![BackendEvent::SearchResults {
+                                query: input,
+                                outcome: Box::new(outcome),
+                            }]
+                        }
+                        Err(e) => vec![BackendEvent::Error(format!("mix: {e}"))],
+                    }
+                }
                 LinkKind::Invalid => vec![BackendEvent::Error(
                     "Enlace no reconocido: pega un watch/watch?v=, youtu.be, shorts o playlist de YouTube.".to_string(),
                 )],

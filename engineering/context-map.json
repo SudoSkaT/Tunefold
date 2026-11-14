@@ -1,0 +1,554 @@
+{
+  "schema_version": 1,
+  "project": {
+    "name": "Tunefold",
+    "summary": "TUI music player and recommendation engine in Rust; YouTube provider optional behind feature `youtube`.",
+    "repo": "https://github.com/SudoSkaT/Tunefold",
+    "license": "GPL-3.0",
+    "version_source": "Cargo.toml CARGO_PKG_VERSION",
+    "global_instructions": "AGENTS.md",
+    "verification_baseline": "docs/testing/audio-validation.md"
+  },
+  "levels": {
+    "level1": [
+      "AGENTS.md",
+      "engineering/CORE.md"
+    ],
+    "level2": [
+      "engineering/ARCHITECTURE.md",
+      "engineering/MODULE_INDEX.md",
+      "engineering/VERIFICATION.md",
+      "engineering/KNOWN_ISSUES.md"
+    ],
+    "level3": "code paths listed by context-report"
+  },
+  "systems": {
+    "audio": {
+      "description": "Desktop audio engine: rodio/symphonia decoding, StreamBuffer, DSP chain, playback monitor, cancellation.",
+      "source_paths": [
+        "src/infrastructure/playback",
+        "src/app/audio.rs",
+        "src/media/transport"
+      ],
+      "docs": [
+        "docs/architecture/audio-engine.md",
+        "docs/architecture/playback-lifecycle.md"
+      ],
+      "tests": [
+        "cargo test --lib infrastructure::playback",
+        "cargo test --lib media::transport",
+        "cargo test --test audio_decode"
+      ],
+      "commands": [
+        "cargo test --lib",
+        "cargo test --test audio_decode"
+      ],
+      "constraints": [
+        "audio thread never blocks on network/disk/locks",
+        "events carry generation",
+        "Flat path bit-exact",
+        "no allocations in hot path"
+      ],
+      "related": [
+        "dsp",
+        "playback",
+        "networking"
+      ],
+      "avoid": [
+        "docs/android/*",
+        "src/platform/android*",
+        "src/ui/*"
+      ],
+      "keywords": [
+        "audio",
+        "rodio",
+        "symphonia",
+        "buffer",
+        "dsp",
+        "pcm",
+        "streambuffer"
+      ]
+    },
+    "dsp": {
+      "description": "DSP chain: params, control, processors, biquad EQ, stereo, normalize, limiter, rodio adapter.",
+      "source_paths": [
+        "src/dsp"
+      ],
+      "docs": [
+        "docs/architecture/dsp-pipeline.md"
+      ],
+      "tests": [
+        "cargo test --lib dsp::",
+        "cargo run --release --example bench_dsp"
+      ],
+      "commands": [
+        "cargo test --lib dsp::"
+      ],
+      "constraints": [
+        "Copy params",
+        "try_lock only",
+        "no alloc in process",
+        "reset on seek/discontinuity",
+        "Flat early return"
+      ],
+      "related": [
+        "audio",
+        "analysis"
+      ],
+      "avoid": [
+        "docs/android/*",
+        "src/platform/*",
+        "src/ui/*"
+      ],
+      "keywords": [
+        "dsp",
+        "eq",
+        "equalizer",
+        "biquad",
+        "limiter",
+        "normalize",
+        "preamp"
+      ]
+    },
+    "android": {
+      "description": "Android playback engine: JNI, Oboe/AudioTrack, foreground service, ring buffer, decoder.",
+      "source_paths": [
+        "src/platform",
+        "android"
+      ],
+      "docs": [
+        "docs/android/playback-glossary.md",
+        "docs/android/visual-system.md",
+        "android/README.md"
+      ],
+      "tests": [
+        "cargo test --lib --features android",
+        "cd android && ./gradlew --offline test"
+      ],
+      "commands": [
+        "cargo check --offline --features android",
+        "cargo test --lib --features android"
+      ],
+      "constraints": [
+        "SPSC ring",
+        "no seek in decoder",
+        "cancel token",
+        "fail-open ranking",
+        "forward-only source"
+      ],
+      "related": [
+        "audio",
+        "networking",
+        "recommendations"
+      ],
+      "avoid": [
+        "src/infrastructure/playback",
+        "src/ui/*",
+        "docs/architecture/dsp-pipeline.md"
+      ],
+      "keywords": [
+        "android",
+        "jni",
+        "oboe",
+        "audiotrack",
+        "foreground",
+        "ring"
+      ]
+    },
+    "playback": {
+      "description": "Session queue, position clock, preload, recovery, router, app playback orchestration.",
+      "source_paths": [
+        "src/playback",
+        "src/app/playback.rs",
+        "src/infrastructure/playback",
+        "src/media/router.rs"
+      ],
+      "docs": [
+        "docs/architecture/playback-lifecycle.md"
+      ],
+      "tests": [
+        "cargo test --lib playback::",
+        "cargo test --lib app::playback"
+      ],
+      "commands": [
+        "cargo test --lib"
+      ],
+      "constraints": [
+        "epoch/generation guards",
+        "recover_current checks epoch",
+        "stop not revived by late play",
+        "persistence after start"
+      ],
+      "related": [
+        "audio",
+        "networking",
+        "ui"
+      ],
+      "avoid": [
+        "docs/android/visual-system.md",
+        "src/dsp/*"
+      ],
+      "keywords": [
+        "playback",
+        "queue",
+        "session",
+        "epoch",
+        "generation",
+        "recover",
+        "router"
+      ]
+    },
+    "networking": {
+      "description": "HTTP transport: HttpRangeStream, range windows, retries/backoff, cancellation, validation.",
+      "source_paths": [
+        "src/media/transport",
+        "src/media/resolver.rs",
+        "src/media/cache.rs",
+        "src/media/expiration.rs"
+      ],
+      "docs": [
+        "docs/testing/audio-validation.md",
+        "README.md"
+      ],
+      "tests": [
+        "cargo test --lib media::transport",
+        "cargo test --test audio_decode"
+      ],
+      "commands": [
+        "cargo test --lib media::transport"
+      ],
+      "constraints": [
+        "closed ranges required",
+        "total immutable",
+        "200 only full from 0",
+        "cancel interrupts all phases",
+        "no blind retries on 403/416"
+      ],
+      "related": [
+        "audio",
+        "playback",
+        "providers"
+      ],
+      "avoid": [
+        "src/ui/*",
+        "docs/android/visual-system.md",
+        "src/dsp/*"
+      ],
+      "keywords": [
+        "http",
+        "range",
+        "transport",
+        "stream",
+        "retry",
+        "backoff",
+        "cancel",
+        "network"
+      ]
+    },
+    "providers": {
+      "description": "Provider adapters and composition boundary; YouTube behind feature `youtube`; LRCLIB lyrics always.",
+      "source_paths": [
+        "src/providers",
+        "src/api/mod.rs",
+        "src/catalog",
+        "src/media/registry.rs",
+        "src/media/provider.rs"
+      ],
+      "docs": [
+        "docs/policies.md",
+        "README.md"
+      ],
+      "tests": [
+        "cargo test --lib",
+        "cargo test --lib --features youtube"
+      ],
+      "commands": [
+        "cargo check --offline",
+        "cargo check --offline --features youtube"
+      ],
+      "constraints": [
+        "YouTube only in src/providers/youtube and feature youtube",
+        "api/mod.rs sole composition boundary",
+        "no rustypipe in default build"
+      ],
+      "related": [
+        "networking",
+        "recommendations"
+      ],
+      "avoid": [
+        "src/dsp/*",
+        "src/ui/*"
+      ],
+      "keywords": [
+        "provider",
+        "youtube",
+        "rustypipe",
+        "catalog",
+        "streamresolver",
+        "lyrics"
+      ]
+    },
+    "analysis": {
+      "description": "Acoustic analysis: FFT, bands, chroma, features, tap, ring, aggregator.",
+      "source_paths": [
+        "src/analysis",
+        "src/recommendation/acoustic_aggregator.rs",
+        "src/recommendation/profile.rs"
+      ],
+      "docs": [
+        "docs/architecture/dsp-pipeline.md",
+        "docs/recommendations.md"
+      ],
+      "tests": [
+        "cargo test --lib analysis::",
+        "cargo test --lib recommendation::"
+      ],
+      "commands": [
+        "cargo test --lib analysis::"
+      ],
+      "constraints": [
+        "analysis pre-DSP",
+        "dedicated thread",
+        "drop-newest on lag",
+        "no audio thread block"
+      ],
+      "related": [
+        "dsp",
+        "visualization",
+        "recommendations"
+      ],
+      "avoid": [
+        "src/platform/*",
+        "docs/android/*"
+      ],
+      "keywords": [
+        "analysis",
+        "fft",
+        "chroma",
+        "features",
+        "tap",
+        "ring",
+        "acoustic"
+      ]
+    },
+    "visualization": {
+      "description": "TUI visualization: spectrum, lava metaballs, beat pulse, palette from artwork.",
+      "source_paths": [
+        "src/visualization",
+        "src/ui/widgets",
+        "src/ui/dashboard"
+      ],
+      "docs": [
+        "README.md"
+      ],
+      "tests": [
+        "cargo test --lib visualization::",
+        "cargo test --lib ui::"
+      ],
+      "commands": [
+        "cargo test --lib"
+      ],
+      "constraints": [
+        "phase from real playback position",
+        "no visual clocks",
+        "zero alloc in render hot path"
+      ],
+      "related": [
+        "analysis",
+        "ui"
+      ],
+      "avoid": [
+        "src/platform/*",
+        "docs/android/playback-glossary.md"
+      ],
+      "keywords": [
+        "visual",
+        "visualization",
+        "spectrum",
+        "lava",
+        "palette",
+        "render"
+      ]
+    },
+    "recommendations": {
+      "description": "Ranking engine: weights, signals, acoustic/harmonic/structure scoring, JNI contract.",
+      "source_paths": [
+        "src/recommendation",
+        "src/platform/android_rank.rs"
+      ],
+      "docs": [
+        "docs/recommendations.md"
+      ],
+      "tests": [
+        "cargo test --lib recommendation::",
+        "cargo test --lib --features android platform::android_rank"
+      ],
+      "commands": [
+        "cargo test --lib recommendation::",
+        "cargo test --lib --features android"
+      ],
+      "constraints": [
+        "weights sum 1.0",
+        "impressions never score",
+        "rec_click collapses with play",
+        "fail-open on Android",
+        "stateless JSON contract"
+      ],
+      "related": [
+        "analysis",
+        "providers",
+        "persistence"
+      ],
+      "avoid": [
+        "src/ui/*",
+        "src/dsp/*"
+      ],
+      "keywords": [
+        "recommendation",
+        "ranker",
+        "scoring",
+        "affinity",
+        "signals",
+        "related",
+        "autoplay"
+      ]
+    },
+    "persistence": {
+      "description": "SQLite via sqlx, models, history, stats, caches, XDG dirs, migration.",
+      "source_paths": [
+        "src/infrastructure/db.rs",
+        "src/infrastructure/storage.rs",
+        "src/infrastructure/config.rs",
+        "src/infrastructure/dirs.rs",
+        "src/app/history.rs",
+        "src/app/aggregator.rs"
+      ],
+      "docs": [
+        "docs/policies.md",
+        "README.md"
+      ],
+      "tests": [
+        "cargo test --lib infrastructure::",
+        "cargo test --lib app::history"
+      ],
+      "commands": [
+        "cargo test --lib"
+      ],
+      "constraints": [
+        "XDG paths only",
+        "migration copies never deletes",
+        "no CWD-relative data",
+        "sqlx migrations"
+      ],
+      "related": [
+        "playback",
+        "recommendations",
+        "ui"
+      ],
+      "avoid": [
+        "src/dsp/*",
+        "src/platform/*"
+      ],
+      "keywords": [
+        "sqlite",
+        "db",
+        "storage",
+        "xdg",
+        "dirs",
+        "migration",
+        "history",
+        "cache"
+      ]
+    },
+    "ui": {
+      "description": "TUI (ratatui/crossterm): app loop, backend, views, widgets, navigation, settings.",
+      "source_paths": [
+        "src/ui",
+        "src/app",
+        "src/main.rs"
+      ],
+      "docs": [
+        "README.md"
+      ],
+      "tests": [
+        "cargo test --lib ui::",
+        "cargo test --lib app::"
+      ],
+      "commands": [
+        "cargo test --lib"
+      ],
+      "constraints": [
+        "no blocking in UI thread beyond documented",
+        "epoch-aware events",
+        "local-first privacy"
+      ],
+      "related": [
+        "playback",
+        "visualization",
+        "persistence"
+      ],
+      "avoid": [
+        "src/platform/*",
+        "src/dsp/*",
+        "docs/android/playback-glossary.md"
+      ],
+      "keywords": [
+        "ui",
+        "tui",
+        "ratatui",
+        "view",
+        "widget",
+        "backend",
+        "settings"
+      ]
+    }
+  },
+  "historical_docs": [
+    "docs/audit/*",
+    "docs/roadmap/*",
+    "android/*_REPORT.md"
+  ],
+  "verification_matrix": {
+    "rust_general": [
+      "cargo fmt --check",
+      "cargo clippy --all-targets -- -D warnings",
+      "cargo test --lib"
+    ],
+    "dsp": [
+      "cargo test --lib dsp::",
+      "cargo run --release --example bench_dsp"
+    ],
+    "audio_decode": [
+      "cargo test --test audio_decode",
+      "cargo test --lib media::transport"
+    ],
+    "android": [
+      "cargo test --lib --features android",
+      "cd android && ./gradlew --offline test"
+    ],
+    "jni": [
+      "cargo test --lib --features android",
+      "cargo check --offline --features android"
+    ],
+    "networking": [
+      "cargo test --lib media::transport"
+    ],
+    "providers": [
+      "cargo check --offline",
+      "cargo check --offline --features youtube",
+      "cargo test --lib --features youtube"
+    ],
+    "ui": [
+      "cargo test --lib ui::",
+      "cargo test --lib app::"
+    ],
+    "recommendations": [
+      "cargo test --lib recommendation::",
+      "cargo test --lib --features android platform::android_rank"
+    ],
+    "dependencies": [
+      "cargo check --offline",
+      "cargo clippy --all-targets --all-features -- -D warnings"
+    ]
+  }
+}

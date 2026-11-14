@@ -10,7 +10,9 @@
 
 use async_trait::async_trait;
 
-use crate::domain::{album::Album, artist::Artist, source::Source, track::Track};
+use crate::domain::{
+    album::Album, artist::Artist, external_playlist::ExternalPlaylist, source::Source, track::Track,
+};
 
 /// Error unificado devuelto por cualquier proveedor de metadatos.
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +50,12 @@ pub trait CatalogProvider: std::fmt::Debug + Send + Sync {
     async fn get_artist(&self, external_id: &str) -> Result<Artist, CatalogError>;
     async fn get_album(&self, external_id: &str) -> Result<Album, CatalogError>;
     async fn get_album_tracks(&self, external_id: &str) -> Result<Vec<Track>, CatalogError>;
+
+    /// External playlist metadata and entries, if the provider supports them.
+    async fn playlist(&self, external_id: &str) -> Result<ExternalPlaylist, CatalogError> {
+        let _ = external_id;
+        Err(CatalogError::Other("playlist not supported".to_string()))
+    }
 
     /// Recomendados de un video. `Ok(vec![])` si la fuente no los expone.
     async fn related(&self, _video_id: &str) -> Result<Vec<Track>, CatalogError> {

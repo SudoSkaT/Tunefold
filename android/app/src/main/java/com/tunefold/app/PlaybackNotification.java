@@ -207,7 +207,7 @@ final class PlaybackNotification {
                 // comando de voz o el relojongo tengan que decir, y mezclado con el
                 // nombre del artista quedaba ilegible en la pantalla de bloqueo.
                 .setContentText(artist)
-                .setSubText(snapshot.state.label())
+                .setSubText(buildSubText(snapshot))
                 .setCategory(Notification.CATEGORY_TRANSPORT)
                 // Sin esto la notificación se oculta en la pantalla de bloqueo y el
                 // sistema la expone como una más: los controles de medios disappears
@@ -271,6 +271,19 @@ final class PlaybackNotification {
     static DownloadState.Phase downloadPhaseOf(PlaybackSession.Snapshot snapshot) {
         return snapshot.download == null
                 ? DownloadState.Phase.IDLE : snapshot.download.phase;
+    }
+    private static boolean isDownloadedSnapshot(PlaybackSession.Snapshot snapshot) {
+        DownloadState.Phase phase = downloadPhaseOf(snapshot);
+        return phase == DownloadState.Phase.COMPLETED
+                || phase == DownloadState.Phase.ALREADY_DOWNLOADED;
+    }
+    private static String buildSubText(PlaybackSession.Snapshot snapshot) {
+        java.util.List<String> parts = new java.util.ArrayList<>();
+        if (snapshot.liked) parts.add("Liked");
+        if (isDownloadedSnapshot(snapshot)) parts.add("Downloaded");
+        if (snapshot.state.label() != null && !snapshot.state.label().isEmpty())
+            parts.add(snapshot.state.label());
+        return android.text.TextUtils.join(" · ", parts);
     }
 
     /** Like glyph for the notification: filled when the track is liked. */

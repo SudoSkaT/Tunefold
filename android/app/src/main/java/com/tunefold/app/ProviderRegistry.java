@@ -339,6 +339,38 @@ final class ProviderRegistry implements AutoCloseable {
         });
     }
 
+    /**
+     * Fetches metadata and entries for an external YouTube playlist.
+     *
+     * <p>Completes with the raw JSON document so the caller can render a preview
+     * without coupling this registry to a particular model.
+     */
+    void playlist(String playlistId, Callback<JSONObject> callback) {
+        worker.execute(() -> {
+            if (!available || playlistId == null || playlistId.trim().isEmpty()) {
+                deliver(callback, null, "Provider is not initialized");
+                return;
+            }
+            String response = TunefoldBridge.playlistYoutube(playlistId.trim());
+            try {
+                JSONObject root = new JSONObject(response);
+                if (!root.optBoolean("ok")) {
+                    deliver(callback, null,
+                            root.optString("category", "provider_error") + ": "
+                                    + root.optString("error", "Provider request failed"));
+                    return;
+                }
+                JSONObject playlist = root.optJSONObject("playlist");
+                if (playlist != null) root = playlist;
+                // Keep an "ok" marker so callers can treat the unwrapped object uniformly.
+                root.put("ok", true);
+                deliver(callback, root, null);
+            } catch (Exception error) {
+                deliver(callback, null, error.toString());
+            }
+        });
+    }
+
     /** Enumerates committed local media, backing the derived `Descargadas` view. */
     void localEntries(Callback<List<LocalMediaStore.Entry>> callback) {
         worker.execute(() -> {
@@ -398,6 +430,82 @@ final class ProviderRegistry implements AutoCloseable {
         main.postDelayed(() -> once.complete(null,
                 "Search timed out. Check your connection and try again."),
                 SEARCH_TIMEOUT_MS);
+    }
+
+    /**
+     * Searches albums, reported as playable track lists' parents.
+     *
+     * <p>Albums are returned as {@link MediaTrack}-shaped rows (title, cover) so the
+     * search surface can render them uniformly; tapping fetches their tracks through
+     * {@link #albumTracks}.
+     */
+    void searchAlbums(String query, Callback<java.util.List<MediaTrack>> callback) {
+        java.util.concurrent.atomic.AtomicBoolean delivered = new java.util.concurrent.atomic.AtomicBoolean(false);
+        Callback<java.util.List<MediaTrack>> once = (value, error) -> {
+            if (delivered.compareAndSet(false, true)) deliver(callback, value, error);
+        };
+        searchWorker.execute(() -> {
+            if (!available) { once.complete(null, "YouTube provider is not initialized"); return; }
+            String response = TunefoldBridge.searchAlbumsYoutube(query, 20);
+            try {
+                org.json.JSONObject root = new org.json.JSONObject(response);
+                if (!root.optBoolean("ok")) {
+                    once.complete(null, root.optString("error", "Search failed"));
+                    return;
+                }
+                org.json.JSONArray albums = root.optJSONArray("albums");
+                java.util.List<MediaTrack> result = new java.util.ArrayList<>();
+                if (albums != null) for (int i = 0; i < albums.length(); i++) {
+                    org.json.JSONObject a = albums.optJSONObject(i);
+                    if (a == null) continue;
+                    String thumb = a.optString("cover", "");
+                    result.add(new MediaTrack("Album", a.optString("id", ""), a.optString("title", "Untitled"),
+                            "", "", a.optString("title", ""), "artist", -1, thumb, "", a.toString()));
+                }
+                once.complete(result, null);
+            } catch (Exception e) { once.complete(null, e.toString()); }
+        });
+        main.postDelayed(() -> once.complete(null, "Search timed out. Check your connection and try again."),
+                20_000L);
+    }
+
+    /** Fetches the tracks of an album. */
+    void albumTracks(String albumId, Callback<java.util.List<MediaTrack>> callback) {
+        worker.execute(() -> {
+            if (!available) { deliver(callback, null, "YouTube provider is not initialized"); return; }
+            String response = TunefoldBridge.albumTracksYoutube(albumId);
+            parseTracks(response, (tracks, error) -> deliver(callback, tracks, error));
+        });
+    }
+
+    void searchArtists(String query, Callback<java.util.List<MediaTrack>> callback) {
+        java.util.concurrent.atomic.AtomicBoolean delivered = new java.util.concurrent.atomic.AtomicBoolean(false);
+        Callback<java.util.List<MediaTrack>> once = (value, error) -> {
+            if (delivered.compareAndSet(false, true)) deliver(callback, value, error);
+        };
+        searchWorker.execute(() -> {
+            if (!available) { once.complete(null, "YouTube provider is not initialized"); return; }
+            String response = TunefoldBridge.searchArtistsYoutube(query, 20);
+            try {
+                org.json.JSONObject root = new org.json.JSONObject(response);
+                if (!root.optBoolean("ok")) {
+                    once.complete(null, root.optString("error", "Search failed"));
+                    return;
+                }
+                org.json.JSONArray artists = root.optJSONArray("artists");
+                java.util.List<MediaTrack> result = new java.util.ArrayList<>();
+                if (artists != null) for (int i = 0; i < artists.length(); i++) {
+                    org.json.JSONObject a = artists.optJSONObject(i);
+                    if (a == null) continue;
+                    String thumb = a.optString("image", "");
+                    result.add(new MediaTrack("Artist", a.optString("id", ""), a.optString("name", "Unknown"),
+                            a.optString("name", ""), "", "", "artist", -1, thumb, "", a.toString()));
+                }
+                once.complete(result, null);
+            } catch (Exception e) { once.complete(null, e.toString()); }
+        });
+        main.postDelayed(() -> once.complete(null, "Search timed out. Check your connection and try again."),
+                20_000L);
     }
 
     void resolve(String url, PlaybackTrace trace, Callback<MediaTrack> callback) {

@@ -35,6 +35,15 @@ interface LocalMediaStore {
 
     boolean register(String provider, String id, File path, String title, String thumbnail);
 
+    boolean register(String provider, String id, File path, String title, String thumbnail,
+            String artist);
+
+    boolean register(String provider, String id, File path, String title, String thumbnail,
+            String artist, long durationMs);
+
+    boolean register(String provider, String id, File path, String title, String thumbnail,
+            String artist, String album, long durationMs);
+
     boolean remove(String provider, String id);
 
     /**
@@ -62,6 +71,12 @@ interface LocalMediaStore {
         private final String title;
         /** Thumbnail URL remembered at download time, or {@code null} when unknown. */
         private final String thumbnail;
+        /** Artist (or channel) remembered at download time, or {@code null} when unknown. */
+        private final String artist;
+        /** Album remembered at download time, or {@code null} when unknown. */
+        private final String album;
+        /** Duration in ms remembered at download time, or {@code -1} when unknown. */
+        private final long durationMs;
         private final File audio;
 
         Entry(TrackKey key, long size, File audio, String title) {
@@ -69,11 +84,28 @@ interface LocalMediaStore {
         }
 
         Entry(TrackKey key, long size, File audio, String title, String thumbnail) {
+            this(key, size, audio, title, thumbnail, null, null, -1L);
+        }
+
+        Entry(TrackKey key, long size, File audio, String title, String thumbnail, String artist) {
+            this(key, size, audio, title, thumbnail, artist, null, -1L);
+        }
+
+        Entry(TrackKey key, long size, File audio, String title, String thumbnail, String artist,
+                long durationMs) {
+            this(key, size, audio, title, thumbnail, artist, null, durationMs);
+        }
+
+        Entry(TrackKey key, long size, File audio, String title, String thumbnail, String artist,
+                String album, long durationMs) {
             this.key = key;
             this.size = size;
             this.audio = audio;
             this.title = title;
             this.thumbnail = thumbnail;
+            this.artist = artist;
+            this.album = album;
+            this.durationMs = durationMs;
         }
 
         /** The audio file. Guaranteed to exist: the entry was validated. */
@@ -93,6 +125,15 @@ interface LocalMediaStore {
 
         /** Thumbnail URL the file was downloaded under, or {@code null} when unknown. */
         public String thumbnail() { return thumbnail; }
+
+        /** Artist the file was downloaded under, or {@code null} when unknown. */
+        public String artist() { return artist; }
+
+        /** Album the file was downloaded under, or {@code null} when unknown. */
+        public String album() { return album; }
+
+        /** Duration in ms the file was downloaded under, or {@code -1} when unknown. */
+        public long durationMs() { return durationMs; }
 
         @Override public String toString() { return key + " (" + size + " bytes)"; }
     }

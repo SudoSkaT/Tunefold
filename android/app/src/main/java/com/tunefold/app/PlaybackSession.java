@@ -804,6 +804,22 @@ final class PlaybackSession {
         });
     }
 
+    /**
+     * Re-fetches metadata for every remembered identity.
+     *
+     * <p>Repairs libraries saved before the app kept covers, artists or durations,
+     * without re-downloading audio: the provider is asked once per identity and
+     * the answer is remembered where it belongs.
+     */
+    void repairMetadata() {
+        java.util.Set<TrackKey> keys = new java.util.LinkedHashSet<>();
+        if (library != null) keys.addAll(library.likedKeys());
+        if (downloader != null) keys.addAll(downloader.registry().storedKeys());
+        for (TrackKey key : keys) {
+            learnMetadata(key, null);
+        }
+    }
+
     /** Where learned metadata is written, so the next launch does not ask again. */
     private void remember(MediaTrack track) {
         TrackKey key = track.key();
@@ -833,7 +849,11 @@ final class PlaybackSession {
      * move.
      */
     private long durationFor(TrackKey key) {
-        return library.durationFor(key);
+        if (downloader != null) {
+            long downloaded = downloader.registry().durationOf(key);
+            if (downloaded > 0L) return downloaded;
+        }
+        return library == null ? -1L : library.durationFor(key);
     }
 
     private String thumbnailFor(TrackKey key) {
@@ -850,6 +870,20 @@ final class PlaybackSession {
      * needs provider metadata, and the only copy of it that survives the process is the
      * one the library kept.
      */
+    private String artistFor(TrackKey key) {
+        String downloaded = downloader == null ? null : downloader.registry().artistOf(key);
+        if (downloaded != null && !downloaded.isEmpty()) return downloaded;
+        String remembered = library == null ? null : library.artistFor(key);
+        return remembered == null ? "" : remembered;
+    }
+
+    private String albumFor(TrackKey key) {
+        String downloaded = downloader == null ? null : downloader.registry().albumOf(key);
+        if (downloaded != null && !downloaded.isEmpty()) return downloaded;
+        String remembered = library == null ? null : library.albumFor(key);
+        return remembered == null ? "" : remembered;
+    }
+
     private String sourceFor(TrackKey key) {
         String remembered = library.sourceFor(key);
         return remembered == null ? "" : remembered;
@@ -884,7 +918,7 @@ final class PlaybackSession {
         // providerId must stay the real identity: it is what the download registry
         // and the queue key on. Only the display fields are synthesised.
         return new MediaTrack(key.provider(), key.providerTrackId(), trackTitle(key),
-                "", "", "", "", durationFor(key), thumbnailFor(key), sourceFor(key), "{}");
+                artistFor(key), "", albumFor(key), "artist", durationFor(key), thumbnailFor(key), sourceFor(key), "{}");
     }
 
     // ------------------------------------------------------------- download

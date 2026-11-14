@@ -21,6 +21,7 @@ use rustypipe::model::{MusicAlbum, MusicArtist};
 use super::mapper::{best_thumbnail, map_track, THUMB_FALLBACK};
 use super::metadata_cache::MetadataCache;
 use crate::catalog::{CatalogError as ProviderError, CatalogProvider};
+use crate::domain::external_playlist::ExternalPlaylist;
 use crate::domain::source::Source;
 use crate::domain::{album::Album, artist::Artist, track::Track};
 use crate::media::FailureCategory;
@@ -789,6 +790,60 @@ impl CatalogProvider for YoutubeProvider {
             .await
             .map_err(|e| map_error(e, "music_album"))?;
         Ok(album.tracks.iter().map(map_track).collect())
+    }
+
+    async fn playlist(&self, external_id: &str) -> Result<ExternalPlaylist, ProviderError> {
+        if external_id.starts_with("RD") {
+            let mut paginator = self
+                .client
+                .query()
+                .music_radio_playlist(external_id)
+                .await
+                .map_err(|e| map_error(e, "music_radio_playlist"))?;
+            while paginator.items.len() < 500 && !paginator.is_exhausted() {
+                let q = self.client.query();
+                if !paginator.extend(&q).await.unwrap_or(false) {
+                    break;
+                }
+            }
+            let mut out = ExternalPlaylist::new(
+                crate::domain::source::Source::YouTube,
+                external_id.to_string(),
+            );
+            out.title = format!("Mix {external_id}");
+            out.track_count = Some(paginator.items.len() as u64);
+            out.tracks = paginator.items.iter().map(map_track).collect();
+            return Ok(out);
+        }
+
+        let mut pl = self
+            .client
+            .query()
+            .music_playlist(external_id)
+            .await
+            .map_err(|e| map_error(e, "music_playlist"))?;
+        // Bounded pagination: avoid unbounded memory on very large playlists.
+        while pl.tracks.items.len() < 500 && !pl.tracks.is_exhausted() {
+            let q = self.client.query();
+            if !pl.tracks.extend(&q).await.unwrap_or(false) {
+                break;
+            }
+        }
+        let mut out = ExternalPlaylist::new(
+            crate::domain::source::Source::YouTube,
+            external_id.to_string(),
+        );
+        out.title = pl.name;
+        out.description = pl
+            .description
+            .as_ref()
+            .map(|r| r.0.iter().map(|c| c.get_text()).collect::<String>());
+        out.thumbnail =
+            best_thumbnail(&pl.thumbnail).map(|url| crate::domain::track::Thumbnail { url });
+        out.owner = pl.channel.as_ref().map(|c| c.name.clone());
+        out.track_count = pl.track_count;
+        out.tracks = pl.tracks.items.iter().map(map_track).collect();
+        Ok(out)
     }
 
     async fn related(&self, video_id: &str) -> Result<Vec<Track>, ProviderError> {

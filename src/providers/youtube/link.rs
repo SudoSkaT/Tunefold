@@ -93,6 +93,15 @@ pub fn parse_link(raw: &str) -> LinkKind {
 
     // /watch?v=ID (&list=PLID opcional: manda el video por decisión Q2 copia)
     if path_query.split(['?', '#']).next() == Some("/watch") {
+        // Un mix/radio de YouTube viaja como `list=RD…` (o `RDAMPL…`): se
+        // trata como playlist para reproducir el mix completo, no solo el video.
+        if let Some(list) = query_param(path_query, "list") {
+            if list.starts_with("RD") {
+                if let Some(id) = valid_list(&list) {
+                    return LinkKind::PlaylistId(id);
+                }
+            }
+        }
         if let Some(v) = query_param(path_query, "v") {
             if let Some(id) = valid_video(&v) {
                 return LinkKind::VideoId(id);
@@ -108,6 +117,19 @@ pub fn parse_link(raw: &str) -> LinkKind {
     }
 
     LinkKind::Invalid
+}
+
+/// URL canónica de una playlist externa de YouTube.
+pub fn canonical_playlist_url(playlist_id: &str) -> String {
+    format!("https://www.youtube.com/playlist?list={playlist_id}")
+}
+
+/// Extrae el identificador de playlist de una URL soportada, si la representa.
+pub fn playlist_id_from_url(raw: &str) -> Option<String> {
+    match parse_link(raw) {
+        LinkKind::PlaylistId(id) => Some(id),
+        _ => None,
+    }
 }
 
 /// ¿Parece URL (para que Search la desvíe a `ResolveLink`)? Barato y sin

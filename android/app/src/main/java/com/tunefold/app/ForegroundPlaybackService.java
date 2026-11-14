@@ -57,8 +57,10 @@ public final class ForegroundPlaybackService extends Service {
         providers.initialize(new java.io.File(getCacheDir(), "rustypipe").getAbsolutePath(),
                 new java.io.File(getFilesDir(), "media").getAbsolutePath(),
                 (ready, error) -> {
-                    if (ready) attachDownloader();
-                    else if (error != null) Log.i(TAG, error);
+                    if (ready) {
+                        attachDownloader();
+                        if (session != null) session.repairMetadata();
+                    } else if (error != null) Log.i(TAG, error);
                 });
         handler.post(poll);
     }
@@ -116,6 +118,7 @@ public final class ForegroundPlaybackService extends Service {
      *                    a late tap likes or downloads the wrong song.
      */
     void dispatchCommand(String action, String expectedKey) {
+        android.util.Log.i(TAG, "event=NOTIFICATION_ACTION action=" + action);
         if (session == null || action == null) return;
         if (expectedKey != null && !expectedKey.isEmpty()) {
             PlaybackSession.Snapshot current = session.snapshot();

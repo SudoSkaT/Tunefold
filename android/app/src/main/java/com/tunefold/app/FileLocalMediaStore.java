@@ -88,7 +88,12 @@ final class FileLocalMediaStore implements LocalMediaStore {
                 }
                 String title = entry.optString("title", "").trim();
                 String thumbnail = entry.optString("thumbnail", "").trim();
-                found.add(new Entry(key, actual, audio, title.isEmpty() ? null : title, thumbnail.isEmpty() ? null : thumbnail));
+                String artist = entry.optString("artist", "").trim();
+                String album = entry.optString("album", "").trim();
+                long durationMs = entry.optLong("duration_ms", -1L);
+                found.add(new Entry(key, actual, audio, title.isEmpty() ? null : title,
+                        thumbnail.isEmpty() ? null : thumbnail, artist.isEmpty() ? null : artist,
+                        album.isEmpty() ? null : album, durationMs));
             } catch (Exception corrupt) {
                 sidecar.delete();
             }
@@ -150,6 +155,24 @@ final class FileLocalMediaStore implements LocalMediaStore {
 
     @Override
     public synchronized boolean register(String provider, String id, File path, String title, String thumbnail) {
+        return register(provider, id, path, title, thumbnail, null, -1L);
+    }
+
+    @Override
+    public synchronized boolean register(String provider, String id, File path, String title, String thumbnail,
+            String artist) {
+        return register(provider, id, path, title, thumbnail, artist, -1L);
+    }
+
+    @Override
+    public synchronized boolean register(String provider, String id, File path, String title, String thumbnail,
+            String artist, long durationMs) {
+        return register(provider, id, path, title, thumbnail, artist, null, durationMs);
+    }
+
+    @Override
+    public synchronized boolean register(String provider, String id, File path, String title, String thumbnail,
+            String artist, String album, long durationMs) {
         if (provider == null || provider.isEmpty() || id == null || id.isEmpty()) return false;
         if (path == null || !path.isFile()) return false;
         File target = audioFile(provider, id);
@@ -173,6 +196,9 @@ final class FileLocalMediaStore implements LocalMediaStore {
             // blank title is left out entirely rather than stored as an empty string.
             if (title != null && !title.trim().isEmpty()) entry.put("title", title.trim());
             if (thumbnail != null && !thumbnail.trim().isEmpty()) entry.put("thumbnail", thumbnail.trim());
+            if (artist != null && !artist.trim().isEmpty()) entry.put("artist", artist.trim());
+            if (album != null && !album.trim().isEmpty()) entry.put("album", album.trim());
+            if (durationMs > 0L) entry.put("duration_ms", durationMs);
             entry.put("updated_at_ms", System.currentTimeMillis());
             try (FileOutputStream output = new FileOutputStream(metadataPart)) {
                 output.write(entry.toString().getBytes(StandardCharsets.UTF_8));

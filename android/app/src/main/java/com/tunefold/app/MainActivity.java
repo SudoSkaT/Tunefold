@@ -1,9 +1,12 @@
 package com.tunefold.app;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import org.json.JSONArray;
+import org.json.JSONObject;
 import android.content.res.Configuration;
 import android.graphics.drawable.ColorDrawable;
 import android.os.Bundle;
@@ -118,6 +121,8 @@ public final class MainActivity extends Activity
     private Section restoredSection = Section.HOME;
     /** Where Search returns to; {@code null} means "wherever you were". */
     private Section returnFromSearch = Section.HOME;
+    /** URL compartida pendiente de previsualizar, si la app se abrió por share. */
+    private String pendingSharedUrl;
     /** Whether the player is covering the navigation. */
     private boolean playerOpen;
 
@@ -161,6 +166,10 @@ public final class MainActivity extends Activity
             render();
             if (getIntent().getBooleanExtra("runtime_smoke_test", false)) resolveAndPlay();
             applyRuntimeDownloadHook();
+            if (pendingSharedUrl != null) {
+                showSharedPlaylistPreview(pendingSharedUrl);
+                pendingSharedUrl = null;
+            }
         }
 
         @Override public void onServiceDisconnected(ComponentName name) {
@@ -196,6 +205,7 @@ public final class MainActivity extends Activity
         getWindow().setBackgroundDrawable(
                 new ColorDrawable(DesignTokens.Palette.SURFACE_BASE));
         buildInterface();
+        handleSharedIntent(getIntent());
         requestNotificationPermissionIfNeeded();
         Intent service = new Intent(this, ForegroundPlaybackService.class);
         bound = bindService(service, connection, BIND_AUTO_CREATE);
@@ -705,6 +715,30 @@ public final class MainActivity extends Activity
             return;
         }
         searchSurface.showSearching();
+        if (intent == SearchSurface.Intent.SEARCH_ALBUMS) {
+            if (providers == null) { searchSurface.showError("Provider not initialized"); return; }
+            providers.searchAlbums(query, (tracks, error) -> {
+                if (destroyed || section != Section.SEARCH) return;
+                if (error != null) {
+                    searchSurface.showError(error);
+                    return;
+                }
+                searchSurface.showResults(tracks == null ? new ArrayList<>() : tracks);
+            });
+            return;
+        }
+        if (intent == SearchSurface.Intent.SEARCH_ARTISTS) {
+            if (providers == null) { searchSurface.showError("Provider not initialized"); return; }
+            providers.searchArtists(query, (tracks, error) -> {
+                if (destroyed || section != Section.SEARCH) return;
+                if (error != null) {
+                    searchSurface.showError(error);
+                    return;
+                }
+                searchSurface.showResults(tracks == null ? new ArrayList<>() : tracks);
+            });
+            return;
+        }
         session.search(query, (tracks, error) -> {
             if (destroyed || section != Section.SEARCH) return;
             if (error != null) {
@@ -713,6 +747,37 @@ public final class MainActivity extends Activity
             }
             searchSurface.showResults(tracks == null ? new ArrayList<>() : tracks);
         });
+    }
+
+    @Override public void onSearchEmpty(SearchSurface.Intent mode) {
+        if (session == null) return;
+        java.util.List<MediaTrack> downloaded = session.downloadedTracks();
+        java.util.List<MediaTrack> grouped = new java.util.ArrayList<>();
+        if (mode == SearchSurface.Intent.SEARCH_ALBUMS) {
+            java.util.Map<String, MediaTrack> albums = new java.util.LinkedHashMap<>();
+            for (MediaTrack track : downloaded) {
+                String key = track.album == null || track.album.trim().isEmpty() ? track.title : track.album.trim();
+                if (!albums.containsKey(key)) {
+                    albums.put(key, new MediaTrack("DownloadedAlbum", key, key,
+                            track.artist, "", track.album, "artist", -1,
+                            track.thumbnail, "", "{}"));
+                }
+            }
+            grouped.addAll(albums.values());
+        } else if (mode == SearchSurface.Intent.SEARCH_ARTISTS) {
+            java.util.Map<String, MediaTrack> artists = new java.util.LinkedHashMap<>();
+            for (MediaTrack track : downloaded) {
+                String key = track.artist == null || track.artist.trim().isEmpty() ? "Unknown" : track.artist.trim();
+                if (!artists.containsKey(key)) {
+                    artists.put(key, new MediaTrack("DownloadedArtist", key, key,
+                            key, "", "", "artist", -1, track.thumbnail, "", "{}"));
+                }
+            }
+            grouped.addAll(artists.values());
+        } else {
+            grouped.addAll(downloaded);
+        }
+        searchSurface.showResults(grouped);
     }
 
     @Override public void onSearchIdle() { }
@@ -859,10 +924,41 @@ public final class MainActivity extends Activity
         if (session == null || row == null) return;
         MediaTrack track = row.track();
         if (track == null) return;
+        if ("Album".equals(track.provider) && track.providerId != null && !track.providerId.isEmpty()) {
+            android.util.Log.i("Tunefold", "album tap id=" + track.providerId);
+            providers.albumTracks(track.providerId, (tracks, error) -> {
+                android.util.Log.i("Tunefold", "album tracks=" + (tracks == null ? -1 : tracks.size()) + " err=" + error);
+                if (tracks == null || tracks.isEmpty()) return;
+                session.playList(tracks, tracks.get(0));
+            });
+            return;
+        }
+        if ("Artist".equals(track.provider) && track.title != null && !track.title.isEmpty()) {
+            providers.search(track.title, (tracks, error) -> {
+                if (tracks == null || tracks.isEmpty()) return;
+                session.playList(tracks, tracks.get(0));
+            });
+            return;
+        }
+        if ("DownloadedAlbum".equals(track.provider)) {
+            java.util.List<MediaTrack> matches = new java.util.ArrayList<>();
+            for (MediaTrack t : session.downloadedTracks()) {
+                String key = t.album == null || t.album.trim().isEmpty() ? t.title : t.album.trim();
+                if (key.equals(track.providerId)) matches.add(t);
+            }
+            if (!matches.isEmpty()) session.playList(matches, matches.get(0));
+            return;
+        }
+        if ("DownloadedArtist".equals(track.provider)) {
+            java.util.List<MediaTrack> matches = new java.util.ArrayList<>();
+            for (MediaTrack t : session.downloadedTracks()) {
+                String key = t.artist == null || t.artist.trim().isEmpty() ? "Unknown" : t.artist.trim();
+                if (key.equals(track.providerId)) matches.add(t);
+            }
+            if (!matches.isEmpty()) session.playList(matches, matches.get(0));
+            return;
+        }
         // The whole list the row is in becomes the queue, starting at the tapped track.
-        // Playing one track from a list used to queue exactly that track, so the song
-        // ended and the list stopped: tapping the third song of L1K3D played the third
-        // song of L1K3D and nothing else, with no way to hear the next one.
         session.playList(row.listTracks(), track);
     }
 
@@ -1378,9 +1474,78 @@ public final class MainActivity extends Activity
      * supersede path on a real device. Validation-only, and it calls exactly the same
      * commands a tap would.
      */
+    private String extractPlaylistId(String url) {
+        if (url == null) return null;
+        int idx = url.indexOf("list=");
+        if (idx < 0) return null;
+        String rest = url.substring(idx + 5);
+        int end = rest.length();
+        for (int i = 0; i < rest.length(); i++) {
+            char c = rest.charAt(i);
+            if (c == '&' || c == '#' || c == '?' || Character.isWhitespace(c)) { end = i; break; }
+        }
+        String id = rest.substring(0, end);
+        return id.isEmpty() ? null : id;
+    }
+
+    private void showSharedPlaylistPreview(String url) {
+        if (providers == null) { pendingSharedUrl = url; return; }
+        String id = extractPlaylistId(url);
+        if (id == null) {
+            new AlertDialog.Builder(this).setTitle("Enlace no soportado")
+                    .setMessage("No se reconoció una playlist de YouTube.")
+                    .setPositiveButton("OK", null).show();
+            return;
+        }
+        providers.playlist(id, (root, error) -> {
+            if (error != null || root == null) {
+                new AlertDialog.Builder(this).setTitle("No se pudo cargar")
+                        .setMessage(error == null ? "Error desconocido" : error)
+                        .setPositiveButton("OK", null).show();
+                return;
+            }
+            String title = root.optString("title", "Playlist");
+            if (title.isEmpty()) title = "Playlist";
+            int count = root.optJSONArray("tracks") == null ? 0 : root.optJSONArray("tracks").length();
+            String owner = root.optString("owner", "");
+            AlertDialog.Builder b = new AlertDialog.Builder(this);
+            b.setTitle(title);
+            StringBuilder msg = new StringBuilder();
+            if (!owner.isEmpty()) msg.append(owner).append("\n");
+            msg.append(count).append(" pistas");
+            b.setMessage(msg.toString());
+            final JSONArray tracks = root.optJSONArray("tracks");
+            b.setPositiveButton("Reproducir todo", (d, w) -> {
+                java.util.List<MediaTrack> list = new java.util.ArrayList<>();
+                if (tracks != null) for (int i = 0; i < tracks.length(); i++) {
+                    JSONObject o = tracks.optJSONObject(i);
+                    if (o != null) list.add(MediaTrack.fromJson(o));
+                }
+                if (!list.isEmpty() && session != null) session.playList(list, list.get(0));
+            });
+            b.setNegativeButton("Cerrar", null);
+            b.show();
+        });
+    }
+
+    /** Extrae una URL compartida (ACTION_SEND/ACTION_VIEW) sin bloquear la UI. */
+    private void handleSharedIntent(Intent intent) {
+        if (intent == null) return;
+        String url = null;
+        if (Intent.ACTION_SEND.equals(intent.getAction())) {
+            url = intent.getStringExtra(Intent.EXTRA_TEXT);
+        } else if (Intent.ACTION_VIEW.equals(intent.getAction()) && intent.getData() != null) {
+            url = intent.getData().toString();
+        }
+        if (url != null && !url.trim().isEmpty()) {
+            pendingSharedUrl = url.trim();
+        }
+    }
+
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        handleSharedIntent(intent);
         if (destroyed || session == null) return;
         if (intent.getBooleanExtra("runtime_smoke_test", false)) resolveAndPlay();
         applyRuntimeDownloadHook();

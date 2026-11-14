@@ -367,11 +367,19 @@ final class TrackDownloader implements AutoCloseable {
         // read as a bare provider id.
         String title = job.track == null ? null : job.track.title;
         String thumbnail = job.track == null ? null : job.track.thumbnail;
+        String artist = job.track == null ? null : (job.track.artist == null || job.track.artist.trim().isEmpty()
+                ? job.track.channel : job.track.artist);
+        String album = job.track == null ? null : job.track.album;
+        long durationMs = job.track == null ? -1L : job.track.durationMs;
         boolean registered = committed != null
-                && store.register(key.provider(), key.providerTrackId(), new File(committed), title, thumbnail);
+                && store.register(key.provider(), key.providerTrackId(), new File(committed), title, thumbnail,
+                        artist, album, durationMs);
         // Remembered as well as written: the sidecar only reaches the list again when
         // the store is next scanned, and the row for this track is on screen now.
         if (thumbnail != null) registry.rememberThumbnail(key, thumbnail);
+        if (artist != null && !artist.trim().isEmpty()) registry.rememberArtist(key, artist);
+        if (album != null && !album.trim().isEmpty()) registry.rememberAlbum(key, album);
+        if (durationMs > 0L) registry.rememberDuration(key, durationMs);
         if (!registered) {
             String message = readError();
             if (message.isEmpty()) {
@@ -405,11 +413,16 @@ final class TrackDownloader implements AutoCloseable {
         if (key == null || track == null || !registry.isDownloaded(key)) return;
         registry.rememberTitle(key, track.title);
         registry.rememberThumbnail(key, track.thumbnail);
+        String learnArtist = (track.artist == null || track.artist.trim().isEmpty())
+                ? track.channel : track.artist;
+        if (learnArtist != null && !learnArtist.trim().isEmpty()) registry.rememberArtist(key, learnArtist);
+        if (track.album != null && !track.album.trim().isEmpty()) registry.rememberAlbum(key, track.album);
+        if (track.durationMs > 0L) registry.rememberDuration(key, track.durationMs);
         providers.runOffUi(() -> {
             File audio = store.get(key.provider(), key.providerTrackId());
             if (audio == null) return;
             store.register(key.provider(), key.providerTrackId(), audio,
-                    track.title, track.thumbnail);
+                    track.title, track.thumbnail, learnArtist, track.album, track.durationMs);
         });
     }
 

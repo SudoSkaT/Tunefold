@@ -63,7 +63,8 @@ final class MediaTrack {
         String artist = "channel".equals(role) ? "" : name;
         String channel = "channel".equals(role) ? name : "";
         JSONObject collection = value.optJSONObject("album");
-        String album = collection == null ? "" : collection.optString("name", "");
+        String album = collection == null ? "" : collection.optString("title",
+                collection.optString("name", ""));
         return new MediaTrack(provider, providerId, title, artist, channel, album, role,
                 durationMs, thumbnail, providerUrl, value.toString());
     }

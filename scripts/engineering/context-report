@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent.parent
+MANIFEST_PATH = REPO_ROOT / "engineering" / "context-map.json"
+CACHE_DIR = REPO_ROOT / "engineering" / ".cache" / "context"
+LEVEL1 = ["AGENTS.md", "engineering/CORE.md"]
+
+def load_manifest():
+    with MANIFEST_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+def infer_systems(task, manifest):
+    task_l = (task or "").lower()
+    scored = []
+    for name, info in manifest["systems"].items():
+        score = 0
+        for kw in info.get("keywords", []):
+            if kw.lower() in task_l:
+                score += 1
+        # system name mention
+        if name in task_l:
+            score += 2
+        if score > 0:
+            scored.append((score, name))
+    scored.sort(reverse=True)
+    if not scored:
+        return []
+    top_score = scored[0][0]
+    # include all with score >= top_score-1? keep top 3 max
+    chosen = [n for s, n in scored if s >= max(1, top_score - 1)]
+    return chosen[:3]
+
+def check_exists(rel):
+    return (REPO_ROOT / rel).exists()
+
+def build_package(args, manifest):
+    start = time.perf_counter()
+    errors = []
+    systems_requested = []
+    inferred = False
+    if args.system:
+        if args.system not in manifest["systems"]:
+            errors.append(f"unknown system: {args.system}")
+            systems_requested = []
+        else:
+            systems_requested = [args.system]
+    else:
+        if args.task:
+            systems_requested = infer_systems(args.task, manifest)
+            inferred = bool(systems_requested)
+        else:
+            errors.append("empty task and no system provided")
+            systems_requested = []
+
+    sys_infos = [manifest["systems"][s] for s in systems_requested if s in manifest["systems"]]
+
+    # level2 base docs
+    level2_docs = ["engineering/MODULE_INDEX.md", "engineering/ARCHITECTURE.md",
+                   "engineering/VERIFICATION.md", "engineering/KNOWN_ISSUES.md"]
+    # system docs
+    system_docs = []
+    for info in sys_infos:
+        system_docs.extend(info.get("docs", []))
+    # dedup preserving order
+    def dedup(seq):
+        seen = set()
+        out = []
+        for x in seq:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+    docs = dedup(level2_docs + system_docs)
+
+    source_paths = dedup([p for info in sys_infos for p in info.get("source_paths", [])])
+    tests = dedup([t for info in sys_infos for t in info.get("tests", [])])
+    commands = dedup([c for info in sys_infos for c in info.get("commands", [])])
+    # add verification matrix commands if system known
+    vm = manifest.get("verification_matrix", {})
+    for s in systems_requested:
+        if s in vm:
+            commands = dedup(commands + vm[s])
+    constraints = dedup([c for info in sys_infos for c in info.get("constraints", [])])
+    related = dedup([r for info in sys_infos for r in info.get("related", [])])
+    avoid = dedup([a for info in sys_infos for a in info.get("avoid", [])])
+
+    # ADRs are discovered via engineering/decisions/* when needed; not auto-included
+    # to keep task context minimal.
+    adrs = []
+
+    # existence checks
+    unresolved = []
+    for p in source_paths + docs + LEVEL1:
+        if not check_exists(p):
+            unresolved.append(p)
+    # adrs check
+    for p in adrs:
+        if not check_exists(p):
+            unresolved.append(p)
+
+    # confidence
+    if errors:
+        confidence = "low"
+    elif not systems_requested:
+        confidence = "low"
+    elif inferred:
+        confidence = "medium"
+    else:
+        confidence = "high"
+
+    # size bytes of docs
+    size_bytes = 0
+    for rel in docs + LEVEL1:
+        p = REPO_ROOT / rel
+        if p.exists():
+            size_bytes += p.stat().st_size
+
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+    package = {
+        "task": args.task or "",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "systems": systems_requested,
+        "inferred_systems": inferred,
+        "confidence": confidence,
+        "level1_always": LEVEL1,
+        "level2_docs": docs,
+        "adr_docs": adrs,
+        "source_paths": source_paths,
+        "tests": tests,
+        "commands": commands,
+        "constraints": constraints,
+        "related_systems": related,
+        "avoid_reading": avoid,
+        "risks": errors if errors else ["none detected by generator"],
+        "suggested_systems": list(manifest["systems"].keys()) if errors or not systems_requested else [],
+        "unresolved_sources": unresolved,
+        "metrics": {
+            "execution_time_ms": round(elapsed_ms, 3),
+            "files_included": len(LEVEL1) + len(docs) + len(source_paths) + len(adrs),
+            "files_excluded": len(avoid),
+            "docs_included": len(docs) + len(LEVEL1),
+            "context_size_bytes": size_bytes,
+            "references": len(source_paths) + len(docs) + len(tests) + len(commands),
+            "unresolved_sources": len(unresolved),
+            "errors": len(errors),
+        },
+    }
+
+    if args.level:
+        # filter by level if requested
+        lvl = int(args.level)
+        if lvl < 2:
+            package["level2_docs"] = []
+            package["source_paths"] = []
+            package["tests"] = []
+            package["commands"] = []
+            package["adr_docs"] = []
+        if lvl < 3:
+            package["source_paths"] = []
+
+    return package, errors
+
+def render_text(pkg):
+    lines = []
+    lines.append(f"Task: {pkg['task']}")
+    lines.append(f"Systems: {', '.join(pkg['systems']) if pkg['systems'] else '(none)'} (confidence: {pkg['confidence']})")
+    lines.append("")
+    lines.append("Level 1 (always):")
+    for p in pkg["level1_always"]:
+        lines.append(f"  - {p}")
+    lines.append("Level 2 (docs):")
+    for p in pkg["level2_docs"]:
+        lines.append(f"  - {p}")
+    if pkg["adr_docs"]:
+        lines.append("ADRs:")
+        for p in pkg["adr_docs"]:
+            lines.append(f"  - {p}")
+    lines.append("Source paths:")
+    for p in pkg["source_paths"]:
+        lines.append(f"  - {p}")
+    lines.append("Tests:")
+    for t in pkg["tests"]:
+        lines.append(f"  - {t}")
+    lines.append("Commands:")
+    for c in pkg["commands"]:
+        lines.append(f"  - {c}")
+    lines.append("Constraints:")
+    for c in pkg["constraints"]:
+        lines.append(f"  - {c}")
+    lines.append("Related systems:")
+    lines.append("  " + (", ".join(pkg["related_systems"]) if pkg["related_systems"] else "(none)"))
+    lines.append("Avoid reading:")
+    for a in pkg["avoid_reading"]:
+        lines.append(f"  - {a}")
+    lines.append("Risks:")
+    for r in pkg["risks"]:
+        lines.append(f"  - {r}")
+    if pkg["suggested_systems"]:
+        lines.append("Suggested systems: " + ", ".join(pkg["suggested_systems"]))
+    if pkg["unresolved_sources"]:
+        lines.append("Unresolved sources:")
+        for u in pkg["unresolved_sources"]:
+            lines.append(f"  - {u}")
+    m = pkg["metrics"]
+    lines.append("")
+    lines.append(f"Metrics: time={m['execution_time_ms']}ms files_included={m['files_included']} files_excluded={m['files_excluded']} docs={m['docs_included']} size_bytes={m['context_size_bytes']} refs={m['references']} unresolved={m['unresolved_sources']} errors={m['errors']}")
+    return "\n".join(lines) + "\n"
+
+def render_markdown(pkg):
+    lines = []
+    lines.append(f"# Context package: {pkg['task']}")
+    lines.append("")
+    lines.append(f"- Systems: {', '.join(pkg['systems']) if pkg['systems'] else '(none)'}")
+    lines.append(f"- Confidence: {pkg['confidence']}")
+    lines.append("")
+    lines.append("## Level 1 (always)")
+    for p in pkg["level1_always"]:
+        lines.append(f"- `{p}`")
+    lines.append("")
+    lines.append("## Level 2 (docs)")
+    for p in pkg["level2_docs"]:
+        lines.append(f"- `{p}`")
+    if pkg["adr_docs"]:
+        lines.append("")
+        lines.append("## ADRs")
+        for p in pkg["adr_docs"]:
+            lines.append(f"- `{p}`")
+    lines.append("")
+    lines.append("## Source paths")
+    for p in pkg["source_paths"]:
+        lines.append(f"- `{p}`")
+    lines.append("")
+    lines.append("## Tests")
+    for t in pkg["tests"]:
+        lines.append(f"- {t}")
+    lines.append("")
+    lines.append("## Commands")
+    for c in pkg["commands"]:
+        lines.append(f"- `{c}`")
+    lines.append("")
+    lines.append("## Constraints")
+    for c in pkg["constraints"]:
+        lines.append(f"- {c}")
+    lines.append("")
+    lines.append("## Related systems")
+    lines.append(", ".join(pkg["related_systems"]) if pkg["related_systems"] else "(none)")
+    lines.append("")
+    lines.append("## Avoid reading")
+    for a in pkg["avoid_reading"]:
+        lines.append(f"- `{a}`")
+    lines.append("")
+    lines.append("## Risks")
+    for r in pkg["risks"]:
+        lines.append(f"- {r}")
+    if pkg["suggested_systems"]:
+        lines.append("")
+        lines.append("## Suggested systems")
+        lines.append(", ".join(pkg["suggested_systems"]))
+    if pkg["unresolved_sources"]:
+        lines.append("")
+        lines.append("## Unresolved sources")
+        for u in pkg["unresolved_sources"]:
+            lines.append(f"- `{u}`")
+    m = pkg["metrics"]
+    lines.append("")
+    lines.append("## Metrics")
+    lines.append(f"- execution_time_ms: {m['execution_time_ms']}")
+    lines.append(f"- files_included: {m['files_included']}")
+    lines.append(f"- files_excluded: {m['files_excluded']}")
+    lines.append(f"- docs_included: {m['docs_included']}")
+    lines.append(f"- context_size_bytes: {m['context_size_bytes']}")
+    lines.append(f"- references: {m['references']}")
+    lines.append(f"- unresolved_sources: {m['unresolved_sources']}")
+    lines.append(f"- errors: {m['errors']}")
+    return "\n".join(lines) + "\n"
+
+def cache_key(args):
+    manifest_mtime = MANIFEST_PATH.stat().st_mtime if MANIFEST_PATH.exists() else 0
+    raw = json.dumps({
+        "task": args.task or "",
+        "system": args.system or "",
+        "format": args.format,
+        "level": args.level or "",
+        "manifest_mtime": manifest_mtime,
+    }, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate task-specific context package for TuneFold.")
+    parser.add_argument("--task", default="", help="Task description")
+    parser.add_argument("--system", default="", help="Subsystem key (audio,dsp,android,playback,networking,providers,analysis,visualization,recommendations,persistence,ui)")
+    parser.add_argument("--format", default="text", choices=["text", "markdown", "json"])
+    parser.add_argument("--level", default="", help="Context level 1-3")
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--record", action="store_true", help="Append metrics to engineering/reports/context-metrics.jsonl")
+    parser.add_argument("--list-systems", action="store_true")
+    args = parser.parse_args()
+
+    manifest = load_manifest()
+
+    if args.list_systems:
+        print("\n".join(sorted(manifest["systems"].keys())))
+        return
+
+    # cache
+    key = cache_key(args)
+    cache_file = CACHE_DIR / f"{key}.{args.format}"
+    if (not args.no_cache) and (not args.refresh) and cache_file.exists():
+        # invalidate if manifest newer than cache
+        if MANIFEST_PATH.exists() and MANIFEST_PATH.stat().st_mtime <= cache_file.stat().st_mtime:
+            sys.stdout.write(cache_file.read_text(encoding="utf-8"))
+            return
+
+    pkg, errors = build_package(args, manifest)
+
+    if args.format == "json":
+        output = json.dumps(pkg, indent=2, ensure_ascii=False) + "\n"
+    elif args.format == "markdown":
+        output = render_markdown(pkg)
+    else:
+        output = render_text(pkg)
+
+    # write cache
+    if not args.no_cache:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(output, encoding="utf-8")
+
+    sys.stdout.write(output)
+
+    if args.record:
+        metrics_path = REPO_ROOT / "engineering" / "reports" / "context-metrics.jsonl"
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "task": args.task or "",
+            "system": args.system or "",
+            "format": args.format,
+            "metrics": pkg["metrics"],
+        }
+        with metrics_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+if __name__ == "__main__":
+    main()

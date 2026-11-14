@@ -33,6 +33,10 @@ final class SearchSurface extends SectionSurface {
     enum Intent {
         /** Words to look for. */
         SEARCH,
+        /** Album search. */
+        SEARCH_ALBUMS,
+        /** Artist search. */
+        SEARCH_ARTISTS,
         /** A stream to play. */
         URL
     }
@@ -44,6 +48,9 @@ final class SearchSurface extends SectionSurface {
 
         /** Run a search or a URL against the session. */
         void onSubmit(String query, Intent intent);
+
+        /** Show grouped results when the query is empty. */
+        void onSearchEmpty(Intent mode);
 
         /** A request that has finished, successfully or not. */
         void onSearchIdle();
@@ -57,6 +64,7 @@ final class SearchSurface extends SectionSurface {
     private final SearchHost searchHost;
 
     private boolean submitting;
+    private Intent mode = Intent.SEARCH;
     /** Whether this surface already has something to show; see {@link #showPrompt()}. */
     private boolean hasResults;
 
@@ -119,6 +127,23 @@ final class SearchSurface extends SectionSurface {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
+        // Mode chips: tracks vs albums.
+        LinearLayout modes = new LinearLayout(context);
+        modes.setOrientation(LinearLayout.HORIZONTAL);
+        for (Intent candidate : new Intent[] { Intent.SEARCH, Intent.SEARCH_ALBUMS, Intent.SEARCH_ARTISTS }) {
+            android.widget.Button button = new android.widget.Button(context);
+            String label = candidate == Intent.SEARCH ? "Pistas" : (candidate == Intent.SEARCH_ALBUMS ? "Álbumes" : "Artistas");
+            button.setText(label);
+            button.setOnClickListener(view -> {
+                mode = candidate;
+                submit.setEnabled(!trimmed().isEmpty());
+            });
+            modes.addView(button, new LinearLayout.LayoutParams(0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        }
+        addView(modes, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
         results = new TrackGroup(context, "Results", host.rowPool(), host, host.scrollHost());
         results.setVisibleGroup(false);
         results.setRangeListener((first, count) -> { });
@@ -147,10 +172,13 @@ final class SearchSurface extends SectionSurface {
     /** Runs the current query, exactly as the button would. */
     void submit() {
         String query = trimmed();
-        if (query.isEmpty()) return;
+        if (query.isEmpty()) {
+            searchHost.onSearchEmpty(mode);
+            return;
+        }
         submit.setEnabled(false);
         submitting = true;
-        Intent intent = Intent.SEARCH;
+        Intent intent = mode;
         if (isUrl(query)) {
             intent = Intent.URL;
             // A pasted URL is a thing to play, not to search for: say so before the

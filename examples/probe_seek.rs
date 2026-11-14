@@ -38,11 +38,12 @@ async fn main() -> anyhow::Result<()> {
     println!("pista: {} ({})", track.title, track.identifier());
 
     let (bus, joined) = EventBus::channel();
-    let (engine_config, _features, _waveform, _dsp) = tunefold::infrastructure::playback::build_engines(
-        &tunefold::infrastructure::config::Config::default(),
-        bus,
-        reqwest::Client::new(),
-    );
+    let (engine_config, _features, _waveform, _dsp) =
+        tunefold::infrastructure::playback::build_engines(
+            &tunefold::infrastructure::config::Config::default(),
+            bus,
+            reqwest::Client::new(),
+        );
     let router = PlaybackRouter::new(engine_config, joined);
 
     let url = provider

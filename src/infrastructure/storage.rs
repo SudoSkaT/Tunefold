@@ -13,6 +13,7 @@ use sqlx::{Row, Transaction};
 use crate::recommendation::signals::{PlayContext, PlaySignal, SignalKind};
 use crate::recommendation::types::TrackAcousticProfile;
 
+use crate::domain::external_playlist::{ExternalPlaylistReference, ImportStatus};
 use crate::domain::playlist::{Playlist, PlaylistItem, PlaylistKind};
 use crate::domain::{album::Album, artist::Artist, genre::Genre, source::Source, track::Track};
 
@@ -87,6 +88,28 @@ pub struct ArtworkPalette {
     pub primary: [u8; 3],
     pub secondary: [u8; 3],
     pub accent: [u8; 3],
+}
+
+fn row_to_external_ref(row: sqlx::sqlite::SqliteRow) -> ExternalPlaylistReference {
+    use sqlx::Row;
+    let source_str: String = row.get("source");
+    let status_str: String = row.get("import_status");
+    ExternalPlaylistReference {
+        id: row.get("id"),
+        source: source_str
+            .parse()
+            .unwrap_or(crate::domain::source::Source::YouTube),
+        external_id: row.get("external_id"),
+        canonical_url: row.get("canonical_url"),
+        title: row.get("title"),
+        description: row.get("description"),
+        thumbnail: row.get("thumbnail"),
+        owner: row.get("owner"),
+        last_refreshed_at: row.get("last_refreshed_at"),
+        created_at: row.get("created_at"),
+        import_status: status_str.parse().unwrap_or(ImportStatus::NotImported),
+        native_playlist_id: row.get("native_playlist_id"),
+    }
 }
 
 impl Db {
@@ -678,6 +701,141 @@ impl Db {
 
     /// Id de la playlist de sistema L1K3D (creada por la migración 0009).
     /// `None` si la base aún no migró (no debería ocurrir en producción).
+    // ------------------------------------------------ external playlist refs
+    pub async fn create_external_playlist_reference(
+        &self,
+        reference: &ExternalPlaylistReference,
+    ) -> Result<i64> {
+        // Dedup by canonical URL: return existing id if present.
+        if let Some(existing) = self
+            .find_external_playlist_reference_by_url(&reference.canonical_url)
+            .await?
+        {
+            return Ok(existing.id);
+        }
+        let res = sqlx::query(
+            "INSERT INTO external_playlist_references              (source, external_id, canonical_url, title, description, thumbnail, owner,               last_refreshed_at, created_at, import_status, native_playlist_id)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, datetime('now')), ?10, ?11)",
+        )
+        .bind(reference.source.as_str())
+        .bind(&reference.external_id)
+        .bind(&reference.canonical_url)
+        .bind(&reference.title)
+        .bind(&reference.description)
+        .bind(&reference.thumbnail)
+        .bind(&reference.owner)
+        .bind(&reference.last_refreshed_at)
+        .bind(if reference.created_at.is_empty() { None } else { Some(reference.created_at.clone()) })
+        .bind(reference.import_status.as_str())
+        .bind(reference.native_playlist_id)
+        .execute(self.pool())
+        .await?;
+        Ok(res.last_insert_rowid())
+    }
+
+    pub async fn get_external_playlist_reference(
+        &self,
+        id: i64,
+    ) -> Result<Option<ExternalPlaylistReference>> {
+        let row = sqlx::query(
+            "SELECT id, source, external_id, canonical_url, title, description, thumbnail,                     owner, last_refreshed_at, created_at, import_status, native_playlist_id              FROM external_playlist_references WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(row_to_external_ref))
+    }
+
+    pub async fn find_external_playlist_reference_by_url(
+        &self,
+        url: &str,
+    ) -> Result<Option<ExternalPlaylistReference>> {
+        let row = sqlx::query(
+            "SELECT id, source, external_id, canonical_url, title, description, thumbnail,                     owner, last_refreshed_at, created_at, import_status, native_playlist_id              FROM external_playlist_references WHERE canonical_url = ?1",
+        )
+        .bind(url)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(row_to_external_ref))
+    }
+
+    pub async fn find_external_playlist_reference_by_external(
+        &self,
+        source: Source,
+        external_id: &str,
+    ) -> Result<Option<ExternalPlaylistReference>> {
+        let row = sqlx::query(
+            "SELECT id, source, external_id, canonical_url, title, description, thumbnail,                     owner, last_refreshed_at, created_at, import_status, native_playlist_id              FROM external_playlist_references WHERE source = ?1 AND external_id = ?2",
+        )
+        .bind(source.as_str())
+        .bind(external_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(row_to_external_ref))
+    }
+
+    pub async fn list_external_playlist_references(
+        &self,
+    ) -> Result<Vec<ExternalPlaylistReference>> {
+        let rows = sqlx::query(
+            "SELECT id, source, external_id, canonical_url, title, description, thumbnail,                     owner, last_refreshed_at, created_at, import_status, native_playlist_id              FROM external_playlist_references ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(row_to_external_ref).collect())
+    }
+
+    pub async fn update_external_playlist_reference(
+        &self,
+        reference: &ExternalPlaylistReference,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE external_playlist_references SET              title = ?2, description = ?3, thumbnail = ?4, owner = ?5,              last_refreshed_at = ?6, import_status = ?7, native_playlist_id = ?8              WHERE id = ?1",
+        )
+        .bind(reference.id)
+        .bind(&reference.title)
+        .bind(&reference.description)
+        .bind(&reference.thumbnail)
+        .bind(&reference.owner)
+        .bind(&reference.last_refreshed_at)
+        .bind(reference.import_status.as_str())
+        .bind(reference.native_playlist_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_external_playlist_reference(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM external_playlist_references WHERE id = ?1")
+            .bind(id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn associate_native_playlist(
+        &self,
+        reference_id: i64,
+        native_playlist_id: i64,
+        strategy: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE playlists SET source_reference_id = ?2, generation_strategy = ?3              WHERE id = ?1",
+        )
+        .bind(native_playlist_id)
+        .bind(reference_id)
+        .bind(strategy)
+        .execute(self.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE external_playlist_references SET native_playlist_id = ?2,              import_status = 'imported' WHERE id = ?1",
+        )
+        .bind(reference_id)
+        .bind(native_playlist_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
     pub async fn l1k3d_id(&self) -> Result<Option<i64>> {
         let row = sqlx::query(Self::l1k3d_query())
             .fetch_optional(self.pool())
@@ -2034,5 +2192,56 @@ mod tests {
         assert!(all.contains_key(&id2));
         assert!((all[&id1].bpm_mean - 100.0).abs() < 1e-3);
         assert_eq!(all[&id2].band_profile, [0.6, 0.3, 0.4, 0.2, 0.1]);
+    }
+    #[tokio::test]
+    async fn external_playlist_reference_crud() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::connect(dir.path().join("music.db").to_str().unwrap())
+            .await
+            .unwrap();
+        use crate::domain::external_playlist::{
+            ExternalPlaylist, ExternalPlaylistReference, ImportStatus,
+        };
+        use crate::domain::source::Source;
+        let mut playlist = ExternalPlaylist::new(Source::YouTube, "PL123".to_string());
+        playlist.title = "My PL".to_string();
+        let mut reference = ExternalPlaylistReference::from_playlist(&playlist);
+        reference.created_at = String::new();
+        let id = db
+            .create_external_playlist_reference(&reference)
+            .await
+            .unwrap();
+        assert!(id > 0);
+        // dedup by canonical url
+        let id2 = db
+            .create_external_playlist_reference(&reference)
+            .await
+            .unwrap();
+        assert_eq!(id, id2);
+        let loaded = db
+            .get_external_playlist_reference(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.title, "My PL");
+        assert_eq!(loaded.import_status, ImportStatus::NotImported);
+        // associate native playlist (create one)
+        let native = db.create_playlist("Imported").await.unwrap();
+        db.associate_native_playlist(id, native, Some("copy"))
+            .await
+            .unwrap();
+        let loaded = db
+            .get_external_playlist_reference(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.import_status, ImportStatus::Imported);
+        assert_eq!(loaded.native_playlist_id, Some(native));
+        db.delete_external_playlist_reference(id).await.unwrap();
+        assert!(db
+            .get_external_playlist_reference(id)
+            .await
+            .unwrap()
+            .is_none());
     }
 }
