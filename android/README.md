@@ -1,5 +1,11 @@
 # Tunefold Android runtime host
 
+**Implementation note (0.19.6):** the current live visualizer is a single lane
+that draws the combined min/max envelope of both channels. Some detailed sections
+below still describe an earlier two-lane/historical waveform design; when they
+conflict with the code, consult `SoundBarsView`, `LiveAudioBars` and the current
+TPS baseline at `Documentacion/standards/TPS/TPS_BASELINE_AUDIT.md`.
+
 Phase 2 (Now Playing, artwork, live sound bars) is documented in
 [`../Documentacion/android/NOW_PLAYING_REPORT.md`](../Documentacion/android/NOW_PLAYING_REPORT.md), **Phase 4 (navigation,
 Home, Search, library and lists)** in [`../Documentacion/android/NAVIGATION_REPORT.md`](../Documentacion/android/NAVIGATION_REPORT.md)
@@ -56,8 +62,8 @@ Install the APK on an Android device or emulator and launch **Tunefold**. Enter
 a YouTube URL or a search query. Direct HTTP(S) audio
 URLs remain supported for decoder smoke tests. The screen reports buffering,
 playing, pause, provider metadata and decoder/output errors, and draws the
-stereo level of the audio **as it is heard**: two lanes, one per channel, in the
-colours taken from the cover. The bars move with the sound and freeze when the
+audio level **as it is heard**: one lane with the combined channel envelope, in a
+colour taken from the cover. The bars move with the sound and freeze when the
 sound stops; the thin line under them is the session's position.
 The transport controls (previous, play/pause, next) and the actions below them
 (like, autoplay, download) exercise the JNI controls; they are icon-only, so
@@ -190,9 +196,9 @@ still be drawing the bitmap it was handed.
 
 ### Live bars, progress and seek
 
-The bars are the stereo level of the audio **as it is being heard**: two lanes
-(left above, right below), each bar the minimum and maximum of its slice of the
-last measured window, each lane in its own colour taken from the cover. They are
+The bars show the level of the audio **as it is being heard**: one lane, each bar
+the combined minimum and maximum of both channels in its slice of the last
+measured window, in a colour derived from the cover. They are
 not a picture of the song: there is no time axis, no played/remaining split and
 nothing to scroll. Progress is a separate, thinner line below them, because a
 thing that changes has no business wearing the same shape as a thing that
@@ -210,7 +216,8 @@ Three honesty rules the render is built around:
 
 * a bar is the amplitude that was measured — no auto-gain, no smoothing and no
   remembered past, so a quiet track looks quiet (`a_full_scale_tone_fills_a_bar_and_a_quiet_one_does_not`);
-* the same value drives both lanes' scale, so the channels can be compared;
+* both channels contribute to the same envelope; separate left/right comparison
+  is not represented by this one-lane view;
 * a track with **no known duration** gets no progress fill and no invented total:
   the line shows the position as a dot and the total stays `0:00`.
 
@@ -250,7 +257,8 @@ source, Buffering, Playing, Paused, Stopped, Downloading, Downloaded, Error.
 
 The chain ARTWORK → COLOUR → BARS → PLAYBACK is now closed.
 `ArtworkPalette` reads a 32×32 downsample of the cover on the artwork worker and
-returns **two** colours, because the bars are stereo: the dominant hue, and the
+returns up to **two** hues for artwork roles; the current single-lane bars use the
+primary hue. The dominant hue, and the
 second one if the cover has a distinct second hue (two tones closer than 25° are
 one tone, and the control says so instead of pretending). The rules are unit
 tests rather than taste:
@@ -284,7 +292,7 @@ Every dimension, colour, glyph and component in the surface comes from one place
 | States: shape, colour, precedence, wording | `PlaybackStatus`, `StateDotView` |
 | Progress arithmetic and the redraw gate | `ProgressScale` |
 | Live bar data: one read, one buffer, one generation | `LiveAudioBars` |
-| Bar rendering: two lanes, two colours, no work in `onDraw` | `SoundBarsView`, `ProgressControl` |
+| Bar rendering: one combined-envelope lane, no work in `onDraw` | `SoundBarsView`, `ProgressControl` |
 | The position line and its head | `ProgressLineView` |
 | Controls | `IconButton`, `PrimaryPlaybackButton`, `SecondaryActionButton`, `NavigationItem`, `SectionHeader`, `ArtworkView`, `TrackRow`, `TrackList` |
 

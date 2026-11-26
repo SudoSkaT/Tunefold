@@ -29,3 +29,18 @@ engineering/.cache/
 
 # Documentación local consolidada (ignorada)
 Documentacion/
+# TPS is a maintained product standard. Keep its source and the small set of
+# agent-discovery indexes versioned; leave the remaining local documentation
+# overlay ignored.
+!Documentacion/
+Documentacion/*
+!Documentacion/standards/
+Documentacion/standards/*
+!Documentacion/standards/TPS/
+!Documentacion/engineering/
+Documentacion/engineering/*
+!Documentacion/engineering/systems/
+Documentacion/engineering/systems/*
+!Documentacion/engineering/CORE.md
+!Documentacion/engineering/MODULE_INDEX.md
+!Documentacion/engineering/systems/ui.md

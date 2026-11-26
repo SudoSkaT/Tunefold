@@ -2,8 +2,12 @@ package com.tunefold.app;
 
 import android.content.Context;
 import android.view.View;
+import android.widget.HorizontalScrollView;
+import android.widget.ScrollView;
 
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.List;
 
 /**
@@ -63,6 +67,32 @@ final class HomeSurface extends SectionSurface {
     private final TrackGroup liked;
     private final TrackGroup recommended;
     private final Navigation navigation;
+    private final HorizontalScrollView discoveryScroll;
+    private final android.widget.LinearLayout discoveryRow;
+    private final android.widget.TextView discoveryTitle;
+    private final HorizontalScrollView artistsScroll;
+    private final android.widget.LinearLayout artistsRow;
+    private final android.widget.TextView artistsTitle;
+    private final HorizontalScrollView albumsScroll;
+    private final android.widget.LinearLayout albumsRow;
+    private final android.widget.TextView albumsTitle;
+
+    private final android.widget.TextView continueTitle;
+    private final HorizontalScrollView continueScroll;
+    private final android.widget.LinearLayout continueRow;
+    private final android.widget.TextView continueState;
+    private final android.widget.TextView likedTitle;
+    private final HorizontalScrollView likedScroll;
+    private final android.widget.LinearLayout likedRow;
+    private final android.widget.TextView likedState;
+    private final android.widget.TextView recommendedTitle;
+    private final HorizontalScrollView recommendedScroll;
+    private final android.widget.LinearLayout recommendedRow;
+    private final android.widget.TextView recommendedState;
+    private String renderedDiscoveryKey = null;
+    private java.util.List<MediaTrack> recommendedTracks = new java.util.ArrayList<>();
+    private String renderedArtistQuery;
+    private String renderedAlbumQuery;
     /** The first thing on the screen: who Tunefold is and what the library holds. */
     private final MastheadView masthead;
 
@@ -101,6 +131,88 @@ final class HomeSurface extends SectionSurface {
         recommended = group("Recomendado");
         recommended.state().setActionHost(() -> loadRecommendations(force = true));
 
+        continueTitle = new android.widget.TextView(context);
+        continueTitle.setText("Sigue escuchando");
+        continueTitle.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_TITLE_SIZE);
+        continueTitle.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        addView(continueTitle, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        continueScroll = new HorizontalScrollView(context);
+        continueScroll.setHorizontalScrollBarEnabled(false);
+        continueRow = new android.widget.LinearLayout(context);
+        continueRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        continueScroll.addView(continueRow, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+        addView(continueScroll, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        continueState = new android.widget.TextView(context);
+        continueState.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        addView(continueState, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+
+        likedTitle = new android.widget.TextView(context);
+        likedTitle.setText("L1K3D");
+        likedTitle.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_TITLE_SIZE);
+        likedTitle.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        addView(likedTitle, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        likedScroll = new HorizontalScrollView(context);
+        likedScroll.setHorizontalScrollBarEnabled(false);
+        likedRow = new android.widget.LinearLayout(context);
+        likedRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        likedScroll.addView(likedRow, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+        addView(likedScroll, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        likedState = new android.widget.TextView(context);
+        likedState.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        addView(likedState, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+
+        recommendedTitle = new android.widget.TextView(context);
+        recommendedTitle.setText("Recomendado");
+        recommendedTitle.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_TITLE_SIZE);
+        recommendedTitle.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        addView(recommendedTitle, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        recommendedScroll = new HorizontalScrollView(context);
+        recommendedScroll.setHorizontalScrollBarEnabled(false);
+        recommendedRow = new android.widget.LinearLayout(context);
+        recommendedRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        recommendedScroll.addView(recommendedRow, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+        addView(recommendedScroll, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        recommendedState = new android.widget.TextView(context);
+        recommendedState.setTextColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+        addView(recommendedState, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+
+        discoveryTitle = new android.widget.TextView(context);
+        discoveryTitle.setText("Descubre");
+        discoveryTitle.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_TITLE_SIZE);
+        discoveryTitle.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        addView(discoveryTitle, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+
+        discoveryScroll = new HorizontalScrollView(context);
+        discoveryScroll.setHorizontalScrollBarEnabled(false);
+        discoveryRow = new android.widget.LinearLayout(context);
+        discoveryRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        discoveryScroll.addView(discoveryRow, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+        addView(discoveryScroll, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+
+        artistsTitle = new android.widget.TextView(context);
+        artistsTitle.setText("Artistas para descubrir");
+        artistsTitle.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_TITLE_SIZE);
+        artistsTitle.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        addView(artistsTitle, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        artistsScroll = new HorizontalScrollView(context);
+        artistsScroll.setHorizontalScrollBarEnabled(false);
+        artistsRow = new android.widget.LinearLayout(context);
+        artistsRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        artistsScroll.addView(artistsRow, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+        addView(artistsScroll, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+
+        albumsTitle = new android.widget.TextView(context);
+        albumsTitle.setText("Álbumes para descubrir");
+        albumsTitle.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, DesignTokens.TYPE_TITLE_SIZE);
+        albumsTitle.setTextColor(DesignTokens.Palette.ON_SURFACE);
+        addView(albumsTitle, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        albumsScroll = new HorizontalScrollView(context);
+        albumsScroll.setHorizontalScrollBarEnabled(false);
+        albumsRow = new android.widget.LinearLayout(context);
+        albumsRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        albumsScroll.addView(albumsRow, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+        addView(albumsScroll, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+
         // The previews lead to the whole list; the queue does not, because the rest of
         // it is the player and the player is one tap away in the strip.
         liked.setAction("Ver todo", () -> navigation.openLiked());
@@ -122,11 +234,8 @@ final class HomeSurface extends SectionSurface {
     void setAccessory(View accessory) { masthead.setAccessory(accessory); }
 
     private TrackGroup group(String title) {
-        TrackGroup group = new TrackGroup(getContext(), title, host.rowPool(), host,
-                host.scrollHost());
-        addView(group, new LayoutParams(LayoutParams.MATCH_PARENT,
-                LayoutParams.WRAP_CONTENT));
-        return group;
+        // State machine only: the visible representation is the mosaic rail below.
+        return new TrackGroup(getContext(), title, host.rowPool(), host, host.scrollHost());
     }
 
     private boolean force;
@@ -182,9 +291,15 @@ final class HomeSurface extends SectionSurface {
             renderedActiveKey = active;
             renderedQueueSize = snapshot.queue.size();
             if (playing) {
+                continueTitle.setText("Sigue escuchando");
+                java.util.List<MediaTrack> cont = continuing();
+                populateSongRail(continueRow, cont, cont);
+                continueState.setText(cont == null || cont.isEmpty() ? "Todavía no hay nada que reproducir." : "");
+                continueScroll.setVisibility(cont == null || cont.isEmpty() ? View.GONE : View.VISIBLE);
                 continueListening.setTitle("Sigue escuchando", snapshot.queue.size());
-                continueListening.show(continuing(), false);
+                continueListening.show(cont, false);
             } else {
+                continueTitle.setText("Empieza aquí");
                 renderStartHere(session, force);
             }
         }
@@ -201,22 +316,34 @@ final class HomeSurface extends SectionSurface {
                 if (track != null) mine.add(track);
             }
             liked.setTitle("L1K3D", keys.size());
-            // The heading counts what exists, not what is previewed.
-            // The way out exists whenever the preview is a preview. Comparing the
-            // preview against what was described would hide it exactly when the list
-            // is long enough to need it.
             liked.setAction(keys.size() > PREVIEW_ROWS ? "Ver todo" : null,
                     () -> navigation.openLiked());
-            if (mine.isEmpty()) liked.showEmpty("Todavía no hay nada en L1K3D.");
-            else liked.show(preview(mine, PREVIEW_ROWS), false);
+            java.util.List<MediaTrack> likedPreview = mine.isEmpty() ? new java.util.ArrayList<>()
+                    : preview(mine, PREVIEW_ROWS);
+            if (mine.isEmpty()) {
+                liked.showEmpty("Todavía no hay nada en L1K3D.");
+                likedState.setText("Todavía no hay nada en L1K3D.");
+                likedScroll.setVisibility(View.GONE);
+            } else {
+                liked.show(likedPreview, false);
+                populateSongRail(likedRow, likedPreview, likedPreview);
+                likedState.setText("");
+                likedScroll.setVisibility(View.VISIBLE);
+            }
         }
+
+        renderDiscovery(session, snapshot, force);
 
         MediaTrack current = snapshot.currentTrack;
         if (current == null) {
             if (recommended.isVisibleGroup()) recommended.setVisibleGroup(false);
+            recommendedTitle.setVisibility(View.GONE);
+            recommendedScroll.setVisibility(View.GONE);
+            recommendedState.setText("");
             recommendationsFor = null;
             return;
         }
+        recommendedTitle.setVisibility(View.VISIBLE);
         loadRecommendations(force = false);
     }
 
@@ -240,16 +367,21 @@ final class HomeSurface extends SectionSurface {
         if (saved.isEmpty()) {
             startHere.setTitle("Empieza aquí", SectionHeader.NO_COUNT);
             startHere.setAction(null, null);
-            // No tracks, no tracks: the block is the way in, not a list.
             startHere.showAction("Todavía no hay nada que reproducir. Busca algo y "
                     + "empieza por ahí.", "Abre la búsqueda", Icon.SEARCH,
                     () -> navigation.openSearch());
+            continueState.setText("Todavía no hay nada que reproducir. Busca algo y empieza por ahí.");
+            continueScroll.setVisibility(View.GONE);
             return;
         }
         startHere.setTitle("Empieza aquí", saved.size());
         startHere.setAction(saved.size() > PREVIEW_ROWS ? "Ver descargas" : null,
                 () -> navigation.openDownloads());
-        startHere.show(preview(saved, PREVIEW_ROWS), false);
+        List<MediaTrack> previewSaved = preview(saved, PREVIEW_ROWS);
+        startHere.show(previewSaved, false);
+        populateSongRail(continueRow, previewSaved, previewSaved);
+        continueState.setText("");
+        continueScroll.setVisibility(View.VISIBLE);
     }
 
     /**
@@ -315,6 +447,53 @@ final class HomeSurface extends SectionSurface {
      * @param all   the whole list, in membership order
      * @param limit how many rows the preview may show
      */
+    static java.util.List<MediaTrack> distinctArtists(java.util.List<MediaTrack> tracks) {
+        return artistsFrom(tracks);
+    }
+
+    static java.util.List<MediaTrack> artistsFrom(java.util.List<MediaTrack> tracks) {
+        java.util.List<MediaTrack> out = new java.util.ArrayList<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        if (tracks == null) return out;
+        for (MediaTrack track : tracks) {
+            if (track == null) continue;
+            String name = track.artist == null || track.artist.trim().isEmpty()
+                    ? (track.channel == null ? "" : track.channel.trim())
+                    : track.artist.trim();
+            if (name.isEmpty() || !seen.add(name)) continue;
+            out.add(new MediaTrack(track.provider, name, name, name, track.channel, "",
+                    "artist", -1, track.thumbnail, "", track.rawJson));
+        }
+        return out;
+    }
+
+    static java.util.List<MediaTrack> artistTiles(java.util.List<MediaTrack> tracks) {
+        return artistsFrom(tracks);
+    }
+
+    static java.util.List<MediaTrack> distinctAlbums(java.util.List<MediaTrack> tracks) {
+        return albumsFrom(tracks);
+    }
+
+    static java.util.List<MediaTrack> albumsFrom(java.util.List<MediaTrack> tracks) {
+        java.util.List<MediaTrack> out = new java.util.ArrayList<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        if (tracks == null) return out;
+        for (MediaTrack track : tracks) {
+            if (track == null) continue;
+            String name = track.album == null ? "" : track.album.trim();
+            if (name.isEmpty()) name = track.title == null ? "" : track.title.trim();
+            if (name.isEmpty() || !seen.add(name)) continue;
+            out.add(new MediaTrack("Album", name, name, track.artist == null ? "" : track.artist,
+                    "", name, "artist", -1, track.thumbnail, "", track.rawJson));
+        }
+        return out;
+    }
+
+    static java.util.List<MediaTrack> albumTiles(java.util.List<MediaTrack> tracks) {
+        return albumsFrom(tracks);
+    }
+
     static java.util.List<MediaTrack> preview(java.util.List<MediaTrack> all, int limit) {
         java.util.List<MediaTrack> source = all == null ? java.util.Collections.emptyList()
                 : all;
@@ -341,12 +520,140 @@ final class HomeSurface extends SectionSurface {
         return tracks;
     }
 
+    private void renderDiscovery(PlaybackSession session, PlaybackSession.Snapshot snapshot, boolean force) {
+        MediaTrack current = snapshot.currentTrack;
+        String key = current == null ? "none" : identityOf(current);
+        if (!force && key.equals(renderedDiscoveryKey)) return;
+        renderedDiscoveryKey = key;
+        discoveryRow.removeAllViews();
+        artistsRow.removeAllViews();
+        albumsRow.removeAllViews();
+
+        if (current == null) {
+            discoveryTitle.setVisibility(View.GONE);
+            discoveryScroll.setVisibility(View.GONE);
+            artistsTitle.setVisibility(View.GONE);
+            artistsScroll.setVisibility(View.GONE);
+            albumsTitle.setVisibility(View.GONE);
+            albumsScroll.setVisibility(View.GONE);
+            renderedArtistQuery = null;
+            renderedAlbumQuery = null;
+            return;
+        }
+        discoveryTitle.setVisibility(View.VISIBLE);
+        discoveryScroll.setVisibility(View.VISIBLE);
+
+        DiscoveryTile radio = new DiscoveryTile(getContext());
+        radio.setVariant(DiscoveryTile.Variant.FEATURED);
+        radio.setTitle(session.radioOn() ? "Detener radio" : "Radio");
+        radio.setSubtitle(current.title);
+        radio.setCategory("Estación");
+        if (!current.thumbnail.isEmpty()) radio.artwork().expectCover(current.thumbnail);
+        ((MainActivity) getContext()).loadTileArtwork(current, radio.artwork());
+        radio.setOnClickListener(v -> {
+            if (session.radioOn()) session.setRadioEnabled(false);
+            else session.setRadioEnabled(true);
+        });
+        discoveryRow.addView(radio, new android.widget.LinearLayout.LayoutParams(DesignTokens.dp(160),
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        // Artistas reales.
+        String artistQuery = current.artist == null ? "" : current.artist.trim();
+        if (artistQuery.isEmpty()) artistQuery = current.channel == null ? "" : current.channel.trim();
+        if (!artistQuery.equals(renderedArtistQuery)) {
+            renderedArtistQuery = artistQuery;
+            artistsRow.removeAllViews();
+            if (artistQuery.isEmpty()) {
+                artistsTitle.setVisibility(View.GONE);
+                artistsScroll.setVisibility(View.GONE);
+            } else {
+                artistsTitle.setVisibility(View.VISIBLE);
+                artistsScroll.setVisibility(View.VISIBLE);
+                ((MainActivity) getContext()).loadHomeArtists(artistQuery, tracks -> {
+                    artistsRow.removeAllViews();
+                    if (tracks == null || tracks.isEmpty()) {
+                        artistsTitle.setVisibility(View.GONE);
+                        artistsScroll.setVisibility(View.GONE);
+                        return;
+                    }
+                    for (MediaTrack a : tracks) {
+                        if (a == null) continue;
+                        DiscoveryTile tile = new DiscoveryTile(getContext());
+                        tile.setTitle(a.title);
+                        tile.setSubtitle("Artista");
+                        tile.setCategory("Artista");
+                        if (!a.thumbnail.isEmpty()) tile.artwork().expectCover(a.thumbnail);
+                        ((MainActivity) getContext()).loadTileArtwork(a, tile.artwork());
+                        tile.setOnClickListener(v -> ((MainActivity) getContext()).openArtistDetail(a));
+                        artistsRow.addView(tile, new android.widget.LinearLayout.LayoutParams(DesignTokens.dp(120),
+                                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+                    }
+                });
+            }
+        }
+
+        // Álbumes reales.
+        String albumQuery = current.album == null ? "" : current.album.trim();
+        if (albumQuery.isEmpty()) albumQuery = current.title == null ? "" : current.title.trim();
+        if (!albumQuery.equals(renderedAlbumQuery)) {
+            renderedAlbumQuery = albumQuery;
+            albumsRow.removeAllViews();
+            if (albumQuery.isEmpty()) {
+                albumsTitle.setVisibility(View.GONE);
+                albumsScroll.setVisibility(View.GONE);
+            } else {
+                albumsTitle.setVisibility(View.VISIBLE);
+                albumsScroll.setVisibility(View.VISIBLE);
+                ((MainActivity) getContext()).loadHomeAlbums(albumQuery, tracks -> {
+                    albumsRow.removeAllViews();
+                    if (tracks == null || tracks.isEmpty()) {
+                        albumsTitle.setVisibility(View.GONE);
+                        albumsScroll.setVisibility(View.GONE);
+                        return;
+                    }
+                    for (MediaTrack a : tracks) {
+                        if (a == null) continue;
+                        DiscoveryTile tile = new DiscoveryTile(getContext());
+                        tile.setTitle(a.title);
+                        tile.setSubtitle(a.artist == null ? "" : a.artist);
+                        tile.setCategory("Álbum");
+                        if (!a.thumbnail.isEmpty()) tile.artwork().expectCover(a.thumbnail);
+                        ((MainActivity) getContext()).loadTileArtwork(a, tile.artwork());
+                        tile.setOnClickListener(v -> ((MainActivity) getContext()).openAlbumDetail(a));
+                        albumsRow.addView(tile, new android.widget.LinearLayout.LayoutParams(DesignTokens.dp(120),
+                                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+                    }
+                });
+            }
+        }
+    }
+
     /**
      * Recommendations, at most one request per track.
      *
      * <p>A failure leaves the rest of Home usable and offers the one action that can
      * fix it, rather than an error screen over a surface that works.
      */
+    private void populateSongRail(android.widget.LinearLayout row, java.util.List<MediaTrack> tracks, java.util.List<MediaTrack> playList) {
+        row.removeAllViews();
+        if (tracks == null || tracks.isEmpty()) return;
+        for (MediaTrack track : tracks) {
+            if (track == null) continue;
+            DiscoveryTile tile = new DiscoveryTile(getContext());
+            tile.setTitle(track.title);
+            tile.setSubtitle(track.artist == null || track.artist.isEmpty() ? track.channel : track.artist);
+            tile.setCategory("Canción");
+            if (track.thumbnail != null && !track.thumbnail.isEmpty()) tile.artwork().expectCover(track.thumbnail);
+            ((MainActivity) getContext()).loadTileArtwork(track, tile.artwork());
+            tile.setOnClickListener(v -> {
+                PlaybackSession s = session();
+                if (s != null && playList != null) s.playList(playList, track);
+            });
+            row.addView(tile, new android.widget.LinearLayout.LayoutParams(DesignTokens.dp(120),
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+        }
+    }
+
     private void loadRecommendations(boolean retry) {
         PlaybackSession session = session();
         if (session == null) return;
@@ -357,15 +664,26 @@ final class HomeSurface extends SectionSurface {
         recommendationsFor = identity;
         recommended.setVisibleGroup(true);
         recommended.showLoading();
+        recommendedState.setText("Cargando…");
+        recommendedScroll.setVisibility(View.GONE);
+        recommendedRow.removeAllViews();
         session.recommendationsForHome(current, (candidates, error) -> {
             if (getVisibility() != View.VISIBLE) return;
             if (error != null) {
                 recommended.showError(error, () -> loadRecommendations(true));
+                recommendedState.setText(error);
+                recommendedScroll.setVisibility(View.GONE);
                 return;
             }
             List<MediaTrack> tracks = candidates == null ? new ArrayList<>() : candidates;
+            recommendedTracks = new ArrayList<>(tracks);
             recommended.setTitle("Recomendado", tracks.size());
             recommended.show(tracks, false);
+            populateSongRail(recommendedRow, tracks, tracks);
+            recommendedState.setText(tracks.isEmpty() ? "Sin recomendaciones todavía." : "");
+            recommendedScroll.setVisibility(tracks.isEmpty() ? View.GONE : View.VISIBLE);
+            PlaybackSession s = session();
+            if (s != null) renderDiscovery(s, s.snapshot(), true);
         });
     }
 

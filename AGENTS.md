@@ -34,6 +34,12 @@ See `Documentacion/engineering/VERIFICATION.md` for the full matrix.
 - Level 3 (after locating modules): specific source files.
 - Generate task package: `scripts/engineering/context-report --task "..." --system <system> [--format text|markdown|json]`.
 
+## Product and interface work
+
+- Before changing a screen, component, interaction, visualizer, accessibility behavior, or UI performance, read `Documentacion/standards/TPS/README.md` and the relevant TPS sections.
+- Android UI lives in `android/app/src/main/java/com/tunefold/app/`; the TUI lives in `src/ui/`. Do not assume they share component implementations.
+- TPS documents product requirements; current Android visual values remain in `DesignTokens.java`/theme classes, and playback/DSP contracts remain in their canonical engineering docs.
+
 ## Where to look
 
 | Need | Doc |

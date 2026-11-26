@@ -1107,6 +1107,39 @@ public final class MainActivity extends Activity
         });
     }
 
+    void loadHomeArtists(String query, java.util.function.Consumer<java.util.List<MediaTrack>> callback) {
+        if (providers == null || query == null || query.trim().isEmpty()) {
+            if (callback != null) callback.accept(new java.util.ArrayList<>());
+            return;
+        }
+        providers.searchArtists(query.trim(), (tracks, error) -> {
+            if (destroyed) return;
+            if (callback != null) callback.accept(tracks == null ? new java.util.ArrayList<>() : tracks);
+        });
+    }
+
+    void loadHomeAlbums(String query, java.util.function.Consumer<java.util.List<MediaTrack>> callback) {
+        if (providers == null || query == null || query.trim().isEmpty()) {
+            if (callback != null) callback.accept(new java.util.ArrayList<>());
+            return;
+        }
+        providers.searchAlbums(query.trim(), (tracks, error) -> {
+            if (destroyed) return;
+            if (callback != null) callback.accept(tracks == null ? new java.util.ArrayList<>() : tracks);
+        });
+    }
+
+    void loadTileArtwork(MediaTrack track, ArtworkView view) {
+        if (providers == null || track == null || view == null) return;
+        String identity = track.key() == null ? track.thumbnail : track.key().toString();
+        view.expectCover(identity);
+        if (track.thumbnail == null || track.thumbnail.isEmpty()) return;
+        providers.loadArtwork(track, DesignTokens.dp(DesignTokens.ARTWORK_THUMB), (bitmap, error) -> {
+            if (destroyed || bitmap == null) return;
+            view.setCover(identity, bitmap);
+        });
+    }
+
     void loadAlbumArtwork(MediaTrack track, ArtworkView view) {
         if (providers == null || track == null || track.thumbnail.isEmpty() || view == null) return;
         String identity = track.key() == null ? track.thumbnail : track.key().toString();
