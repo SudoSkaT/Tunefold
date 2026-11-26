@@ -9,7 +9,9 @@
 //! anillo está lleno, el análisis pierde muestras (drop-newest) pero el audio
 //! sigue intacto.
 
+#[cfg(feature = "rodio")]
 use super::engine::PcmTap;
+#[cfg(feature = "rodio")]
 use super::engine::StreamMeta;
 
 /// Fuente que reenvía las muestras de `S` y las alimenta al [`PcmTap`].

@@ -75,6 +75,26 @@ public class TrackKeyTest {
         org.junit.Assert.assertTrue("and they are the same track", TrackKey.same(first, second));
     }
 
+    @Test public void distinctAlbumsHaveDistinctKeys() {
+        assertNotEquals(TrackKey.of("Album", "MPREb_one"),
+                TrackKey.of("Album", "MPREb_two"));
+    }
+
+    @Test public void distinctArtistsHaveDistinctKeys() {
+        assertNotEquals(TrackKey.of("Artist", "UC_one"),
+                TrackKey.of("Artist", "UC_two"));
+    }
+
+    @Test public void sameAlbumIdentitySurvivesFreshInstance() {
+        assertEquals(TrackKey.of("Album", "MPREb_one"),
+                TrackKey.of("Album", "MPREb_one"));
+    }
+
+    @Test public void sameArtistIdentitySurvivesFreshInstance() {
+        assertEquals(TrackKey.of("Artist", "UC_one"),
+                TrackKey.of("Artist", "UC_one"));
+    }
+
     @Test public void sameIdentityIsNullSafe() {
         assertTrue(TrackKey.same(null, null));
         assertFalse(TrackKey.same(null, TrackKey.of("YouTube", "abc")));

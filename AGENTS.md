@@ -10,7 +10,7 @@ Tunefold is a TUI music player and recommendation engine in Rust (GPL-3.0). The 
 
 1. Rebrand: no `playfusion`/`PlayFusion` in new code, visible text, or paths (legacy env alias `PLAYFUSION_RANGE_WINDOW_KIB` excepted).
 2. YouTube only in `src/providers/youtube/` and feature `youtube`; default builds must not compile rustypipe or touch YouTube network.
-3. GPL-3.0; dependencies only per `docs/policies.md`.
+3. GPL-3.0; dependencies only per `Documentacion/docs/policies.md`.
 4. User data and DB via `src/infrastructure/dirs.rs::*`; never CWD-relative paths.
 5. User data migration copies, never deletes.
 
@@ -25,12 +25,12 @@ cargo check --offline
 cargo check --offline --features youtube
 ```
 
-See `engineering/VERIFICATION.md` for the full matrix.
+See `Documentacion/engineering/VERIFICATION.md` for the full matrix.
 
 ## Context discovery
 
-- Level 1 (always): this file + `engineering/CORE.md`.
-- Level 2 (by task): `engineering/MODULE_INDEX.md`, `engineering/ARCHITECTURE.md`, `engineering/VERIFICATION.md`, `engineering/KNOWN_ISSUES.md`, relevant `engineering/systems/*.md`.
+- Level 1 (always): this file + `Documentacion/engineering/CORE.md`.
+- Level 2 (by task): `Documentacion/engineering/MODULE_INDEX.md`, `Documentacion/engineering/ARCHITECTURE.md`, `Documentacion/engineering/VERIFICATION.md`, `Documentacion/engineering/KNOWN_ISSUES.md`, relevant `Documentacion/engineering/systems/*.md`.
 - Level 3 (after locating modules): specific source files.
 - Generate task package: `scripts/engineering/context-report --task "..." --system <system> [--format text|markdown|json]`.
 
@@ -38,21 +38,21 @@ See `engineering/VERIFICATION.md` for the full matrix.
 
 | Need | Doc |
 |---|---|
-| Modules/deps | `engineering/MODULE_INDEX.md`, `engineering/DEPENDENCIES.md` |
-| Architecture | `engineering/ARCHITECTURE.md`, `docs/architecture/*` |
-| Android | `engineering/systems/android.md`, `docs/android/*` |
-| DSP | `engineering/systems/dsp.md`, `docs/architecture/dsp-pipeline.md` |
-| Recommendations | `engineering/systems/recommendations.md`, `docs/recommendations.md` |
-| Verification | `engineering/VERIFICATION.md`, `docs/testing/audio-validation.md` |
-| Known issues | `engineering/KNOWN_ISSUES.md` |
-| Decisions | `engineering/decisions/*` |
+| Modules/deps | `Documentacion/engineering/MODULE_INDEX.md`, `Documentacion/engineering/DEPENDENCIES.md` |
+| Architecture | `Documentacion/engineering/ARCHITECTURE.md`, `Documentacion/docs/architecture/*` |
+| Android | `Documentacion/engineering/systems/android.md`, `Documentacion/docs/android/*` |
+| DSP | `Documentacion/engineering/systems/dsp.md`, `Documentacion/docs/architecture/dsp-pipeline.md` |
+| Recommendations | `Documentacion/engineering/systems/recommendations.md`, `Documentacion/docs/recommendations.md` |
+| Verification | `Documentacion/engineering/VERIFICATION.md`, `Documentacion/docs/testing/audio-validation.md` |
+| Known issues | `Documentacion/engineering/KNOWN_ISSUES.md` |
+| Decisions | `Documentacion/engineering/decisions/*` |
 
 ## Historical docs
 
-`docs/audit/*`, `docs/roadmap/*`, and `android/*_REPORT.md` are historical. Do not treat them as current implementation state.
+`Documentacion/docs/audit/*`, `Documentacion/docs/roadmap/*`, and `Documentacion/android/*_REPORT.md` are historical. Do not treat them as current implementation state.
 
 ## Notes
 
 - `examples/probe_*` require feature `youtube`; `bench_hotpaths` does not.
 - Version source: `Cargo.toml` (`CARGO_PKG_VERSION`); releases use numeric tags without `v`.
-- Policies: `docs/policies.md`, `PRIVACY.md`.
+- Policies: `Documentacion/docs/policies.md`, `Documentacion/PRIVACY.md`.

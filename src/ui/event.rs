@@ -28,6 +28,9 @@ pub enum UiEvent {
 pub enum BackendEvent {
     SearchResults {
         query: String,
+        /// Generación de la búsqueda que produjo este resultado. La UI solo
+        /// aplica la respuesta si sigue siendo la operación en vuelo.
+        generation: u64,
         outcome: Box<SearchOutcome<Track>>,
     },
     /// Enlace resuelto a un track (la UI lo pone en resultados para

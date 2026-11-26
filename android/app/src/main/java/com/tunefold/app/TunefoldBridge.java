@@ -58,6 +58,7 @@ final class TunefoldBridge {
     static native String searchAlbumsYoutube(String query, int limit);
     static native String searchArtistsYoutube(String query, int limit);
     static native String albumTracksYoutube(String albumId);
+    static native String artistContentYoutube(String artistId);
     static native String resolveYoutubeUrl(String url);
     /**
      * Provider metadata for a video id, for a remembered track.

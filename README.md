@@ -1,11 +1,11 @@
-# Tunefold (PlayFusion)
+# Tunefold
 
 Reproductor de música en TUI con motor de análisis y recomendación. Busca
 canciones, resuelve streams de audio, reproduce con rodio/symphonia (análisis
 PCM en tiempo real + visualizador reactivo) y sincroniza letras (LRCLIB) con
 karaoke.
 
-El proyecto se distribuía antes bajo el nombre **PlayFusion**; fue renombrado
+El proyecto se distribuía antes bajo el nombre **nombre anterior**; fue renombrado
 por conflicto de marca. Los datos locales del usuario se migran de forma no
 destructiva (ver [Datos locales](#datos-locales)).
 
@@ -17,7 +17,7 @@ GNU General Public License v3.0.
 El proveedor de YouTube/YouTube Music reutiliza **rustypipe** (GPL-3.0),
 distribuido con un parche local (el fuente modificado vive en `vendor/` y se
 ofrece como fuente bajo los términos de la GPL). Ver `NOTICE` y
-`THIRD_PARTY.md` para las obligaciones de redistribución.
+`Documentacion/THIRD_PARTY.md` para las obligaciones de redistribución.
 
 ### Proveedor de YouTube — build separado
 
@@ -103,12 +103,12 @@ reeordena con similitud acústica, armónica y estructural más el historial
 local, con la popularidad del proveedor pesando solo un 5 %. Los candidatos
 sin perfil se pre-analizan por rangos HTTP sin abrir dispositivo de audio, y
 las impresiones vistas nunca puntúan. El motor, los pesos y las señales están
-documentados en [`docs/recommendations.md`](docs/recommendations.md).
+documentados en [`Documentacion/docs/recommendations.md`](Documentacion/docs/recommendations.md).
 
 Android comparte **el mismo** motor por JNI (`src/platform/android_rank.rs`,
 contrato estadoless con fail-open al orden del proveedor). Todo el
 procesamiento es local: las señales de escucha no salen del dispositivo (ver
-[`PRIVACY.md`](PRIVACY.md)).
+[`Documentacion/PRIVACY.md`](Documentacion/PRIVACY.md)).
 
 ## Límites de streaming (diagnóstico 2026-08)
 

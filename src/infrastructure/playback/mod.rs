@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use crate::app::audio::{EventBus, PlaybackEngine};
 use crate::app::playback::RouterConfig;
+#[cfg(feature = "rodio")]
 use crate::domain::source::Source;
 use crate::dsp::DspControl;
 use crate::infrastructure::config::Config;
@@ -44,7 +45,8 @@ pub fn build_engines(
     Option<crate::analysis::WaveformBus>,
     DspControl,
 ) {
-    let mut engines: Vec<Arc<dyn PlaybackEngine>> = Vec::new();
+    #[cfg(not(feature = "rodio"))]
+    let _ = (&bus, &http);
     let dsp = DspControl::new(config.dsp);
 
     // Análisis de audio opcional: un runtime por construcción de motores; su
@@ -57,25 +59,27 @@ pub fn build_engines(
     let waveform = analysis.as_ref().map(|rt| rt.waveform_bus());
 
     #[cfg(feature = "rodio")]
-    {
+    let engines = {
         let output =
             Arc::new(SharedOutput::try_new(bus.clone()).expect("dispositivo de audio disponible"));
-
-        engines.push(Arc::new(RodioBackend::new(
+        vec![Arc::new(RodioBackend::new(
             http.clone(),
             output.clone(),
             bus.clone(),
             !config.flags.proxy,
             analysis,
             dsp.clone(),
-        )));
-    }
+        )) as Arc<dyn PlaybackEngine>]
+    };
+    #[cfg(not(feature = "rodio"))]
+    let engines: Vec<Arc<dyn PlaybackEngine>> = Vec::new();
 
     let policy = config.playback_policy.clone();
     (RouterConfig { engines, policy }, features, waveform, dsp)
 }
 
 /// Fuentes que reproducen stream HTTP directo. Todos los orígenes actuales lo son.
+#[cfg(feature = "rodio")]
 pub(crate) fn is_http_source(source: Source) -> bool {
     matches!(source, Source::YouTube)
 }

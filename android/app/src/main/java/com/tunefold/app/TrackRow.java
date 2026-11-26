@@ -311,7 +311,7 @@ final class TrackRow extends LinearLayout {
      * visible without opening the player.
      */
     private void applyStatus() {
-        CharSequence next = statusOf(downloadPhase, downloadPercent, liked);
+        CharSequence next = statusOf(track, downloadPhase, downloadPercent, liked);
         if (TextUtils.equals(next, renderedStatus)) return;
         renderedStatus = next;
         status.setText(renderedStatus);
@@ -335,6 +335,16 @@ final class TrackRow extends LinearLayout {
                 break;
         }
         return word;
+    }
+
+    /** Provenance-aware variant: local downloads say so. */
+    static CharSequence statusOf(MediaTrack track, DownloadState.Phase phase, int percent,
+            boolean liked) {
+        CharSequence base = statusOf(phase, percent, liked);
+        if (track != null && track.isLocal() && (base == null || base.length() == 0)) {
+            return "DESCARGADO";
+        }
+        return base;
     }
 
     /**

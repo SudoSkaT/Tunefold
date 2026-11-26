@@ -49,6 +49,17 @@ pub trait CatalogProvider: std::fmt::Debug + Send + Sync {
     async fn get_track(&self, external_id: &str) -> Result<Track, CatalogError>;
     async fn get_artist(&self, external_id: &str) -> Result<Artist, CatalogError>;
     async fn get_album(&self, external_id: &str) -> Result<Album, CatalogError>;
+
+    /// Contenido de un artista: perfil, canciones y álbumes.
+    async fn artist_content(
+        &self,
+        external_id: &str,
+    ) -> Result<(Artist, Vec<Track>, Vec<Album>), CatalogError> {
+        let _ = external_id;
+        Err(CatalogError::Other(
+            "artist content not supported".to_string(),
+        ))
+    }
     async fn get_album_tracks(&self, external_id: &str) -> Result<Vec<Track>, CatalogError>;
 
     /// External playlist metadata and entries, if the provider supports them.

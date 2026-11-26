@@ -1,5 +1,6 @@
 package com.tunefold.app;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
@@ -30,6 +31,26 @@ public class NotificationActionsTest {
                 download != null && download.isDownloaded(), download == null
                         ? DownloadState.idle(key) : download,
                 new PlaybackQueue(), 0, true, false, false, 0L);
+    }
+
+    @Test public void likeIsReachableWithoutExpandingTheNotification() {
+        assertArrayEquals(new int[] { 0, 1, 2 },
+                PlaybackNotification.compactActionIndices());
+        long actions = PlaybackNotification.platformActions(PlaybackState.PLAYING, false);
+        assertEquals(0, actions & android.media.session.PlaybackState.ACTION_SKIP_TO_NEXT);
+        assertTrue((actions & android.media.session.PlaybackState.ACTION_SKIP_TO_PREVIOUS) != 0);
+    }
+
+    @Test public void systemActionsDoNotOfferPlayWhenTheSessionCannotPlay() {
+        long play = android.media.session.PlaybackState.ACTION_PLAY;
+        assertTrue((PlaybackNotification.platformActions(PlaybackState.PLAYING, false) & play) != 0);
+        assertTrue((PlaybackNotification.platformActions(PlaybackState.PAUSED, false) & play) != 0);
+        assertTrue((PlaybackNotification.platformActions(PlaybackState.STOPPED, false) & play) != 0);
+        assertTrue((PlaybackNotification.platformActions(PlaybackState.ERROR, true) & play) != 0);
+        assertEquals(0, PlaybackNotification.platformActions(
+                PlaybackState.ERROR, false) & play);
+        assertEquals(0, PlaybackNotification.platformActions(
+                PlaybackState.BUFFERING, false) & play);
     }
 
     @Test public void sameSnapshotHasTheSameContentKey() {

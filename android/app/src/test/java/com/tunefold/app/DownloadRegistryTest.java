@@ -59,6 +59,18 @@ public class DownloadRegistryTest {
         assertFalse("still refused while bytes move", registry.canStart(key));
     }
 
+    @Test public void activeWorkKeepsThePlaybackServiceAlive() {
+        assertFalse(registry.hasActiveWork());
+        TrackKey key = key("a");
+        registry.beginResolving(key);
+        assertTrue("source resolution is active work", registry.hasActiveWork());
+        registry.progress(key, 500, 2000, 100);
+        assertTrue("transferring bytes is active work", registry.hasActiveWork());
+        registry.complete(key, 2000, null);
+        assertFalse("a completed download does not pin the service",
+                registry.hasActiveWork());
+    }
+
     @Test public void completedBlocksAFreshDownload() {
         TrackKey key = key("a");
         registry.beginResolving(key);

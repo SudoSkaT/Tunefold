@@ -15,11 +15,11 @@ use tokio::runtime::Runtime;
 
 use crate::api::ComposedMedia;
 use crate::catalog::CatalogError;
+use crate::domain::album::Album;
 use crate::domain::artist::Artist;
 use crate::domain::lyrics::SyncLyrics;
 use crate::domain::source::Source;
 use crate::domain::track::Track;
-use crate::domain::album::Album;
 use crate::infrastructure::config::FeatureFlags;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -150,10 +150,16 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_searchAlbumsYoutube(
     };
     let result = (|| {
         let media = MEDIA.get().ok_or_else(|| {
-            ("provider_unavailable", "provider is not initialized".to_string())
+            (
+                "provider_unavailable",
+                "provider is not initialized".to_string(),
+            )
         })?;
         let provider = media.catalog.get(Source::YouTube).ok_or_else(|| {
-            ("provider_unavailable", "YouTube catalog is disabled".to_string())
+            (
+                "provider_unavailable",
+                "YouTube catalog is disabled".to_string(),
+            )
         })?;
         runtime().block_on(async {
             provider
@@ -181,10 +187,16 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_searchArtistsYoutube
     };
     let result = (|| {
         let media = MEDIA.get().ok_or_else(|| {
-            ("provider_unavailable", "provider is not initialized".to_string())
+            (
+                "provider_unavailable",
+                "provider is not initialized".to_string(),
+            )
         })?;
         let provider = media.catalog.get(Source::YouTube).ok_or_else(|| {
-            ("provider_unavailable", "YouTube catalog is disabled".to_string())
+            (
+                "provider_unavailable",
+                "YouTube catalog is disabled".to_string(),
+            )
         })?;
         runtime().block_on(async {
             provider
@@ -195,6 +207,50 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_searchArtistsYoutube
     })();
     match result {
         Ok(artists) => return_json(&mut env, encode_artists(artists)),
+        Err((category, message)) => return_json(&mut env, failure(category, message)),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_artistContentYoutube(
+    mut env: JNIEnv,
+    _class: JClass,
+    artist_id: JString,
+) -> jstring {
+    let artist_id = match read_string(&mut env, &artist_id) {
+        Ok(id) if !id.trim().is_empty() => id,
+        _ => return return_json(&mut env, failure("invalid_request", "artist id is empty")),
+    };
+    let result = (|| {
+        let media = MEDIA.get().ok_or_else(|| {
+            (
+                "provider_unavailable",
+                "provider is not initialized".to_string(),
+            )
+        })?;
+        let provider = media.catalog.get(Source::YouTube).ok_or_else(|| {
+            (
+                "provider_unavailable",
+                "YouTube catalog is disabled".to_string(),
+            )
+        })?;
+        runtime().block_on(async {
+            provider
+                .artist_content(&artist_id)
+                .await
+                .map_err(|error| (catalog_error_category(&error), error.to_string()))
+        })
+    })();
+    match result {
+        Ok((artist, tracks, albums)) => {
+            let value = json!({
+                "ok": true,
+                "artist": artist,
+                "tracks": tracks,
+                "albums": albums,
+            });
+            return_json(&mut env, value)
+        }
         Err((category, message)) => return_json(&mut env, failure(category, message)),
     }
 }
@@ -459,10 +515,16 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_albumTracksYoutube(
     };
     let result = (|| {
         let media = MEDIA.get().ok_or_else(|| {
-            ("provider_unavailable", "provider is not initialized".to_string())
+            (
+                "provider_unavailable",
+                "provider is not initialized".to_string(),
+            )
         })?;
         let provider = media.catalog.get(Source::YouTube).ok_or_else(|| {
-            ("provider_unavailable", "YouTube catalog is disabled".to_string())
+            (
+                "provider_unavailable",
+                "YouTube catalog is disabled".to_string(),
+            )
         })?;
         runtime().block_on(async {
             provider

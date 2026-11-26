@@ -3,7 +3,7 @@ name: release
 # Único publicador oficial: un tag numérico SIN prefijo `v` (p. ej. `0.17.42`)
 # construye aquí los binarios y los sube como assets de la GitHub Release.
 # Las subidas manuales quedan prohibidas por procedimiento (ver checklist en
-# docs/policies.md): solo lo que sale de este workflow tiene la versión
+# Documentacion/docs/policies.md): solo lo que sale de este workflow tiene la versión
 # horneada verificada contra el tag, que es lo que `tunefold --update` exige.
 on:
   # Cualquier tag dispara el job, pero el paso `version-guard` (el primero)
@@ -130,6 +130,6 @@ jobs:
           files: |
             dist/tunefold-*
             LICENSE
-            THIRD_PARTY.md
+            Documentacion/THIRD_PARTY.md
             NOTICE
           fail_on_unmatched_files: false

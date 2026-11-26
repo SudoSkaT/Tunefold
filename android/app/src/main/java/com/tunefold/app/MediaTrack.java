@@ -72,6 +72,11 @@ final class MediaTrack {
     /** Stable identity of this track, or {@code null} when it has none. */
     TrackKey key() { return TrackKey.of(provider, providerId); }
 
+    /** True when this row came from the local download store, not the provider. */
+    boolean isLocal() {
+        return provider != null && provider.startsWith("Downloaded");
+    }
+
     String displayText() {
         String attribution = artist.isEmpty() ? channel : artist;
         return attribution.isEmpty() ? title : title + " — " + attribution;

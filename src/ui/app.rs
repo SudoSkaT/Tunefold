@@ -168,6 +168,9 @@ pub struct App {
     /// Contador de generaciones de `ResolveLink` del popup (distinto de 0).
     /// La búsqueda clásica usa generación 0.
     link_generation: u64,
+    /// Generación de la búsqueda clásica en vuelo. Una respuesta con otra
+    /// generación (o con otra consulta) es obsoleta y no se aplica.
+    search_generation: u64,
 }
 
 impl App {
@@ -215,6 +218,7 @@ impl App {
             greeting: None,
             external_link_popup: None,
             link_generation: 0,
+            search_generation: 0,
         }
     }
 
@@ -652,12 +656,16 @@ impl App {
                     // La detección vive en el provider (regla frontera `api`).
                     // Generación 0 = flujo clásico de búsqueda (el popup usa
                     // generaciones distintas de 0).
+                    self.search_generation = self.search_generation.wrapping_add(1).max(1);
+                    let generation = self.search_generation;
                     if is_link_query(&query) {
                         self.status = Some("Resolviendo enlace…".to_string());
                         let _ = self.backend_tx.send(BackendCommand::ResolveLink(query, 0));
                     } else {
                         self.status = Some(format!("Buscando «{query}»..."));
-                        let _ = self.backend_tx.send(BackendCommand::Search(query));
+                        let _ = self
+                            .backend_tx
+                            .send(BackendCommand::Search(query, generation));
                     }
                 } else if let Some(track) = self.search.selected().cloned() {
                     self.save_and_play(track);
@@ -1277,7 +1285,54 @@ impl App {
 
     fn on_backend(&mut self, event: BackendEvent) {
         match event {
-            BackendEvent::SearchResults { outcome, .. } => {
+            BackendEvent::SearchResults {
+                query,
+                generation,
+                outcome,
+            } => {
+                // Una playlist pegada en el popup no se puede incorporar como
+                // una pista: el backend la devuelve como resultados. Se cierra
+                // el flujo con un mensaje honesto en vez de dejarlo en
+                // "Resolviendo…" para siempre.
+                if generation != 0
+                    && self
+                        .external_link_popup
+                        .as_ref()
+                        .is_some_and(|p| p.generation == generation && p.submitted == query)
+                {
+                    let fresh = self
+                        .external_link_popup
+                        .as_ref()
+                        .is_some_and(|p| p.flow() == super::external_link::LinkFlow::Resolving);
+                    if !fresh {
+                        return;
+                    }
+                    if let Some(popup) = self.external_link_popup.as_mut() {
+                        popup.set_flow_with(
+                            super::external_link::LinkFlow::Failed,
+                            "Playlist detectada: esta fase no importa listas completas.",
+                        );
+                    }
+                    self.status = Some(
+                        "Playlist detectada: ábrela desde la búsqueda para ver sus pistas."
+                            .to_string(),
+                    );
+                    return;
+                }
+                // Una búsqueda lenta de "a" no puede sustituir los resultados
+                // de "b" enviada después: la generación y la consulta deben
+                // seguir siendo las de la operación en vuelo.
+                // La generación 0 es el flujo clásico de enlaces: se empareja
+                // por consulta en vuelo, no por el contador de búsquedas.
+                let current = self.search.last_query.as_deref() == Some(query.as_str())
+                    && if generation == 0 {
+                        self.search.searching
+                    } else {
+                        self.search_generation == generation
+                    };
+                if !current {
+                    return;
+                }
                 self.search.searching = false;
                 let outcome = *outcome;
                 let count = outcome.items.len();
@@ -1330,7 +1385,14 @@ impl App {
                     self.ensure_external_playlist_and_add(*track);
                     return;
                 }
-                // Flujo clásico de búsqueda (generación 0): sin cambios.
+                // Flujo clásico de búsqueda (generación 0): solo aplica si
+                // sigue siendo la consulta en vuelo. Una resolución lenta de
+                // un enlace anterior no puede pisar la búsqueda actual.
+                let current = self.search.searching
+                    && self.search.last_query.as_deref() == Some(input.as_str());
+                if !current {
+                    return;
+                }
                 self.search.searching = false;
                 self.search.related_from = 0;
                 self.search.results = vec![*track];
@@ -2387,6 +2449,99 @@ mod tests {
             last_greeting_date: Some(today),
         });
         assert!(app.greeting.is_none(), "una vez al día");
+    }
+
+    #[test]
+    fn stale_search_results_do_not_replace_the_current_query() {
+        let (tx, _rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        app.view = View::Search;
+        app.search.last_query = Some("new".to_string());
+        app.search.searching = true;
+        app.search_generation = 2;
+
+        app.on_backend(BackendEvent::SearchResults {
+            query: "old".to_string(),
+            generation: 1,
+            outcome: Box::new(crate::app::aggregator::SearchOutcome {
+                items: vec![rec_track("old")],
+                errors: Vec::new(),
+                related_from: 0,
+            }),
+        });
+        assert!(
+            app.search.results.is_empty(),
+            "la respuesta vieja se ignora"
+        );
+        assert!(app.search.searching, "la búsqueda en vuelo sigue viva");
+
+        app.on_backend(BackendEvent::SearchResults {
+            query: "new".to_string(),
+            generation: 2,
+            outcome: Box::new(crate::app::aggregator::SearchOutcome {
+                items: vec![rec_track("new")],
+                errors: Vec::new(),
+                related_from: 0,
+            }),
+        });
+        assert_eq!(app.search.results.len(), 1);
+        assert_eq!(app.search.results[0].external_id.as_deref(), Some("new"));
+        assert!(!app.search.searching);
+    }
+
+    #[test]
+    fn playlist_link_in_the_popup_fails_honestly_instead_of_hanging() {
+        let (tx, _rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        let mut popup = crate::ui::external_link::ExternalLinkPopup::new();
+        popup.generation = 7;
+        popup.submitted = "https://www.youtube.com/playlist?list=PL123".to_string();
+        popup.set_flow(crate::ui::external_link::LinkFlow::Resolving);
+        app.external_link_popup = Some(popup);
+
+        app.on_backend(BackendEvent::SearchResults {
+            query: "https://www.youtube.com/playlist?list=PL123".to_string(),
+            generation: 7,
+            outcome: Box::new(crate::app::aggregator::SearchOutcome {
+                items: vec![rec_track("one"), rec_track("two")],
+                errors: Vec::new(),
+                related_from: 0,
+            }),
+        });
+
+        assert_eq!(
+            app.external_link_popup.as_ref().map(|p| p.flow()),
+            Some(crate::ui::external_link::LinkFlow::Failed)
+        );
+        assert!(
+            app.search.results.is_empty(),
+            "la playlist del popup no pisa la búsqueda"
+        );
+    }
+
+    #[test]
+    fn stale_classic_link_does_not_replace_the_current_search() {
+        let (tx, _rx) = unbounded_channel::<BackendCommand>();
+        let mut app = App::new(tx);
+        app.view = View::Search;
+        app.search.last_query = Some("https://youtu.be/new".to_string());
+        app.search.searching = true;
+
+        app.on_backend(BackendEvent::LinkResolved {
+            input: "https://youtu.be/old".to_string(),
+            track: Box::new(rec_track("old")),
+            generation: 0,
+        });
+        assert!(app.search.results.is_empty(), "el enlace viejo se ignora");
+
+        app.on_backend(BackendEvent::LinkResolved {
+            input: "https://youtu.be/new".to_string(),
+            track: Box::new(rec_track("new")),
+            generation: 0,
+        });
+        assert_eq!(app.search.results.len(), 1);
+        assert_eq!(app.search.results[0].external_id.as_deref(), Some("new"));
+        assert!(!app.search.searching);
     }
 
     #[test]

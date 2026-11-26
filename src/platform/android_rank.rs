@@ -24,7 +24,7 @@
 //! (incluido `UnsatisfiedLinkError` de un binario antiguo) ⇒ orden del
 //! provider. `profiles`/`seed_profile` están en el contrato desde v1 aunque
 //! v1 no los envíe (el eje sonoro queda dormido hasta que Android produzca
-//! perfiles — `docs/recommendations.md`).
+//! perfiles — `Documentacion/docs/recommendations.md`).
 //!
 //! Regla de frontera (AGENTS.md): este módulo vive en `platform/`, nunca en
 //! `providers/youtube/`; habla JSON neutral y no conoce proveedores.

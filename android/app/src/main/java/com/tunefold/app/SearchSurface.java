@@ -62,6 +62,8 @@ final class SearchSurface extends SectionSurface {
     private final IconButton submit;
     private final TrackGroup results;
     private final SearchHost searchHost;
+    private final java.util.List<android.widget.Button> modeButtons =
+            new java.util.ArrayList<>();
 
     private boolean submitting;
     private Intent mode = Intent.SEARCH;
@@ -132,17 +134,29 @@ final class SearchSurface extends SectionSurface {
         modes.setOrientation(LinearLayout.HORIZONTAL);
         for (Intent candidate : new Intent[] { Intent.SEARCH, Intent.SEARCH_ALBUMS, Intent.SEARCH_ARTISTS }) {
             android.widget.Button button = new android.widget.Button(context);
-            String label = candidate == Intent.SEARCH ? "Pistas" : (candidate == Intent.SEARCH_ALBUMS ? "Álbumes" : "Artistas");
+            String label = candidate == Intent.SEARCH ? "Pistas"
+                    : (candidate == Intent.SEARCH_ALBUMS ? "Álbumes" : "Artistas");
+            Icon glyph = candidate == Intent.SEARCH ? Icon.LIST_MUSIC
+                    : (candidate == Intent.SEARCH_ALBUMS ? Icon.DISC_3 : Icon.MIC_VOCAL);
             button.setText(label);
-            button.setOnClickListener(view -> {
-                mode = candidate;
-                submit.setEnabled(!trimmed().isEmpty());
-            });
+            IconDrawable icon = new IconDrawable(glyph);
+            icon.setColor(DesignTokens.Palette.ON_SURFACE_MUTED);
+            button.setCompoundDrawablesWithIntrinsicBounds(icon, null, null, null);
+            button.setCompoundDrawablePadding(DesignTokens.dp(DesignTokens.SPACE_1));
+            button.setAllCaps(false);
+            button.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+                    DesignTokens.TYPE_LABEL_SIZE);
+            button.setTextColor(DesignTokens.Palette.ON_SURFACE);
+            button.setBackground(MainActivity.roundDrawable(
+                    DesignTokens.Palette.SURFACE_RAISED, DesignTokens.RADIUS_MEDIUM));
+            button.setOnClickListener(view -> selectMode(candidate));
+            modeButtons.add(button);
             modes.addView(button, new LinearLayout.LayoutParams(0,
                     LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         }
         addView(modes, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
+        selectMode(Intent.SEARCH);
 
         results = new TrackGroup(context, "Results", host.rowPool(), host, host.scrollHost());
         results.setVisibleGroup(false);
@@ -159,6 +173,38 @@ final class SearchSurface extends SectionSurface {
     @Override void onShow() {
         field.clearFocus();
         submit.setEnabled(!TextUtils.isEmpty(trimmed()));
+        renderModes();
+    }
+
+    /**
+     * The chip that owns the next search says so.
+     *
+     * <p>Without a selected state the three buttons looked identical, so the
+     * only way to know which search was about to run was to remember the last
+     * tap. Alpha and selection both move; no colour is invented.
+     */
+    private void selectMode(Intent selected) {
+        mode = selected;
+        renderModes();
+        submit.setEnabled(!trimmed().isEmpty());
+    }
+
+    private void renderModes() {
+        Intent[] values = { Intent.SEARCH, Intent.SEARCH_ALBUMS, Intent.SEARCH_ARTISTS };
+        for (int index = 0; index < modeButtons.size(); index++) {
+            android.widget.Button button = modeButtons.get(index);
+            boolean active = values[index] == mode;
+            button.setSelected(active);
+            button.setActivated(active);
+            button.setAlpha(active ? 1f : 0.55f);
+            android.graphics.drawable.Drawable[] drawables = button.getCompoundDrawables();
+            if (drawables.length > 0 && drawables[0] instanceof IconDrawable) {
+                ((IconDrawable) drawables[0]).setColor(active
+                        ? ArtworkTheme.accent() : DesignTokens.Palette.ON_SURFACE_MUTED);
+            }
+            button.setContentDescription((active ? "Selected: " : "")
+                    + button.getText());
+        }
     }
 
     /** What is currently typed, trimmed; shared with the screen for scripted runs. */
@@ -201,11 +247,16 @@ final class SearchSurface extends SectionSurface {
 
     /** The results, once they exist. */
     void showResults(java.util.List<MediaTrack> tracks) {
+        showResults(tracks, "Results");
+    }
+
+    /** The results, once they exist, under an explicit heading. */
+    void showResults(java.util.List<MediaTrack> tracks, CharSequence title) {
         submitting = false;
         hasResults = true;
         results.setVisibleGroup(true);
         int count = tracks == null ? 0 : tracks.size();
-        results.setTitle("Results", count);
+        results.setTitle(title, count);
         if (count == 0) {
             results.showEmpty("No results");
         } else {
@@ -258,18 +309,30 @@ final class SearchSurface extends SectionSurface {
     /**
      * Whether this is something to play rather than something to look for.
      *
-     * <p>Two conditions, both narrow on purpose. A pasted link starts with a scheme or
-     * with {@code www.}, and it points at one of the shapes this app can resolve. The
-     * first condition is what keeps "how do I post on youtube.com/watch" a search: a
-     * sentence that happens to contain the URL of something is a sentence.
+     * <p>A pasted link starts with a scheme or with {@code www.} and parses as
+     * a host with no whitespace. That is what keeps "how do I post on
+     * youtube.com/watch" a search: a sentence that happens to contain a URL is
+     * still a sentence. Any valid host is accepted, not only YouTube, because
+     * direct stream URLs are playable too.
      */
     static boolean isUrl(String query) {
         if (query == null) return false;
-        String value = query.trim().toLowerCase(java.util.Locale.ROOT);
-        boolean shaped = value.startsWith("http://") || value.startsWith("https://")
-                || value.startsWith("www.");
+        String value = query.trim();
+        if (value.isEmpty() || value.indexOf(' ') >= 0
+                || value.indexOf('\n') >= 0 || value.indexOf('\t') >= 0) {
+            return false;
+        }
+        String lower = value.toLowerCase(java.util.Locale.ROOT);
+        boolean shaped = lower.startsWith("http://") || lower.startsWith("https://")
+                || lower.startsWith("www.");
         if (!shaped) return false;
-        return value.contains("youtube.com/watch") || value.contains("youtu.be/")
-                || value.contains("youtube.com/shorts/");
+        String parsed = lower.startsWith("www.") ? "https://" + value : value;
+        try {
+            java.net.URI uri = new java.net.URI(parsed);
+            String host = uri.getHost();
+            return host != null && host.indexOf('.') > 0;
+        } catch (java.net.URISyntaxException malformed) {
+            return false;
+        }
     }
 }

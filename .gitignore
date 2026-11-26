@@ -26,3 +26,6 @@ local.properties
 
 # Context report cache
 engineering/.cache/
+
+# Documentación local consolidada (ignorada)
+Documentacion/

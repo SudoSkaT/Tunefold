@@ -156,48 +156,57 @@ final class ArtworkCache {
         File target = new File(directory, digest(reference) + ".image");
         if (target.isFile() && target.length() > 0 && target.length() <= MAX_IMAGE_BYTES
                 && System.currentTimeMillis() - target.lastModified() <= TTL_MS) {
-            target.setLastModified(System.currentTimeMillis());
+            android.util.Log.d("TunefoldPerf", "event=artwork_disk_hit");
+            // Touch the file at most once an hour: updating mtime on every hit
+            // turned a cache lookup into a disk write on every scroll.
+            if (System.currentTimeMillis() - target.lastModified() >= 3_600_000L) {
+                target.setLastModified(System.currentTimeMillis());
+            }
             return target;
         }
         target.delete();
-        HttpURLConnection connection = null;
-        File temporary = new File(directory, target.getName() + ".part");
-        try {
-            if (!directory.isDirectory() && !directory.mkdirs()) return null;
-            connection = (HttpURLConnection) new URL(reference).openConnection();
-            connection.setConnectTimeout(5_000);
-            connection.setReadTimeout(5_000);
-            connection.setInstanceFollowRedirects(true);
-            connection.setRequestProperty("User-Agent", "Tunefold/0.1 artwork-cache");
-            int status = connection.getResponseCode();
-            String type = connection.getContentType();
-            if (status < 200 || status >= 300 || type == null || !type.toLowerCase().startsWith("image/")) {
-                return null;
-            }
-            long declaredLength = connection.getContentLengthLong();
-            if (declaredLength > MAX_IMAGE_BYTES) return null;
-            long total = 0;
-            try (InputStream input = connection.getInputStream();
-                 FileOutputStream output = new FileOutputStream(temporary)) {
-                byte[] buffer = new byte[16 * 1024];
-                int count;
-                while ((count = input.read(buffer)) != -1) {
-                    total += count;
-                    if (total > MAX_IMAGE_BYTES) return null;
-                    output.write(buffer, 0, count);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            HttpURLConnection connection = null;
+            File temporary = new File(directory, target.getName() + ".part");
+            try {
+                if (!directory.isDirectory() && !directory.mkdirs()) return null;
+                connection = (HttpURLConnection) new URL(reference).openConnection();
+                connection.setConnectTimeout(10_000);
+                connection.setReadTimeout(10_000);
+                connection.setInstanceFollowRedirects(true);
+                connection.setRequestProperty("User-Agent", "Tunefold/0.1 artwork-cache");
+                int status = connection.getResponseCode();
+                String type = connection.getContentType();
+                if (status < 200 || status >= 300 || type == null || !type.toLowerCase().startsWith("image/")) {
+                    return null;
                 }
-                output.getFD().sync();
+                long declaredLength = connection.getContentLengthLong();
+                if (declaredLength > MAX_IMAGE_BYTES) return null;
+                long total = 0;
+                try (InputStream input = connection.getInputStream();
+                     FileOutputStream output = new FileOutputStream(temporary)) {
+                    byte[] buffer = new byte[16 * 1024];
+                    int count;
+                    while ((count = input.read(buffer)) != -1) {
+                        total += count;
+                        if (total > MAX_IMAGE_BYTES) return null;
+                        output.write(buffer, 0, count);
+                    }
+                    output.getFD().sync();
+                }
+                if (total == 0 || !temporary.renameTo(target)) return null;
+                evictOldFiles();
+                android.util.Log.d("TunefoldPerf", "event=artwork_download_ok attempt=" + (attempt + 1));
+                return target;
+            } catch (Exception failure) {
+                Log.d("TunefoldCache", "Artwork fetch failed: " + failure.getClass().getSimpleName());
+                if (attempt == 1) return null;
+            } finally {
+                if (connection != null) connection.disconnect();
+                temporary.delete();
             }
-            if (total == 0 || !temporary.renameTo(target)) return null;
-            evictOldFiles();
-            return target;
-        } catch (Exception failure) {
-            Log.d("TunefoldCache", "Artwork fetch failed: " + failure.getClass().getSimpleName());
-            return null;
-        } finally {
-            if (connection != null) connection.disconnect();
-            temporary.delete();
         }
+        return null;
     }
 
     private void evictOldFiles() {
@@ -213,12 +222,18 @@ final class ArtworkCache {
         }
     }
 
+    private static final char[] HEX = "0123456789abcdef".toCharArray();
+
     private static String digest(String value) {
         try {
             byte[] hash = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder result = new StringBuilder(hash.length * 2);
-            for (byte item : hash) result.append(String.format(java.util.Locale.ROOT, "%02x", item));
-            return result.toString();
+            char[] result = new char[hash.length * 2];
+            for (int i = 0; i < hash.length; i++) {
+                int b = hash[i] & 0xff;
+                result[i * 2] = HEX[b >>> 4];
+                result[i * 2 + 1] = HEX[b & 0x0f];
+            }
+            return new String(result);
         } catch (Exception impossible) {
             throw new IllegalStateException("SHA-256 unavailable", impossible);
         }

@@ -1,10 +1,10 @@
 # Tunefold Android runtime host
 
 Phase 2 (Now Playing, artwork, live sound bars) is documented in
-[`NOW_PLAYING_REPORT.md`](NOW_PLAYING_REPORT.md), **Phase 4 (navigation,
-Home, Search, library and lists)** in [`NAVIGATION_REPORT.md`](NAVIGATION_REPORT.md)
+[`../Documentacion/android/NOW_PLAYING_REPORT.md`](../Documentacion/android/NOW_PLAYING_REPORT.md), **Phase 4 (navigation,
+Home, Search, library and lists)** in [`../Documentacion/android/NAVIGATION_REPORT.md`](../Documentacion/android/NAVIGATION_REPORT.md)
 and **Phase 5 (responsive layout, mini player, adaptive composition)** in
-[`LAYOUT_REPORT.md`](LAYOUT_REPORT.md): what was measured, what is a bound, and what
+[`../Documentacion/android/LAYOUT_REPORT.md`](../Documentacion/android/LAYOUT_REPORT.md): what was measured, what is a bound, and what
 still needs a device.
 
 This is a minimal test host for the Rust Android playback engine. Playback is
@@ -69,11 +69,12 @@ The service posts a minimal Tunefold playback notification and releases its
 engine/output when playback stops or reaches EOF. Activity recreation can bind
 again to observe the current controller state.
 
-The output uses Android `AudioTrack` in float PCM mode. Rust normalizes decoded
-audio to interleaved stereo `f32`, duplicates mono input, keeps the first two
-channels for multichannel input, and publishes the decoded source sample rate.
-`AudioTrack` is opened at that exact rate. The decoder pushes accepted frames
-to the bounded SPSC PCM ring and the analysis tap receives those same accepted
+The output uses Android `AudioTrack` in 16-bit PCM mode. Rust normalizes
+decoded audio to interleaved stereo `f32`, resamples it to 48 kHz, duplicates
+mono input, keeps the first two channels for multichannel input, and pushes
+accepted frames to the bounded SPSC PCM ring. Java's `AudioTrackOutput` drains
+that ring, clamps the samples, converts them to `short`, and writes them to an
+`AudioTrack` opened at 48 kHz. The analysis tap receives the same accepted
 frames. Decoding and network I/O run on the Rust decoder thread; AudioTrack
 drains PCM from a Java output worker and never invokes the decoder in an audio
 callback.
@@ -375,7 +376,7 @@ Autoplay and Home do not play the provider's raw "related" order. The same
 scoring engine the desktop TUI uses — acoustic similarity, harmonic distance,
 structure, then the local listening history — reorders candidates before they
 are offered; provider popularity decides only a small fraction of the result.
-The model is documented in [`docs/recommendations.md`](../docs/recommendations.md).
+The model is documented in [`Documentacion/docs/recommendations.md`](../Documentacion/docs/recommendations.md).
 
 * **One engine, via JNI.** `TunefoldBridge.rankRelated` (`src/platform/
   android_rank.rs`) receives candidates, the recorded listening signals and —

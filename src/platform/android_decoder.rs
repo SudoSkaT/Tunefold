@@ -182,6 +182,9 @@ pub struct DecoderDiagnostics {
     pub(crate) decode_errors: AtomicU64,
     pub(crate) ring_frames: AtomicU64,
     pub(crate) analysis_frames: AtomicU64,
+    pub(crate) ring_full_stalls: AtomicU64,
+    pub(crate) ring_full_wait_ms: AtomicU64,
+    pub(crate) spec_changes: AtomicU64,
     pub(crate) http_open_us: AtomicU64,
     pub(crate) first_response_us: AtomicU64,
     pub(crate) probe_us: AtomicU64,
@@ -208,6 +211,9 @@ impl DecoderDiagnostics {
             decode_errors: AtomicU64::new(0),
             ring_frames: AtomicU64::new(0),
             analysis_frames: AtomicU64::new(0),
+            ring_full_stalls: AtomicU64::new(0),
+            ring_full_wait_ms: AtomicU64::new(0),
+            spec_changes: AtomicU64::new(0),
             http_open_us: AtomicU64::new(0),
             first_response_us: AtomicU64::new(0),
             probe_us: AtomicU64::new(0),
@@ -469,10 +475,10 @@ impl StereoResampler {
         let previous = self.previous.unwrap_or([input[0], input[1]]);
         let mut pos = self.pos;
         loop {
-            let index = pos.floor() as isize;
-            if index + 1 >= frames as isize {
+            if pos >= frames as f64 {
                 break;
             }
+            let index = pos.floor() as isize;
             let fraction = pos - index as f64;
             let left = if index < 0 {
                 previous
@@ -480,8 +486,14 @@ impl StereoResampler {
                 let sample = index as usize * 2;
                 [input[sample], input[sample + 1]]
             };
-            let next = (index + 1) as usize * 2;
-            let right = [input[next], input[next + 1]];
+            // Clamp the right neighbour to the last available frame so short
+            // packets still produce output instead of being deferred forever.
+            let right_index = if index + 1 < 0 {
+                0usize
+            } else {
+                (index + 1).min(frames as isize - 1) as usize
+            };
+            let right = [input[right_index * 2], input[right_index * 2 + 1]];
             output.push(
                 (f64::from(left[0]) * (1.0 - fraction) + f64::from(right[0]) * fraction) as f32,
             );
@@ -491,7 +503,12 @@ impl StereoResampler {
             pos += self.step;
         }
         self.previous = Some([input[(frames - 1) * 2], input[(frames - 1) * 2 + 1]]);
-        self.pos = pos - frames as f64;
+        // Keep the fractional phase in [0, step) for the next compatible block.
+        let mut phase = pos - frames as f64;
+        if phase < 0.0 {
+            phase += frames as f64;
+        }
+        self.pos = phase;
     }
 }
 
@@ -786,6 +803,9 @@ impl AndroidDecoder {
                         sample_buf_spec = Some(spec);
                         source_channels = spec.channels.count();
                         sample_rate = spec.rate;
+                        self.diagnostics
+                            .spec_changes
+                            .fetch_add(1, Ordering::Relaxed);
                         resampler = StereoResampler::new(sample_rate, ANDROID_OUTPUT_SAMPLE_RATE);
                         self.analysis_tap.announce(StreamMeta {
                             sample_rate: ANDROID_OUTPUT_SAMPLE_RATE,
@@ -918,6 +938,12 @@ impl AndroidDecoder {
 
             let free_frames = self.ring.free_frames();
             if free_frames == 0 {
+                self.diagnostics
+                    .ring_full_stalls
+                    .fetch_add(1, Ordering::Relaxed);
+                self.diagnostics
+                    .ring_full_wait_ms
+                    .fetch_add(2, Ordering::Relaxed);
                 let should_report =
                     stall_reported.is_none_or(|last| last.elapsed() >= Duration::from_secs(1));
                 if should_report {

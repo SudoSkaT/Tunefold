@@ -198,6 +198,13 @@ impl CatalogProvider for YouTubeAdapter {
         self.inner.get_album_tracks(external_id).await
     }
 
+    async fn artist_content(
+        &self,
+        external_id: &str,
+    ) -> Result<(Artist, Vec<Track>, Vec<Album>), crate::catalog::CatalogError> {
+        self.inner.artist_content(external_id).await
+    }
+
     async fn playlist(
         &self,
         external_id: &str,

@@ -116,6 +116,16 @@ final class DownloadRegistry {
 
     boolean isActive(MediaTrack track) { return isActive(TrackKey.of(track)); }
 
+    /** True while any identity is resolving or transferring. */
+    boolean hasActiveWork() {
+        synchronized (states) {
+            for (DownloadState state : states.values()) {
+                if (state != null && state.isActive()) return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * Decides whether a download may start for this identity.
      *

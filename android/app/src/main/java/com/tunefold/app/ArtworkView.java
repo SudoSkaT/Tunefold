@@ -90,7 +90,17 @@ final class ArtworkView extends View {
      * load that never arrives cannot make the view look current.
      */
     void expectCover(String identity) {
-        expectedCoverId = identity == null ? "" : identity;
+        String next = identity == null ? "" : identity;
+        if (next.equals(expectedCoverId)) return;
+        expectedCoverId = next;
+        // A rebind never inherits the previous cover: the view cannot be allowed
+        // to keep painting a bitmap whose identity no longer matches what it is
+        // waiting for, even while the new decode is still in flight.
+        if (!next.equals(coverId)) {
+            bitmap = null;
+            coverId = "";
+            invalidate();
+        }
     }
 
     /**
@@ -101,7 +111,13 @@ final class ArtworkView extends View {
      */
     void setCover(String identity, Bitmap value) {
         if (value == null) {
-            clearCover();
+            // A null only clears when it belongs to the binding currently on
+            // screen; a late null for a superseded binding must not wipe the
+            // cover that has since arrived.
+            if (identity == null || identity.isEmpty()
+                    || identity.equals(expectedCoverId) || identity.equals(coverId)) {
+                clearCover();
+            }
             return;
         }
         if (identity == null || !identity.equals(expectedCoverId)) return;

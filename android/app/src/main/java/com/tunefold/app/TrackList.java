@@ -302,10 +302,20 @@ final class TrackList extends ViewGroup {
      * the one being painted.
      */
     void onArtwork(String identity, android.graphics.Bitmap bitmap) {
+        if (identity == null || identity.isEmpty()) return;
         for (int i = 0; i < bound.size(); i++) {
             TrackRow row = bound.get(i);
             if (identity.equals(row.artworkIdentity())) row.setArtwork(bitmap);
         }
+    }
+
+    /** Whether any bound row is still waiting for {@code identity}. */
+    boolean wantsArtwork(String identity) {
+        if (identity == null || identity.isEmpty()) return false;
+        for (int i = 0; i < bound.size(); i++) {
+            if (identity.equals(bound.get(i).artworkIdentity())) return true;
+        }
+        return false;
     }
 
     /** Returns every row to the pool and forgets the window. */

@@ -1,7 +1,7 @@
 //! Pipeline de generación de candidatos → scoring → ranking.
 //!
 //! Es el ÚNICO camino de scoring del sistema (la TUI lo invoca vía
-//! `reorder_by_local_taste` y Android vía JNI — ver `docs/recommendations.md`).
+//! `reorder_by_local_taste` y Android vía JNI — ver `Documentacion/docs/recommendations.md`).
 //! Los candidatos se comparan por el SONIDO real (timbre, armonía, ritmo
 //! armónico, estructura) y por la relación con el usuario; la popularidad es
 //! solo un desempate residual.
@@ -24,7 +24,7 @@ use crate::recommendation::{
 
 /// Pesos del pipeline (suman 1.0).
 ///
-/// Justificación (rediseño v0.20 — ver `docs/recommendations.md`):
+/// Justificación (rediseño v0.20 — ver `Documentacion/docs/recommendations.md`):
 /// - `acoustic` (0.30): similitud de TIMBRE/ENERGÍA (bandas, centroid, BPM,
 ///   onset) contra el gusto del usuario y la pista que suena ahora (semilla).
 /// - `harmonic` (0.20): cromática, tonalidad y tasa de cambios armónicos —

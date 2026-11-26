@@ -166,7 +166,7 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
     private PlaybackState renderedPhaseState;
     /** Phase the indicator was last given, dot and word together. */
     private PlaybackStatus.Phase renderedPhase;
-    private boolean renderedPlaying;
+    private TransportActions.Primary renderedPrimary;
     private boolean renderedAutoplay;
     private boolean renderedLiked;
     private DownloadState.Phase renderedDownloadPhase;
@@ -694,6 +694,9 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         progress.refreshSound(soundPlayable);
     }
 
+    /** Whether a new live window can exist right now. */
+    boolean soundPlayable() { return soundPlayable; }
+
     /** Counters for the diagnostics panel. */
     String progressStats() { return progress.stats(); }
 
@@ -767,26 +770,42 @@ final class NowPlayingView implements ArtworkTheme.AccentListener {
         PlaybackState state = snapshot.state;
         boolean hasTrack = snapshot.currentTrack != null;
         // §26: an action must state what it will do, so the primary control reads
-        // Pause while audio is coming out. Mirroring the state instead once left a
-        // playing track showing "Play".
-        boolean playing = state == PlaybackState.PLAYING;
-        if (renderedPlaying != playing) {
-            renderedPlaying = playing;
-            playPause.setAction(playing ? Icon.PAUSE : Icon.PLAY,
-                    playing ? "Pause playback" : "Start playback");
+        // Pause while audio is coming out, Retry after a recoverable failure and
+        // Play to restart a stopped track. A control that is enabled in a state
+        // where the session ignores it is a control that lies.
+        boolean retryable = snapshot.error != null && snapshot.error.retryable;
+        TransportActions.Primary primary =
+                TransportActions.primaryFor(state, hasTrack, retryable);
+        if (renderedPrimary != primary) {
+            renderedPrimary = primary;
+            switch (primary) {
+                case PAUSE:
+                    playPause.setAction(Icon.PAUSE, "Pause playback");
+                    break;
+                case PLAY:
+                    playPause.setAction(Icon.PLAY, state == PlaybackState.PAUSED
+                            ? "Resume playback" : "Restart playback");
+                    break;
+                case RETRY:
+                    playPause.setAction(Icon.RETRY, "Retry playback");
+                    break;
+                default:
+                    playPause.setAction(Icon.PLAY, "Start playback");
+                    break;
+            }
         }
-        playPause.setEnabled(hasTrack);
+        playPause.setEnabled(primary != TransportActions.Primary.NONE);
         // Next is never disabled by an empty queue: with autoplay on it still acts, and
         // the session decides between the next item, a recommendation and stopping (§13).
-        next.setEnabled(hasTrack || snapshot.autoplayEnabled);
-        previous.setEnabled(hasTrack);
+        next.setEnabled(TransportActions.nextEnabled(hasTrack,
+                snapshot.autoplayEnabled));
+        previous.setEnabled(TransportActions.previousEnabled(hasTrack));
         applyAutoplay(snapshot.autoplayEnabled);
         applyStatus(snapshot);
-        // The bars only make sense while the engine is engaged with this track: a
-        // source still resolving belongs to no measurement yet (§7).
-        soundPlayable = state == PlaybackState.BUFFERING
-                || state == PlaybackState.PLAYING
-                || state == PlaybackState.PAUSED;
+        // The bars only move when the engine can publish a new window. Paused and
+        // buffering keep their frozen frame: polling there would only confirm
+        // that the generation has not moved.
+        soundPlayable = UiCadence.soundProducesBars(state);
         if (!soundPlayable && (state == PlaybackState.STOPPED
                 || state == PlaybackState.IDLE || state == PlaybackState.ERROR)) {
             // Terminal states rest empty: a frozen envelope after stop reads as

@@ -32,6 +32,8 @@ public final class ForegroundPlaybackService extends Service {
     private TrackDownloader downloader;
     private PlaybackNotification notification;
     private boolean foreground;
+    /** Whether Android has this service as "started", not merely bound. */
+    private boolean started;
 
     public final class LocalBinder extends Binder {
         PlaybackController controller() { return controller; }
@@ -84,16 +86,17 @@ public final class ForegroundPlaybackService extends Service {
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        // A notification action starts the service; normal in-app playback is
+        // bound-only, so render() starts it explicitly once playback is live.
+        started = true;
         // System media controls and the notification send their commands here, so
         // they land on exactly the same session the UI drives (§17).
         String action = intent == null ? null : intent.getAction();
         if (action != null) {
             String expected = intent.getStringExtra(PlaybackNotification.EXTRA_TRACK_KEY);
             dispatchCommand(action, expected);
-            if (!foreground) startForegroundIfNeeded();
-            return START_STICKY;
         }
-        startForegroundIfNeeded();
+        render();
         return START_STICKY;
     }
 
@@ -183,7 +186,7 @@ public final class ForegroundPlaybackService extends Service {
                         || current == PlaybackState.BUFFERING)) {
                 // Position-only: moves the lock-screen playhead without
                 // rebuilding or re-notifying the notification (see publish).
-                notification.refreshPosition(snapshot.state, snapshot.positionMs);
+                notification.refreshPosition(snapshot);
             }
             handler.postDelayed(this, intervalFor(current));
         }
@@ -235,21 +238,55 @@ public final class ForegroundPlaybackService extends Service {
     private void render() {
         if (session == null || notification == null) return;
         PlaybackSession.Snapshot snapshot = session.snapshot();
-        boolean active = notification.shouldBeForeground(snapshot.state);
-        if (active) startForegroundIfNeeded();
-        notification.publish(snapshot, null);
-        if (!active && foreground && snapshot.state == PlaybackState.STOPPED) {
-            // Stopped and paused-free: the service may go away. L1K3D and the
-            // LocalMediaStore persist on disk regardless.
-            notification.stopForeground();
-            foreground = false;
+        boolean active = ForegroundState.wantsForeground(snapshot.state);
+        if (active) {
+            // A bound service is not a started service. Without this, playback
+            // started from the UI died with the last bound Activity even though
+            // the notification had already been promoted to foreground.
+            if (!started) {
+                try {
+                    startService(new Intent(this, ForegroundPlaybackService.class));
+                } catch (IllegalStateException backgroundStartRefused) {
+                    // The Activity that is bound right now keeps the process
+                    // alive; the next notification action marks it started.
+                    Log.i(TAG, "event=SERVICE_START_DEFERRED reason=background");
+                }
+            }
+            if (started) {
+                startForegroundIfNeeded();
+            }
+            notification.publish(snapshot, null);
+        } else {
+            if (foreground) {
+                notification.stopForeground();
+                foreground = false;
+            }
+            notification.deactivate();
         }
+        // ERROR and STOPPED are terminal for playback, but never for a download
+        // the user explicitly started. When the last one finishes, the session
+        // notifies us and this same decision releases the service.
+        boolean retryable = snapshot.error != null && snapshot.error.retryable;
+        if (ForegroundState.mayStop(snapshot.state, hasActiveDownloads(), retryable)) {
+            started = false;
+            stopSelf();
+        }
+    }
+
+    private boolean hasActiveDownloads() {
+        return downloader != null && downloader.hasActiveWork();
     }
 
     private void startForegroundIfNeeded() {
         if (foreground || session == null || notification == null) return;
-        notification.startForeground(session.snapshot());
-        foreground = true;
+        try {
+            notification.startForeground(session.snapshot());
+            foreground = true;
+        } catch (IllegalStateException backgroundStartRefused) {
+            // Same background restriction as startService; keep playing while
+            // bound and retry on the next render or notification action.
+            Log.i(TAG, "event=FOREGROUND_START_DEFERRED reason=background");
+        }
     }
 
     @Override public void onDestroy() {

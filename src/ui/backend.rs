@@ -32,7 +32,9 @@ use super::event::BackendEvent;
 /// Comandos que la UI envía al backend.
 #[derive(Debug)]
 pub enum BackendCommand {
-    Search(String),
+    /// Búsqueda de catálogo. `u64` = generación de la operación: la respuesta
+    /// la repite para que una consulta lenta no pise a una más reciente.
+    Search(String, u64),
     /// Resuelve un enlace YouTube a entidad interna (Fase 1: video → Track;
     /// playlist remota → mensaje honesto de copia local, sin espejo).
     /// `u64` = generación de la operación en vuelo (0 = búsqueda clásica;
@@ -184,6 +186,7 @@ pub struct Backend {
     /// Semillas cuyo pre-análisis de candidatos está en vuelo: evita
     /// duplicar el trabajo cuando se piden listas "relacionadas" en ráfaga.
     /// Mutex std (nunca se mantiene en hold a través de un await).
+    #[cfg(feature = "rodio")]
     preanalysis_inflight: Arc<std::sync::Mutex<super::preanalysis::InflightSet>>,
 }
 
@@ -253,6 +256,7 @@ impl Backend {
             features,
             waveform,
             events_out: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "rodio")]
             preanalysis_inflight: Arc::new(std::sync::Mutex::new(
                 super::preanalysis::InflightSet::default(),
             )),
@@ -613,7 +617,7 @@ impl Backend {
     /// orden sin necesitar re-consultas por cada efecto colateral.
     async fn handle_heavy(&self, cmd: BackendCommand) -> Vec<BackendEvent> {
         match cmd {
-            BackendCommand::Search(query) => {
+            BackendCommand::Search(query, generation) => {
                 if self.search.aggregator().is_empty() {
                     vec![BackendEvent::Message(
                         "No hay fuentes de catálogo activas (revisa los feature flags en .env)."
@@ -624,6 +628,7 @@ impl Backend {
                     match outcome {
                         Ok(outcome) => vec![BackendEvent::SearchResults {
                             query,
+                            generation,
                             outcome: Box::new(outcome),
                         }],
                         Err(e) => vec![BackendEvent::Error(format!("búsqueda: {e}"))],
@@ -1089,6 +1094,7 @@ impl Backend {
                             let _ = title;
                             vec![BackendEvent::SearchResults {
                                 query: input,
+                                generation,
                                 outcome: Box::new(outcome),
                             }]
                         }
@@ -1900,7 +1906,7 @@ pub fn spawn_backend(
 fn is_heavy(cmd: &BackendCommand) -> bool {
     matches!(
         cmd,
-        BackendCommand::Search(_)
+        BackendCommand::Search(..)
             | BackendCommand::ResolveLink(..)
             | BackendCommand::SaveTrack(_)
             | BackendCommand::Play(_)

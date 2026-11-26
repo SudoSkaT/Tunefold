@@ -714,13 +714,15 @@ impl CatalogProvider for YoutubeProvider {
             .into_iter()
             .take(limit as usize)
             .map(|a| {
-                Album::new(
+                let mut album = Album::new(
                     a.name.clone(),
                     a.year
                         .and_then(|y| chrono::NaiveDate::from_ymd_opt(y as i32, 1, 1)),
                     best_thumbnail(&a.cover),
                     None,
-                )
+                );
+                album.external_id = Some(a.id.clone());
+                album
             })
             .collect())
     }
@@ -765,6 +767,47 @@ impl CatalogProvider for YoutubeProvider {
         Ok(domain)
     }
 
+    /// Contenido de un artista: perfil, canciones y álbumes.
+    async fn artist_content(
+        &self,
+        external_id: &str,
+    ) -> Result<(Artist, Vec<Track>, Vec<Album>), ProviderError> {
+        let artist: MusicArtist = self
+            .client
+            .query()
+            .music_artist(external_id, false)
+            .await
+            .map_err(|e| map_error(e, "music_artist"))?;
+        let mut domain = Artist::new(
+            if artist.name.is_empty() {
+                "Desconocido".to_string()
+            } else {
+                artist.name.clone()
+            },
+            None,
+            artist.description.clone(),
+            best_thumbnail(&artist.header_image),
+        );
+        domain.external_id = Some(artist.id.clone());
+        let tracks: Vec<Track> = artist.tracks.iter().map(map_track).collect();
+        let albums: Vec<Album> = artist
+            .albums
+            .iter()
+            .map(|a| {
+                let mut album = Album::new(
+                    a.name.clone(),
+                    a.year
+                        .and_then(|y| chrono::NaiveDate::from_ymd_opt(y as i32, 1, 1)),
+                    best_thumbnail(&a.cover),
+                    None,
+                );
+                album.external_id = Some(a.id.clone());
+                album
+            })
+            .collect();
+        Ok((domain, tracks, albums))
+    }
+
     async fn get_album(&self, external_id: &str) -> Result<Album, ProviderError> {
         let album: MusicAlbum = self
             .client
@@ -772,14 +815,16 @@ impl CatalogProvider for YoutubeProvider {
             .music_album(external_id)
             .await
             .map_err(|e| map_error(e, "music_album"))?;
-        Ok(Album::new(
+        let mut domain = Album::new(
             album.name.clone(),
             album
                 .year
                 .and_then(|y| chrono::NaiveDate::from_ymd_opt(y as i32, 1, 1)),
             best_thumbnail(&album.cover),
             None,
-        ))
+        );
+        domain.external_id = Some(album.id.clone());
+        Ok(domain)
     }
 
     async fn get_album_tracks(&self, external_id: &str) -> Result<Vec<Track>, ProviderError> {
@@ -789,7 +834,20 @@ impl CatalogProvider for YoutubeProvider {
             .music_album(external_id)
             .await
             .map_err(|e| map_error(e, "music_album"))?;
-        Ok(album.tracks.iter().map(map_track).collect())
+        let album_cover = best_thumbnail(&album.cover);
+        Ok(album
+            .tracks
+            .iter()
+            .map(|item| {
+                let mut track = map_track(item);
+                if track.thumbnail.is_none() {
+                    track.thumbnail = album_cover
+                        .clone()
+                        .map(|url| crate::domain::track::Thumbnail { url });
+                }
+                track
+            })
+            .collect())
     }
 
     async fn playlist(&self, external_id: &str) -> Result<ExternalPlaylist, ProviderError> {

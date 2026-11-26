@@ -57,7 +57,7 @@ final class MiniPlayer extends LinearLayout {
 
     private CharSequence renderedTitle = "";
     private CharSequence renderedArtist = "";
-    private boolean renderedPlaying;
+    private TransportActions.Primary renderedPrimary;
     private boolean renderedVisible;
     private boolean renderedLiked;
     private DownloadState.Phase renderedDownloadPhase = DownloadState.Phase.IDLE;
@@ -176,12 +176,21 @@ final class MiniPlayer extends LinearLayout {
             artist.setText(renderedArtist);
             artist.setVisibility(hasWho ? View.VISIBLE : View.GONE);
         }
-        boolean playing = snapshot.state == PlaybackState.PLAYING;
-        if (renderedPlaying != playing) {
-            renderedPlaying = playing;
-            playPause.setAction(playing ? Icon.PAUSE : Icon.PLAY,
-                    playing ? "Pause playback" : "Start playback");
+        boolean retryable = snapshot.error != null && snapshot.error.retryable;
+        TransportActions.Primary primary =
+                TransportActions.primaryFor(snapshot.state, track != null, retryable);
+        if (renderedPrimary != primary) {
+            renderedPrimary = primary;
+            if (primary == TransportActions.Primary.PAUSE) {
+                playPause.setAction(Icon.PAUSE, "Pause playback");
+            } else if (primary == TransportActions.Primary.RETRY) {
+                playPause.setAction(Icon.RETRY, "Retry playback");
+            } else {
+                playPause.setAction(Icon.PLAY, snapshot.state == PlaybackState.PAUSED
+                        ? "Resume playback" : "Restart playback");
+            }
         }
+        playPause.setEnabled(primary != TransportActions.Primary.NONE);
         boolean liked = snapshot.liked;
         if (renderedLiked != liked) {
             renderedLiked = liked;
@@ -210,9 +219,16 @@ final class MiniPlayer extends LinearLayout {
         artwork.expectCover(identity);
     }
 
+    /** Applies a cover already decoded for the player, carrying its identity. */
+    void setArtwork(String identity, android.graphics.Bitmap bitmap) {
+        if (bitmap == null) return;
+        if (identity == null || !identity.equals(renderedCover)) return;
+        artwork.setCover(identity, bitmap);
+    }
+
     /** Applies a cover already decoded for the player. */
     void setArtwork(android.graphics.Bitmap bitmap) {
-        artwork.setCover(renderedCover, bitmap);
+        setArtwork(renderedCover, bitmap);
     }
 
     /**

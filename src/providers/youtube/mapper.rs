@@ -35,10 +35,11 @@ pub(crate) fn map_track(item: &TrackItem) -> Track {
     if let Some(secs) = item.duration {
         track.duration = Some(std::time::Duration::from_secs(secs as u64));
     }
-    track.album = item
-        .album
-        .as_ref()
-        .map(|a| Album::new(a.name.clone(), None, None, None));
+    track.album = item.album.as_ref().map(|a| {
+        let mut album = Album::new(a.name.clone(), None, None, None);
+        album.external_id = Some(a.id.clone());
+        album
+    });
     track.url = Some(format!("https://www.youtube.com/watch?v={}", item.id));
     track
 }

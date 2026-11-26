@@ -284,17 +284,22 @@ pub fn sanitize_clipboard_text(raw: &str) -> Option<String> {
 
 /// Timeout para los CLIs de clipboard: un helper colgado no debe congelar la
 /// TUI nunca.
+#[cfg(feature = "clipboard")]
 const CLIP_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+#[cfg(feature = "clipboard")]
 const WL_ARGS: &[&str] = &["--no-newline"];
+#[cfg(feature = "clipboard")]
 const XCLIP_ARGS: &[&str] = &["-o", "-selection", "clipboard"];
+#[cfg(feature = "clipboard")]
 const XSEL_ARGS: &[&str] = &["--clipboard", "--output"];
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "clipboard", target_os = "macos"))]
 const NO_ARGS: &[&str] = &[];
 
 /// CLIs de clipboard por plataforma. Los binarios ausentes se reportan en
 /// tiempo de ejecución y se pasa al siguiente (Omarchy trae `wl-paste` de
 /// serie con Hyprland; en X11 suelen estar `xclip`/`xsel`).
+#[cfg(feature = "clipboard")]
 fn paste_commands() -> Vec<(&'static str, &'static [&'static str])> {
     #[cfg(target_os = "macos")]
     {
@@ -322,6 +327,7 @@ fn paste_commands() -> Vec<(&'static str, &'static [&'static str])> {
 }
 
 /// Ejecuta un CLI de clipboard y devuelve su stdout como texto.
+#[cfg(feature = "clipboard")]
 fn run_paste_cmd(cmd: &str, args: &[&str]) -> Result<String, String> {
     use std::process::{Command, Stdio};
     let child = Command::new(cmd)
@@ -349,6 +355,7 @@ fn run_paste_cmd(cmd: &str, args: &[&str]) -> Result<String, String> {
 }
 
 /// Recorta un error a una línea corta para el pie de estado.
+#[cfg(feature = "clipboard")]
 fn short_err(e: impl std::fmt::Display) -> String {
     let line = e.to_string();
     let line = line.lines().next().unwrap_or("").trim();
@@ -374,8 +381,12 @@ fn short_err(e: impl std::fmt::Display) -> String {
 /// `Err("vacío")`; si ninguna fuente responde → `Err("no disponible (…)")`
 /// para mostrar el fallback nativo del terminal (`Ctrl+Shift+V` / pegar).
 pub fn read_clipboard_text() -> Result<String, String> {
+    #[cfg(feature = "clipboard")]
     let mut problems: Vec<String> = Vec::new();
+    #[cfg(feature = "clipboard")]
     let mut readable = false;
+    #[cfg(not(feature = "clipboard"))]
+    let (problems, readable) = (Vec::<String>::new(), false);
 
     // 1 — arboard, selección clipboard (copiado explícito Ctrl+C / Ctrl+Shift+C).
     #[cfg(feature = "clipboard")]
@@ -768,6 +779,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "clipboard")]
     fn paste_cmd_missing_binary_is_an_error_not_a_panic() {
         let err = run_paste_cmd("tunefold-definitely-missing-binary-xyz", &[]).unwrap_err();
         assert!(
@@ -777,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "clipboard"))]
     fn paste_cmd_reads_stdout() {
         // `/bin/echo` existe en cualquier Unix: el runner devuelve su stdout.
         let out = run_paste_cmd("/bin/echo", &["https://youtu.be/abc123XYZ-_"])

@@ -45,8 +45,8 @@ final class ProviderRegistry implements AutoCloseable {
      */
     private final ExecutorService searchWorker = Executors.newSingleThreadExecutor(r ->
             new Thread(r, "tunefold-search"));
-    private final ExecutorService artworkWorker = Executors.newSingleThreadExecutor(r ->
-            new Thread(r, "tunefold-artwork-cache"));
+    private final ExecutorService artworkWorker = Executors.newFixedThreadPool(2, r ->
+            new Thread(r, "tunefold-artwork"));
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile boolean available;
     private volatile ArtworkCache artworkCache;
@@ -87,6 +87,7 @@ final class ProviderRegistry implements AutoCloseable {
                     artworkInflight.get(identity);
             if (waiting != null) {
                 waiting.add(callback);
+                android.util.Log.d("TunefoldPerf", "event=artwork_coalesced");
                 return;
             }
             java.util.List<Callback<android.graphics.Bitmap>> started = new ArrayList<>(4);
@@ -107,6 +108,7 @@ final class ProviderRegistry implements AutoCloseable {
             android.graphics.Bitmap cached = cache.memoryHit(identity);
             if (cached != null && cached.getWidth() < minSide(targetPx)) cached = null;
             if (cached != null) {
+                android.util.Log.d("TunefoldPerf", "event=artwork_memory_hit");
                 if (ownsPalette) applyDerivedAccent(cached);
                 deliverArtwork(identity, cached, null);
                 return;
@@ -459,10 +461,38 @@ final class ProviderRegistry implements AutoCloseable {
                     org.json.JSONObject a = albums.optJSONObject(i);
                     if (a == null) continue;
                     String thumb = a.optString("cover", "");
-                    result.add(new MediaTrack("Album", a.optString("id", ""), a.optString("title", "Untitled"),
+                    String albumId = a.optString("external_id", "");
+                    if (albumId.isEmpty() || albumId.equals("0") || albumId.equalsIgnoreCase("null")) {
+                        albumId = a.optString("id", "");
+                    }
+                    if (albumId.isEmpty() || albumId.equals("0") || albumId.equalsIgnoreCase("null")) {
+                        albumId = a.optString("title", "Untitled");
+                    }
+                    result.add(new MediaTrack("Album", albumId, a.optString("title", "Untitled"),
                             "", "", a.optString("title", ""), "artist", -1, thumb, "", a.toString()));
                 }
                 once.complete(result, null);
+            } catch (Exception e) { once.complete(null, e.toString()); }
+        });
+        main.postDelayed(() -> once.complete(null, "Search timed out. Check your connection and try again."),
+                20_000L);
+    }
+
+    /** Fetches an artist's profile, tracks and albums. */
+    void artistContent(String artistId, Callback<org.json.JSONObject> callback) {
+        java.util.concurrent.atomic.AtomicBoolean delivered = new java.util.concurrent.atomic.AtomicBoolean(false);
+        Callback<org.json.JSONObject> once = (value, error) -> {
+            if (delivered.compareAndSet(false, true)) deliver(callback, value, error);
+        };
+        searchWorker.execute(() -> {
+            if (!available) { once.complete(null, "YouTube provider is not initialized"); return; }
+            try {
+                org.json.JSONObject root = new org.json.JSONObject(TunefoldBridge.artistContentYoutube(artistId));
+                if (!root.optBoolean("ok")) {
+                    once.complete(null, root.optString("error", "Search failed"));
+                    return;
+                }
+                once.complete(root, null);
             } catch (Exception e) { once.complete(null, e.toString()); }
         });
         main.postDelayed(() -> once.complete(null, "Search timed out. Check your connection and try again."),
@@ -498,7 +528,14 @@ final class ProviderRegistry implements AutoCloseable {
                     org.json.JSONObject a = artists.optJSONObject(i);
                     if (a == null) continue;
                     String thumb = a.optString("image", "");
-                    result.add(new MediaTrack("Artist", a.optString("id", ""), a.optString("name", "Unknown"),
+                    String artistId = a.optString("external_id", "");
+                    if (artistId.isEmpty() || artistId.equals("0") || artistId.equalsIgnoreCase("null")) {
+                        artistId = a.optString("id", "");
+                    }
+                    if (artistId.isEmpty() || artistId.equals("0") || artistId.equalsIgnoreCase("null")) {
+                        artistId = a.optString("name", "Unknown");
+                    }
+                    result.add(new MediaTrack("Artist", artistId, a.optString("name", "Unknown"),
                             a.optString("name", ""), "", "", "artist", -1, thumb, "", a.toString()));
                 }
                 once.complete(result, null);

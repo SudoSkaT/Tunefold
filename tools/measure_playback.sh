@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Reproducible Android playback measurement for Tunefold.
 #
-#   ./tools/measure_playback.sh cold 5   # Case A: no useful caches
+#   ./tools/measure_playback.sh cache 5  # Case A: no useful caches, keep user data
 #   ./tools/measure_playback.sh warm 5   # Case B: caches already populated
+#   ./tools/measure_playback.sh cold 5   # Destructive: pm clear, including user data
+#
+# `cache` removes only the app's cache tree via run-as, so likes, downloads and
+# preferences survive. `cold` remains available for a true fresh-install state,
+# but it wipes user data and must not be used without explicit approval.
 #
 # Extracts the ordered TunefoldPerf timeline for every run and reports
 # min / median / p95 / max for TTFA and each stage.
@@ -13,7 +18,7 @@ PKG=com.tunefold.app
 ACTIVITY="$PKG/.MainActivity"
 VIDEO="${TUNEFOLD_VIDEO:-dQw4w9WgXcQ}"
 URL="${TUNEFOLD_URL:-https://www.youtube.com/watch?v=$VIDEO}"
-MODE="${1:-cold}"
+MODE="${1:-cache}"
 RUNS="${2:-5}"
 SETTLE="${SETTLE:-9}"
 OUT="${OUT:-/tmp/opencode/playback-$MODE-$RUNS.log}"
@@ -27,7 +32,9 @@ done
 : > "$OUT"
 for i in $(seq 1 "$RUNS"); do
     "$ADB" shell am force-stop "$PKG" >/dev/null 2>&1
-    if [ "$MODE" = cold ]; then
+    if [ "$MODE" = cache ]; then
+        "$ADB" shell "run-as $PKG sh -c 'rm -rf cache/*'" >/dev/null 2>&1
+    elif [ "$MODE" = cold ]; then
         "$ADB" shell pm clear "$PKG" >/dev/null 2>&1
     fi
     sleep 2

@@ -34,12 +34,14 @@ public class NavigationRulesTest {
 
     // -------------------------------------------------------------- search
 
-    /** A link is a link: the two hosts this app can actually resolve. */
+    /** A link is a link, including direct streams outside YouTube. */
     @Test public void linksAreRecognisedAsLinks() {
         assertTrue(SearchSurface.isUrl("https://www.youtube.com/watch?v=abc"));
         assertTrue(SearchSurface.isUrl("https://youtu.be/abc"));
         assertTrue(SearchSurface.isUrl("https://www.youtube.com/shorts/abc"));
         assertTrue(SearchSurface.isUrl("HTTPS://WWW.YOUTUBE.COM/WATCH?V=ABC"));
+        assertTrue(SearchSurface.isUrl("https://radio.example.org/live.mp3"));
+        assertTrue(SearchSurface.isUrl("www.example.org/live.mp3"));
     }
 
     /**
@@ -51,6 +53,8 @@ public class NavigationRulesTest {
     @Test public void wordsAreNotLinks() {
         assertFalse(SearchSurface.isUrl("get lucky"));
         assertFalse(SearchSurface.isUrl("how to post on youtube.com/watch"));
+        assertFalse(SearchSurface.isUrl("https://example.org is a site"));
+        assertFalse(SearchSurface.isUrl("https://not a host"));
         assertFalse(SearchSurface.isUrl(""));
         assertFalse(SearchSurface.isUrl(null));
     }

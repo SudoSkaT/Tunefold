@@ -57,6 +57,8 @@ public final class LockScreenControlsActivity extends Activity {
     private TrackDownloader downloader;
     private boolean bound;
     private boolean destroyed;
+    private boolean resumed;
+    private boolean visualTickScheduled;
     private boolean portraitOnly;
 
     private final ServiceConnection connection = new ServiceConnection() {
@@ -76,10 +78,7 @@ public final class LockScreenControlsActivity extends Activity {
         }
 
         @Override public void onServiceDisconnected(ComponentName name) {
-            session = null;
-            controller = null;
-            providers = null;
-            downloader = null;
+            detachSession();
             binder = null;
         }
     };
@@ -177,26 +176,38 @@ public final class LockScreenControlsActivity extends Activity {
 
     @Override protected void onStop() {
         super.onStop();
+        resumed = false;
         handler.removeCallbacks(tick);
+        stopVisualTick();
+        // Unbind does not call onServiceDisconnected: the observer has to be
+        // removed here or every visit to the lock screen leaves one behind.
+        detachSession();
         if (bound) {
             unbindService(connection);
             bound = false;
         }
         if (deviceInteractive() && !isFinishing()) finish();
-        session = null;
-        controller = null;
-        providers = null;
-        downloader = null;
         binder = null;
     }
 
     @Override protected void onDestroy() {
         destroyed = true;
+        resumed = false;
         handler.removeCallbacks(tick);
-        if (session != null) session.removeObserver(observer);
+        stopVisualTick();
+        detachSession();
         controls.release();
         controls.attachSound(null);
         super.onDestroy();
+    }
+
+    /** Idempotent: connection loss, onStop and onDestroy all end here. */
+    private void detachSession() {
+        if (session != null) session.removeObserver(observer);
+        session = null;
+        controller = null;
+        providers = null;
+        downloader = null;
     }
 
     /**
@@ -215,11 +226,45 @@ public final class LockScreenControlsActivity extends Activity {
                 PlaybackPosition now = session.readPosition(position);
                 controls.setPosition(now.key, now.positionMs, now.durationMs);
                 controls.tick();
-                controls.refreshSound();
             }
             if (!destroyed) handler.postDelayed(this, DesignTokens.POSITION_INTERVAL_MS);
         }
     };
+
+    /**
+     * The bars' 20 Hz tick, separate from the position tick and alive only while
+     * this screen is resumed with audio that can produce a new window.
+     */
+    private final Runnable visualTick = new Runnable() {
+        @Override public void run() {
+            if (!UiCadence.visualTickEnabled(resumed, true,
+                    controls != null && controls.soundPlayable())) {
+                visualTickScheduled = false;
+                return;
+            }
+            controls.refreshSound();
+            if (visualTickScheduled) {
+                handler.postDelayed(this, DesignTokens.VISUAL_INTERVAL_MS);
+            }
+        }
+    };
+
+    private void syncVisualTick() {
+        boolean wanted = controls != null
+                && UiCadence.visualTickEnabled(resumed, true, controls.soundPlayable());
+        if (!wanted) {
+            stopVisualTick();
+            return;
+        }
+        if (visualTickScheduled) return;
+        visualTickScheduled = true;
+        handler.post(visualTick);
+    }
+
+    private void stopVisualTick() {
+        visualTickScheduled = false;
+        handler.removeCallbacks(visualTick);
+    }
 
     private MediaTrack currentTrack() {
         return session == null ? null : session.snapshot().currentTrack;
@@ -255,6 +300,7 @@ public final class LockScreenControlsActivity extends Activity {
         loadQueueArtwork();
         requestLyrics(snapshot);
         requestRecommendations(snapshot);
+        syncVisualTick();
     }
 
     /** Covers of the Sigue window, once per window; never on the UI thread. */
@@ -429,7 +475,9 @@ public final class LockScreenControlsActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        resumed = true;
         handler.post(tick);
+        syncVisualTick();
     }
 
     /** Extra that says "the device is locked": these controls stay in portrait. */

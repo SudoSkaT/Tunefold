@@ -7,6 +7,7 @@ import android.media.AudioTrack;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
+import java.util.concurrent.atomic.AtomicLong;
 
 final class AudioTrackOutput {
     interface Listener {
@@ -15,6 +16,11 @@ final class AudioTrackOutput {
 
     private static final int CHUNK_FRAMES = 1024;
     private final Listener listener;
+    private final AtomicLong writeCalls = new AtomicLong();
+    private final AtomicLong writtenFramesTotal = new AtomicLong();
+    private final AtomicLong zeroWrites = new AtomicLong();
+    private final AtomicLong audioUnderruns = new AtomicLong();
+    private final AtomicLong maxWriteMs = new AtomicLong();
     private volatile boolean running;
     private volatile AudioTrack track;
     private volatile Thread worker;
@@ -74,6 +80,15 @@ final class AudioTrackOutput {
         joinWorker(0);
     }
 
+    /** Low-cost diagnostic snapshot of output behaviour. */
+    String metrics() {
+        return "writes=" + writeCalls.get()
+                + " frames=" + writtenFramesTotal.get()
+                + " zeroWrites=" + zeroWrites.get()
+                + " underruns=" + audioUnderruns.get()
+                + " maxWriteMs=" + maxWriteMs.get();
+    }
+
     private void joinWorker(long timeoutMs) {
         Thread current = worker;
         if (current == null || current == Thread.currentThread()) return;
@@ -89,6 +104,7 @@ final class AudioTrackOutput {
     private void pump(long engine, PlaybackTrace trace, Runnable onOutputBegan) {
         AudioTrack localTrack = null;
         boolean trackPlaying = false;
+        int lastUnderruns = 0;
         // Held in a local so firing it needs no locking; cleared after the call.
         Runnable began = onOutputBegan;
         // Sample rate is fixed for a source: re-reading it from JNI on every
@@ -136,6 +152,8 @@ final class AudioTrackOutput {
                 if (localTrack == null) {
                     localTrack = createTrack(sampleRate);
                     track = localTrack;
+                    try { lastUnderruns = localTrack.getUnderrunCount(); }
+                    catch (RuntimeException ignored) { lastUnderruns = 0; }
                 }
 
                 state = TunefoldBridge.getPlaybackState(engine);
@@ -152,6 +170,16 @@ final class AudioTrackOutput {
                     TunefoldBridge.setOutputState(engine, PlaybackController.PLAYING);
                 }
 
+                if (localTrack != null) {
+                    try {
+                        int currentUnderruns = localTrack.getUnderrunCount();
+                        if (currentUnderruns > lastUnderruns) {
+                            audioUnderruns.addAndGet(currentUnderruns - lastUnderruns);
+                            lastUnderruns = currentUnderruns;
+                        }
+                    } catch (RuntimeException ignored) {
+                    }
+                }
                 pcm.clear();
                 int frames = TunefoldBridge.readPcm(engine, pcm, Math.min(CHUNK_FRAMES, available));
                 if (frames <= 0) {
@@ -169,15 +197,21 @@ final class AudioTrackOutput {
                 int writtenBytes = 0;
                 int offset = 0;
                 while (running && offset < samples) {
+                    long writeStarted = System.nanoTime();
                     int written = localTrack.write(
                             pcm16, offset, samples - offset, AudioTrack.WRITE_BLOCKING);
+                    long writeMs = (System.nanoTime() - writeStarted) / 1_000_000L;
+                    if (writeMs > maxWriteMs.get()) maxWriteMs.set(writeMs);
+                    writeCalls.incrementAndGet();
                     if (written < 0) {
                         throw new IllegalStateException("AudioTrack.write failed: " + written);
                     }
                     if (written == 0) {
+                        zeroWrites.incrementAndGet();
                         sleepMillis(2);
                         continue;
                     }
+                    writtenFramesTotal.addAndGet(written);
                     offset += written;
                     writtenBytes += written * 2;
                 }

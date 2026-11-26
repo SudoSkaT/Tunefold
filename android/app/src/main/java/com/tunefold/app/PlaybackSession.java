@@ -356,13 +356,18 @@ final class PlaybackSession {
     /** Resolves a pasted URL and plays it. */
     void playUrl(String url) {
         if (url == null || url.trim().isEmpty()) return;
+        String target = url.trim();
+        // "www." is a valid thing to paste but not a URL the resolver accepts.
+        if (target.regionMatches(true, 0, "www.", 0, 4)) {
+            target = "https://" + target;
+        }
         endRadioForManualPlay();
         beginTrace("url");
         state = PlaybackState.RESOLVING_METADATA;
         error = null;
         notifyChanged();
         PlaybackTrace.markCurrent(PlaybackTrace.SOURCE_RESOLUTION_START, "kind=url");
-        providers.resolve(url, trace, (track, failure) -> {
+        providers.resolve(target, trace, (track, failure) -> {
             if (track == null) {
                 setError(PlaybackError.classify(PlaybackError.Stage.METADATA,
                         failure == null ? "No track found" : failure));
@@ -404,10 +409,20 @@ final class PlaybackSession {
      */
     void setPlaying(boolean playing) {
         if (playing) {
-            // Nothing to resume when the engine was never started for this track.
-            if (state == PlaybackState.PLAYING || state == PlaybackState.PAUSED) {
+            if (state == PlaybackState.PLAYING) return;
+            if (state == PlaybackState.PAUSED) {
                 controller.resume();
+                return;
             }
+            // A stopped session still owns its queue: Play means start it
+            // again, not "resume an engine that was never running".
+            if (state == PlaybackState.STOPPED) {
+                if (queue.current() != null) startCurrent("manual");
+                return;
+            }
+            // A failed track has a bounded retry path; reusing it keeps the
+            // policy (and its budget) in one place.
+            if (state == PlaybackState.ERROR) retry();
             return;
         }
         if (state == PlaybackState.PLAYING) controller.pause();
@@ -664,6 +679,24 @@ final class PlaybackSession {
                 "id=" + track.key() + " liked=" + liked);
         notifyChanged();
         return liked;
+    }
+
+    /**
+     * Sets membership from any surface, then publishes it once.
+     *
+     * <p>Rows call this instead of writing the library directly: a like from
+     * Search or Descargadas changes the same track the player is showing, and
+     * the notification and every bound row must hear about it.
+     */
+    boolean setLiked(MediaTrack track, boolean liked) {
+        if (track == null) return false;
+        boolean changed = library.setLiked(track, liked);
+        if (changed) {
+            PlaybackTrace.markCurrent(PlaybackTrace.LIKE_CHANGED,
+                    "id=" + track.key() + " liked=" + liked);
+            notifyChanged();
+        }
+        return changed;
     }
 
     boolean isLiked(MediaTrack track) { return library.isLiked(track); }
@@ -1331,6 +1364,12 @@ final class PlaybackSession {
     /** Called by the controller when the engine reports a state change. */
     void onControllerState(int engineState, String message) {
         PlaybackState mapped = PlaybackState.fromEngine(engineState);
+        if (state == PlaybackState.STOPPED && mapped != PlaybackState.STOPPED) {
+            // A stop is sticky until a new attempt starts (which moves the state
+            // to resolving). A late engine callback must not resurrect playback
+            // or re-arm the foreground service after the user stopped.
+            return;
+        }
         if (mapped == PlaybackState.ERROR) {
             // While a new track is still resolving, the engine is still running
             // the attempt we replaced. Its failure must not be charged to the

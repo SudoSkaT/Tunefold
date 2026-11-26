@@ -18,12 +18,19 @@
 //!   por lista fría; el re-rank resultante se emite como actualización
 //!   tardía de la MISMA generación (ver `RecommendationSession::accepts_update`).
 
+#[cfg(feature = "rodio")]
+#[cfg(feature = "rodio")]
 use std::collections::HashMap;
+#[cfg(feature = "rodio")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "rodio")]
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "rodio")]
 use crate::domain::track::Track;
+#[cfg(feature = "rodio")]
 use crate::recommendation::acoustic_aggregator::AcousticAggregator;
+#[cfg(feature = "rodio")]
 use crate::recommendation::types::TrackAcousticProfile;
 
 /// Borra la semilla del conjunto "en vuelo" al dropearse (patrón del
@@ -41,22 +48,27 @@ impl Drop for InflightGuard {
 }
 
 /// Semillas cuyo pre-análisis está en vuelo.
+#[cfg(feature = "rodio")]
 pub(crate) type InflightSet = std::collections::HashSet<String>;
 
 /// Segundos de audio analizados por candidato. 45 s bastan para bandas,
 /// BPM, cromática y ~8 buckets estructurales (~5.6 s/bucket).
+#[cfg(feature = "rodio")]
 pub(crate) const PREANALYZE_SECS: u32 = 45;
 
 /// Máximo de candidatos pre-analizados por lista. El resto se beneficia en
 /// la siguiente carga (ya con perfil en BD).
+#[cfg(feature = "rodio")]
 pub(crate) const PREANALYZE_TOP_K: usize = 10;
 
 /// Cobertura mínima de perfiles para NO pre-analizar: por encima de este
 /// umbral el ranking ya decide con datos suficientes.
+#[cfg(feature = "rodio")]
 pub(crate) const PREANALYZE_COVERAGE: f32 = 0.3;
 
 /// ¿La lista necesita pre-análisis? `with` = candidatos con perfil ya
 /// conocido; `total` = longitud de la lista.
+#[cfg(feature = "rodio")]
 pub(crate) fn needs_preanalysis(with: usize, total: usize) -> bool {
     total > 0 && (with as f32) / (total as f32) < PREANALYZE_COVERAGE
 }
@@ -65,6 +77,7 @@ pub(crate) fn needs_preanalysis(with: usize, total: usize) -> bool {
 /// actual (así el pre-análisis refuerza justo a los que el usuario verá
 /// arriba). `resolved` paralela a `related`: id interno por candidato
 /// (`None` si no está en la BD).
+#[cfg(feature = "rodio")]
 pub(crate) fn candidates_missing_profile(
     related: &[Track],
     resolved: &[Option<i64>],
@@ -268,7 +281,7 @@ fn drain_bus(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rodio"))]
 mod tests {
     use super::*;
     use crate::domain::artist::Artist;
@@ -285,6 +298,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "rodio")]
     fn coverage_below_threshold_needs_preanalysis() {
         assert!(needs_preanalysis(0, 10));
         assert!(needs_preanalysis(2, 10), "20% < 30%");
@@ -294,6 +308,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "rodio")]
     fn missing_profile_candidates_keep_provider_order_and_cap() {
         let mut profiles = HashMap::new();
         profiles.insert(2, TrackAcousticProfile::default());

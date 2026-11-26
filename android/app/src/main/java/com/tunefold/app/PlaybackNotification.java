@@ -49,6 +49,18 @@ final class PlaybackNotification {
      */
     static final String EXTRA_TRACK_KEY = "com.tunefold.app.TRACK_KEY";
 
+    /** Action indices in {@link #build}; keep in sync with addAction order. */
+    private static final int INDEX_PREVIOUS = 0;
+    private static final int INDEX_TOGGLE = 1;
+    private static final int INDEX_LIKE = 2;
+    private static final int INDEX_NEXT = 3;
+    private static final int INDEX_DOWNLOAD = 4;
+
+    /** The three actions visible when the notification is collapsed. */
+    static int[] compactActionIndices() {
+        return new int[] { INDEX_PREVIOUS, INDEX_TOGGLE, INDEX_LIKE };
+    }
+
     /** Typed as the concrete service so commands reach the session directly. */
     private final ForegroundPlaybackService service;
     private final MediaSession session;
@@ -75,6 +87,12 @@ final class PlaybackNotification {
             @Override public void onSkipToNext() { command(ACTION_NEXT); }
             @Override public void onSkipToPrevious() { command(ACTION_PREVIOUS); }
             @Override public void onStop() { command(ACTION_STOP); }
+            // Like, Next and Download are custom actions: Android 13+ builds
+            // the compact media controls from PlaybackState custom actions,
+            // not from Notification.Action.
+            @Override public void onCustomAction(String action, Bundle extras) {
+                command(action);
+            }
         });
     }
 
@@ -93,8 +111,7 @@ final class PlaybackNotification {
 
     /** True while audio is or soon will be playing, so the service stays foreground. */
     boolean shouldBeForeground(PlaybackState state) {
-        return state == PlaybackState.PLAYING || state == PlaybackState.PAUSED
-                || state == PlaybackState.BUFFERING;
+        return ForegroundState.wantsForeground(state);
     }
 
     /** Publishes the current track and state to the system. */
@@ -113,11 +130,8 @@ final class PlaybackNotification {
         session.setMetadata(metadata);
 
         long position = snapshot.currentTrack == null ? 0 : Math.max(0L, snapshot.positionMs);
-        session.setPlaybackState(new android.media.session.PlaybackState.Builder()
-                .setActions(platformActions())
-                .setState(toSystemStatus(snapshot.state), position, 1f)
-                .build());
-        session.setActive(true);
+        session.setPlaybackState(playbackState(snapshot, position));
+        session.setActive(ForegroundState.wantsForeground(snapshot.state));
 
         // Content (title, actions, icons) only re-notifies when something the
         // user can see changed. The poll used to rebuild and re-notify twice a
@@ -138,12 +152,46 @@ final class PlaybackNotification {
      * stopped positions are static and were already published with the state
      * change that made them so.
      */
-    void refreshPosition(PlaybackState state, long positionMs) {
-        session.setPlaybackState(new android.media.session.PlaybackState.Builder()
-                .setActions(platformActions())
-                .setState(toSystemStatus(state), Math.max(0L, positionMs), 1f)
-                .build());
-        session.setActive(true);
+    void refreshPosition(PlaybackSession.Snapshot snapshot) {
+        long position = Math.max(0L, snapshot.positionMs);
+        session.setPlaybackState(playbackState(snapshot, position));
+        session.setActive(ForegroundState.wantsForeground(snapshot.state));
+    }
+
+    /**
+     * One PlaybackState for every surface. The custom actions are what Android
+     * 13+ turns into the media buttons: Like is first, so it takes the compact
+     * slot that would otherwise be Next; Next and Download remain expanded.
+     */
+    private android.media.session.PlaybackState playbackState(
+            PlaybackSession.Snapshot snapshot, long position) {
+        boolean retryable = snapshot.error != null && snapshot.error.retryable;
+        android.media.session.PlaybackState.Builder builder =
+                new android.media.session.PlaybackState.Builder()
+                        .setActions(platformActions(snapshot.state, retryable))
+                        .setState(toSystemStatus(snapshot.state), position, 1f);
+        if (snapshot.currentTrack != null) {
+            // Order matters: SystemUI lays the first custom action in the
+            // compact slot that standard Next would take. Putting Next first
+            // and Like second yields Like, Previous, Play/Pause, Next, Download
+            // on Android 13+; the like icon still reflects membership.
+            builder.addCustomAction(customAction(ACTION_NEXT, "Next",
+                    R.drawable.ic_notification_next));
+            builder.addCustomAction(customAction(ACTION_LIKE,
+                    snapshot.liked ? "Unlike" : "Like",
+                    snapshot.liked ? R.drawable.ic_notification_like_filled
+                            : R.drawable.ic_notification_like));
+            builder.addCustomAction(customAction(ACTION_DOWNLOAD,
+                    downloadTitleFor(downloadPhaseOf(snapshot)),
+                    R.drawable.ic_notification_download));
+        }
+        return builder.build();
+    }
+
+    private static android.media.session.PlaybackState.CustomAction customAction(
+            String action, CharSequence name, int icon) {
+        return new android.media.session.PlaybackState.CustomAction.Builder(
+                action, name, icon).build();
     }
 
     /**
@@ -182,13 +230,21 @@ final class PlaybackNotification {
         }
     }
 
-    private static long platformActions() {
-        return android.media.session.PlaybackState.ACTION_PLAY
-                | android.media.session.PlaybackState.ACTION_PAUSE
-                | android.media.session.PlaybackState.ACTION_PLAY_PAUSE
-                | android.media.session.PlaybackState.ACTION_SKIP_TO_NEXT
-                | android.media.session.PlaybackState.ACTION_SKIP_TO_PREVIOUS
+    static long platformActions(PlaybackState state, boolean retryable) {
+        // Next is a custom action (see playbackState): keeping the standard
+        // ACTION_SKIP_TO_NEXT would fill the compact slot that Like needs.
+        long actions = android.media.session.PlaybackState.ACTION_SKIP_TO_PREVIOUS
                 | android.media.session.PlaybackState.ACTION_STOP;
+        boolean canPlay = state == PlaybackState.PLAYING
+                || state == PlaybackState.PAUSED
+                || state == PlaybackState.STOPPED
+                || (state == PlaybackState.ERROR && retryable);
+        if (canPlay) {
+            actions |= android.media.session.PlaybackState.ACTION_PLAY
+                    | android.media.session.PlaybackState.ACTION_PAUSE
+                    | android.media.session.PlaybackState.ACTION_PLAY_PAUSE;
+        }
+        return actions;
     }
 
     private Notification build(PlaybackSession.Snapshot snapshot, String diagnostics) {
@@ -229,22 +285,24 @@ final class PlaybackNotification {
         // nothing playing.
         builder.setDeleteIntent(actionIntent(ACTION_STOP, 9, trackKeyOf(snapshot)));
 
-        // Previous and Play/Pause flanking Next matches the platform convention.
-        // These three stay in the compact view; Like and Download live in the
-        // expanded view, where there is room without hiding the transport.
+        // The collapsed notification keeps Previous, Play/Pause and the L1K3D
+        // toggle: liking the current track is the one thing worth reaching
+        // without expanding. Next and Download stay in the expanded view.
         String trackKey = trackKeyOf(snapshot);
         builder.addAction(action(notificationIcon(Icon.PREVIOUS), "Previous",
                 actionIntent(ACTION_PREVIOUS, 1, trackKey)));
         builder.addAction(action(notificationIcon(paused ? Icon.PLAY : Icon.PAUSE),
                 paused ? "Play" : "Pause", actionIntent(ACTION_TOGGLE, 2, trackKey)));
-        builder.addAction(action(notificationIcon(Icon.NEXT), "Next",
-                actionIntent(ACTION_NEXT, 3, trackKey)));
         builder.addAction(action(notificationIcon(likeIconFor(snapshot.liked)),
                 snapshot.liked ? "Unlike" : "Like",
-                actionIntent(ACTION_LIKE, 4, trackKey)));
+                actionIntent(ACTION_LIKE, 3, trackKey)));
+        builder.addAction(action(notificationIcon(Icon.NEXT), "Next",
+                actionIntent(ACTION_NEXT, 4, trackKey)));
         builder.addAction(action(notificationIcon(downloadIconFor(downloadPhaseOf(snapshot))),
                 downloadTitleFor(downloadPhaseOf(snapshot)),
                 actionIntent(ACTION_DOWNLOAD, 5, trackKey)));
+        // INDEX_* above document this exact order; an action inserted before
+        // these calls must update both the constants and the compact view.
 
         // MediaStyle es lo que convierte esto en una notificación de medios: la
         // que dibuja el sistema en la pantalla de bloqueo, en el panel rápido, en
@@ -256,8 +314,9 @@ final class PlaybackNotification {
         // (see contentIntent), so the button duplicated the tap.
         builder.setStyle(new Notification.MediaStyle()
                 .setMediaSession(session.getSessionToken())
-                // Compact shows the transport; expanded adds Like and Download.
-                .setShowActionsInCompactView(0, 1, 2));
+                // Compact: Previous, Play/Pause, Like. Expanded adds Next and
+                // Download. The like icon is filled when the track is in L1K3D.
+                .setShowActionsInCompactView(compactActionIndices()));
 
         return builder.build();
     }
@@ -501,7 +560,6 @@ final class PlaybackNotification {
 
     /** Enters the foreground, which playback requires on modern Android. */
     void startForeground(PlaybackSession.Snapshot snapshot) {
-        lastContentKey = contentKey(snapshot);
         Notification notification = build(snapshot, null);
         if (Build.VERSION.SDK_INT >= 29) {
             service.startForeground(NOTIFICATION_ID, notification,
@@ -509,10 +567,14 @@ final class PlaybackNotification {
         } else {
             service.startForeground(NOTIFICATION_ID, notification);
         }
+        // Only after the system accepted it: if the call is refused, publish()
+        // must still be able to post the notification normally.
+        lastContentKey = contentKey(snapshot);
     }
 
     void stopForeground() {
         lastContentKey = "";
+        deactivate();
         if (Build.VERSION.SDK_INT >= 24) {
             service.stopForeground(Service.STOP_FOREGROUND_REMOVE);
         } else {
@@ -520,7 +582,15 @@ final class PlaybackNotification {
         }
     }
 
+    /** Leaves the system controls without a live session to drive. */
+    void deactivate() {
+        if (session != null) session.setActive(false);
+    }
+
     void release() {
-        if (session != null) session.release();
+        if (session != null) {
+            session.setActive(false);
+            session.release();
+        }
     }
 }

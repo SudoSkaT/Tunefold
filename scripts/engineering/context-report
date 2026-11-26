@@ -12,7 +12,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 MANIFEST_PATH = REPO_ROOT / "engineering" / "context-map.json"
 CACHE_DIR = REPO_ROOT / "engineering" / ".cache" / "context"
-LEVEL1 = ["AGENTS.md", "engineering/CORE.md"]
+LEVEL1 = ["AGENTS.md", "Documentacion/engineering/CORE.md"]
 
 def load_manifest():
     with MANIFEST_PATH.open("r", encoding="utf-8") as f:
@@ -64,8 +64,8 @@ def build_package(args, manifest):
     sys_infos = [manifest["systems"][s] for s in systems_requested if s in manifest["systems"]]
 
     # level2 base docs
-    level2_docs = ["engineering/MODULE_INDEX.md", "engineering/ARCHITECTURE.md",
-                   "engineering/VERIFICATION.md", "engineering/KNOWN_ISSUES.md"]
+    level2_docs = ["Documentacion/engineering/MODULE_INDEX.md", "Documentacion/engineering/ARCHITECTURE.md",
+                   "Documentacion/engineering/VERIFICATION.md", "Documentacion/engineering/KNOWN_ISSUES.md"]
     # system docs
     system_docs = []
     for info in sys_infos:
@@ -303,7 +303,7 @@ def main():
     parser.add_argument("--level", default="", help="Context level 1-3")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--refresh", action="store_true")
-    parser.add_argument("--record", action="store_true", help="Append metrics to engineering/reports/context-metrics.jsonl")
+    parser.add_argument("--record", action="store_true", help="Append metrics to Documentacion/engineering/reports/context-metrics.jsonl")
     parser.add_argument("--list-systems", action="store_true")
     args = parser.parse_args()
 

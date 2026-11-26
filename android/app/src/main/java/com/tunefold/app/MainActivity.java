@@ -77,7 +77,10 @@ public final class MainActivity extends Activity
     private TrackDownloader downloader;
     private ForegroundPlaybackService.LocalBinder serviceBinder;
     private boolean bound;
+    private boolean started;
     private boolean destroyed;
+    /** Whether the 20 Hz visual tick is currently posted on the main handler. */
+    private boolean visualTickScheduled;
     /** The window the interface was last adapted to; {@code null} before the first. */
     private LayoutRules.Profile window;
 
@@ -101,13 +104,15 @@ public final class MainActivity extends Activity
     private LibrarySurface likedSurface;
     private LibrarySurface downloadsSurface;
     private SettingsSurface settingsSurface;
+    private AlbumDetailSurface albumDetailSurface;
+    private ArtistDetailSurface artistDetailSurface;
     private final SectionSurface[] surfaces = new SectionSurface[Section.values().length];
     private final NavigationItem[] navItems = new NavigationItem[Section.values().length];
 
     private NowPlayingView nowPlaying;
 
     /** Which destination the content area is showing. */
-    private enum Section { HOME, SEARCH, LIKED, DOWNLOADED, SETTINGS }
+    private enum Section { HOME, SEARCH, LIKED, DOWNLOADED, SETTINGS, ALBUM_DETAIL, ARTIST_DETAIL }
     private Section section = Section.HOME;
     /**
      * The destination to land on once the session binds, read from the saved state.
@@ -121,8 +126,13 @@ public final class MainActivity extends Activity
     private Section restoredSection = Section.HOME;
     /** Where Search returns to; {@code null} means "wherever you were". */
     private Section returnFromSearch = Section.HOME;
+    private Section returnFromDetail = Section.HOME;
+    /** Last scroll offset per destination, so switching tabs does not reset it. */
+    private final int[] sectionScroll = new int[Section.values().length];
     /** URL compartida pendiente de previsualizar, si la app se abrió por share. */
     private String pendingSharedUrl;
+    /** Identifies the search whose results are still allowed to paint. */
+    private final SearchGuard searchGuard = new SearchGuard();
     /** Whether the player is covering the navigation. */
     private boolean playerOpen;
 
@@ -182,6 +192,7 @@ public final class MainActivity extends Activity
             // the service gone, that handle must not be touched again.
             bars = null;
             if (nowPlaying != null) nowPlaying.attachSound(null);
+            stopVisualTick();
         }
     };
 
@@ -209,7 +220,25 @@ public final class MainActivity extends Activity
         requestNotificationPermissionIfNeeded();
         Intent service = new Intent(this, ForegroundPlaybackService.class);
         bound = bindService(service, connection, BIND_AUTO_CREATE);
+    }
+
+    @Override protected void onStart() {
+        super.onStart();
+        started = true;
+        // The poll lives only while the Activity can be seen. onDestroy used to be
+        // the only place that removed it, so a backgrounded player kept rendering,
+        // requesting covers and polling the engine at 5 Hz.
+        mainHandler.removeCallbacks(poll);
         mainHandler.post(poll);
+        if (session != null) onSessionChanged();
+        syncVisualTick();
+    }
+
+    @Override protected void onStop() {
+        super.onStop();
+        started = false;
+        mainHandler.removeCallbacks(poll);
+        stopVisualTick();
     }
 
     @Override protected void onSaveInstanceState(Bundle outState) {
@@ -326,11 +355,15 @@ public final class MainActivity extends Activity
         likedSurface = new LibrarySurface(this, this, "L1K3D");
         downloadsSurface = new LibrarySurface(this, this, "Descargadas");
         settingsSurface = new SettingsSurface(this, this);
+        albumDetailSurface = new AlbumDetailSurface(this, this);
+        artistDetailSurface = new ArtistDetailSurface(this, this);
         surfaces[Section.HOME.ordinal()] = homeSurface;
         surfaces[Section.SEARCH.ordinal()] = searchSurface;
         surfaces[Section.LIKED.ordinal()] = likedSurface;
         surfaces[Section.DOWNLOADED.ordinal()] = downloadsSurface;
         surfaces[Section.SETTINGS.ordinal()] = settingsSurface;
+        surfaces[Section.ALBUM_DETAIL.ordinal()] = albumDetailSurface;
+        surfaces[Section.ARTIST_DETAIL.ordinal()] = artistDetailSurface;
         for (SectionSurface surface : surfaces) {
             content.addView(surface, spaced(0f));
         }
@@ -671,13 +704,22 @@ public final class MainActivity extends Activity
         if (section != Section.SEARCH && target == Section.SEARCH && userInitiated) {
             returnFromSearch = section;
         }
+        if (section != target) {
+            sectionScroll[section.ordinal()] = scroller.scrollY();
+        }
         section = target;
         for (Section candidate : Section.values()) {
             boolean active = candidate == target;
-            navItems[candidate.ordinal()].setActiveDestination(active);
-            surfaces[candidate.ordinal()].setVisibility(active ? View.VISIBLE : View.GONE);
+            if (navItems[candidate.ordinal()] != null)
+                navItems[candidate.ordinal()].setActiveDestination(active);
+            if (surfaces[candidate.ordinal()] != null)
+                surfaces[candidate.ordinal()].setVisibility(active ? View.VISIBLE : View.GONE);
         }
-        scroller.scrollToTop();
+        // Restore after the target surface has filled in; a scroll offset saved
+        // against the old content height is clamped by ScrollHost on measure.
+        int restore = sectionScroll[target.ordinal()];
+        scroller.scrollTo(restore);
+        scroller.post(() -> scroller.scrollTo(restore));
         if (session == null) return;
         refreshSection();
         surfaces[target.ordinal()].onShow();
@@ -711,14 +753,18 @@ public final class MainActivity extends Activity
     @Override public void onSubmit(String query, SearchSurface.Intent intent) {
         if (session == null) return;
         if (intent == SearchSurface.Intent.URL) {
+            // A pasted URL supersedes any search still in flight: its results
+            // must not paint over the player the URL opened.
+            searchGuard.invalidate();
             session.playUrl(query);
             return;
         }
+        long generation = searchGuard.begin();
         searchSurface.showSearching();
         if (intent == SearchSurface.Intent.SEARCH_ALBUMS) {
             if (providers == null) { searchSurface.showError("Provider not initialized"); return; }
             providers.searchAlbums(query, (tracks, error) -> {
-                if (destroyed || section != Section.SEARCH) return;
+                if (!isCurrentSearch(generation)) return;
                 if (error != null) {
                     searchSurface.showError(error);
                     return;
@@ -730,7 +776,7 @@ public final class MainActivity extends Activity
         if (intent == SearchSurface.Intent.SEARCH_ARTISTS) {
             if (providers == null) { searchSurface.showError("Provider not initialized"); return; }
             providers.searchArtists(query, (tracks, error) -> {
-                if (destroyed || section != Section.SEARCH) return;
+                if (!isCurrentSearch(generation)) return;
                 if (error != null) {
                     searchSurface.showError(error);
                     return;
@@ -740,7 +786,7 @@ public final class MainActivity extends Activity
             return;
         }
         session.search(query, (tracks, error) -> {
-            if (destroyed || section != Section.SEARCH) return;
+            if (!isCurrentSearch(generation)) return;
             if (error != null) {
                 searchSurface.showError(error);
                 return;
@@ -749,15 +795,31 @@ public final class MainActivity extends Activity
         });
     }
 
+    /** A late answer is stale when a newer query, URL or empty query replaced it. */
+    private boolean isCurrentSearch(long generation) {
+        return !destroyed && section == Section.SEARCH && searchGuard.isCurrent(generation);
+    }
+
     @Override public void onSearchEmpty(SearchSurface.Intent mode) {
         if (session == null) return;
+        searchGuard.invalidate();
         java.util.List<MediaTrack> downloaded = session.downloadedTracks();
         java.util.List<MediaTrack> grouped = new java.util.ArrayList<>();
         if (mode == SearchSurface.Intent.SEARCH_ALBUMS) {
             java.util.Map<String, MediaTrack> albums = new java.util.LinkedHashMap<>();
+            java.util.Map<String, String> albumThumbs = new java.util.LinkedHashMap<>();
             for (MediaTrack track : downloaded) {
                 String key = track.album == null || track.album.trim().isEmpty() ? track.title : track.album.trim();
+                if (!albumThumbs.containsKey(key) || (albumThumbs.get(key).isEmpty()
+                        && !track.thumbnail.isEmpty())) {
+                    albumThumbs.put(key, track.thumbnail == null ? "" : track.thumbnail);
+                }
                 if (!albums.containsKey(key)) {
+                    albums.put(key, new MediaTrack("DownloadedAlbum", key, key,
+                            track.artist, "", track.album, "artist", -1,
+                            albumThumbs.get(key), "", "{}"));
+                } else if (albums.get(key).thumbnail.isEmpty() && !track.thumbnail.isEmpty()) {
+                    // Replace the row when a later track carries the cover.
                     albums.put(key, new MediaTrack("DownloadedAlbum", key, key,
                             track.artist, "", track.album, "artist", -1,
                             track.thumbnail, "", "{}"));
@@ -766,9 +828,17 @@ public final class MainActivity extends Activity
             grouped.addAll(albums.values());
         } else if (mode == SearchSurface.Intent.SEARCH_ARTISTS) {
             java.util.Map<String, MediaTrack> artists = new java.util.LinkedHashMap<>();
+            java.util.Map<String, String> artistThumbs = new java.util.LinkedHashMap<>();
             for (MediaTrack track : downloaded) {
                 String key = track.artist == null || track.artist.trim().isEmpty() ? "Unknown" : track.artist.trim();
+                if (!artistThumbs.containsKey(key) || (artistThumbs.get(key).isEmpty()
+                        && !track.thumbnail.isEmpty())) {
+                    artistThumbs.put(key, track.thumbnail == null ? "" : track.thumbnail);
+                }
                 if (!artists.containsKey(key)) {
+                    artists.put(key, new MediaTrack("DownloadedArtist", key, key,
+                            key, "", "", "artist", -1, artistThumbs.get(key), "", "{}"));
+                } else if (artists.get(key).thumbnail.isEmpty() && !track.thumbnail.isEmpty()) {
                     artists.put(key, new MediaTrack("DownloadedArtist", key, key,
                             key, "", "", "artist", -1, track.thumbnail, "", "{}"));
                 }
@@ -777,7 +847,7 @@ public final class MainActivity extends Activity
         } else {
             grouped.addAll(downloaded);
         }
-        searchSurface.showResults(grouped);
+        searchSurface.showResults(grouped, "Descargas locales");
     }
 
     @Override public void onSearchIdle() { }
@@ -838,6 +908,7 @@ public final class MainActivity extends Activity
         scroller.setVisibility(View.VISIBLE);
         bottomBar.setVisibility(View.VISIBLE);
         nowPlaying.attachSound(null);
+        stopVisualTick();
     }
 
     /** One back gesture means one thing: leave the player, then leave Search. */
@@ -925,28 +996,15 @@ public final class MainActivity extends Activity
         MediaTrack track = row.track();
         if (track == null) return;
         if ("Album".equals(track.provider) && track.providerId != null && !track.providerId.isEmpty()) {
-            android.util.Log.i("Tunefold", "album tap id=" + track.providerId);
-            providers.albumTracks(track.providerId, (tracks, error) -> {
-                android.util.Log.i("Tunefold", "album tracks=" + (tracks == null ? -1 : tracks.size()) + " err=" + error);
-                if (tracks == null || tracks.isEmpty()) return;
-                session.playList(tracks, tracks.get(0));
-            });
-            return;
-        }
-        if ("Artist".equals(track.provider) && track.title != null && !track.title.isEmpty()) {
-            providers.search(track.title, (tracks, error) -> {
-                if (tracks == null || tracks.isEmpty()) return;
-                session.playList(tracks, tracks.get(0));
-            });
+            openAlbumDetail(track);
             return;
         }
         if ("DownloadedAlbum".equals(track.provider)) {
-            java.util.List<MediaTrack> matches = new java.util.ArrayList<>();
-            for (MediaTrack t : session.downloadedTracks()) {
-                String key = t.album == null || t.album.trim().isEmpty() ? t.title : t.album.trim();
-                if (key.equals(track.providerId)) matches.add(t);
-            }
-            if (!matches.isEmpty()) session.playList(matches, matches.get(0));
+            openDownloadedAlbumDetail(track);
+            return;
+        }
+        if ("Artist".equals(track.provider) && track.providerId != null && !track.providerId.isEmpty()) {
+            openArtistDetail(track);
             return;
         }
         if ("DownloadedArtist".equals(track.provider)) {
@@ -955,16 +1013,125 @@ public final class MainActivity extends Activity
                 String key = t.artist == null || t.artist.trim().isEmpty() ? "Unknown" : t.artist.trim();
                 if (key.equals(track.providerId)) matches.add(t);
             }
-            if (!matches.isEmpty()) session.playList(matches, matches.get(0));
+            if (!matches.isEmpty() && searchSurface != null) {
+                searchSurface.showResults(matches, track.providerId);
+            }
             return;
         }
         // The whole list the row is in becomes the queue, starting at the tapped track.
         session.playList(row.listTracks(), track);
     }
 
+    void openAlbumDetail(MediaTrack album) {
+        if (album == null) return;
+        if (section != Section.ALBUM_DETAIL) returnFromDetail = section;
+        showSection(Section.ALBUM_DETAIL, false);
+        albumDetailSurface.open(album);
+        if (providers == null) {
+            albumDetailSurface.setTracks(null, "Provider not initialized");
+            return;
+        }
+        providers.albumTracks(album.providerId, (tracks, error) -> {
+            if (destroyed) return;
+            albumDetailSurface.setTracks(tracks, error);
+        });
+    }
+
+    private void openDownloadedAlbumDetail(MediaTrack album) {
+        if (album == null || session == null) return;
+        java.util.List<MediaTrack> matches = new java.util.ArrayList<>();
+        for (MediaTrack t : session.downloadedTracks()) {
+            String key = t.album == null || t.album.trim().isEmpty() ? t.title : t.album.trim();
+            if (key.equals(album.providerId)) matches.add(t);
+        }
+        showSection(Section.ALBUM_DETAIL, false);
+        albumDetailSurface.open(album);
+        albumDetailSurface.setTracks(matches, matches.isEmpty() ? "No tracks" : null);
+    }
+
+    void closeAlbumDetail() {
+        showSection(returnFromDetail, false);
+    }
+
+    void openArtistDetail(MediaTrack artist) {
+        if (artist == null) return;
+        if (section != Section.ARTIST_DETAIL) returnFromDetail = section;
+        showSection(Section.ARTIST_DETAIL, false);
+        artistDetailSurface.open(artist);
+        if (providers == null) {
+            artistDetailSurface.setTracksAndAlbums(null, null, "Provider not initialized");
+            return;
+        }
+        fetchArtistContent(artist, artistDetailSurface);
+    }
+
+    void closeArtistDetail() {
+        showSection(returnFromDetail, false);
+    }
+
+    void fetchArtistContent(MediaTrack artist, ArtistDetailSurface surface) {
+        providers.artistContent(artist.providerId, (root, error) -> {
+            if (destroyed) return;
+            if (error != null || root == null) {
+                surface.setTracksAndAlbums(null, null, error);
+                return;
+            }
+            try {
+                org.json.JSONArray trackArray = root.optJSONArray("tracks");
+                java.util.List<MediaTrack> tracks = new java.util.ArrayList<>();
+                if (trackArray != null) for (int i = 0; i < trackArray.length(); i++) {
+                    org.json.JSONObject item = trackArray.optJSONObject(i);
+                    if (item != null) tracks.add(MediaTrack.fromJson(item));
+                }
+                org.json.JSONArray albumArray = root.optJSONArray("albums");
+                java.util.List<MediaTrack> albums = new java.util.ArrayList<>();
+                if (albumArray != null) for (int i = 0; i < albumArray.length(); i++) {
+                    org.json.JSONObject a = albumArray.optJSONObject(i);
+                    if (a == null) continue;
+                    String thumb = a.optString("cover", "");
+                    String id = a.optString("external_id", a.optString("id", ""));
+                    albums.add(new MediaTrack("Album", id, a.optString("title", "Untitled"),
+                            "", "", a.optString("title", ""), "artist", -1, thumb, "", a.toString()));
+                }
+                org.json.JSONObject artistObj = root.optJSONObject("artist");
+                if (artistObj != null && artist != null) {
+                    String img = artistObj.optString("image", "");
+                    if (!img.isEmpty() && (artist.thumbnail == null || artist.thumbnail.isEmpty())) {
+                        // no-op: keep original thumbnail
+                    }
+                }
+                surface.setTracksAndAlbums(tracks, albums, null);
+            } catch (Exception e) {
+                surface.setTracksAndAlbums(null, null, e.toString());
+            }
+        });
+    }
+
+    void loadAlbumArtwork(MediaTrack track, ArtworkView view) {
+        if (providers == null || track == null || track.thumbnail.isEmpty() || view == null) return;
+        String identity = track.key() == null ? track.thumbnail : track.key().toString();
+        view.expectCover(identity);
+        providers.loadArtwork(track, DesignTokens.dp(160), (bitmap, error) -> {
+            if (destroyed || bitmap == null) return;
+            view.setCover(identity, bitmap);
+        });
+    }
+
+    void playAlbumTracks(java.util.List<MediaTrack> tracks) {
+        if (session == null || tracks == null || tracks.isEmpty()) return;
+        session.playList(tracks, tracks.get(0));
+    }
+
     private void toggleLike(MediaTrack track) {
-        if (library == null || track == null) return;
-        library.toggleLiked(track);
+        if (track == null) return;
+        // Through the session, not the library: a like from a row changes the
+        // same track the player is showing, and every surface (notification
+        // included) must be notified once.
+        if (session != null) {
+            session.setLiked(track, !session.isLiked(track));
+        } else if (library != null) {
+            library.toggleLiked(track);
+        }
         if (section == Section.LIKED) renderLiked();
         else refreshLists();
     }
@@ -1164,15 +1331,28 @@ public final class MainActivity extends Activity
      * seen from two sides.
      */
     private void loadRowArtwork(MediaTrack track, String identity, int sidePx) {
-        if (providers == null || track == null) return;
+        if (providers == null || track == null || identity == null || identity.isEmpty()) return;
         if (track.thumbnail.isEmpty()) {
-            // A remembered track saved before the app kept its cover: nobody local can
-            // draw it, so ask the provider once for what it is. The answer is
-            // remembered where it belongs, so this is a first run and not a per-launch
-            // cost, and the row that asked is the row that gets painted.
+            // Only real tracks can be re-described by the provider; album and
+            // artist rows carry their own cover URL (or none) and their id is
+            // not a video id, so asking the provider would be meaningless.
+            if (!"YouTube".equals(track.provider) && !"URL".equals(track.provider)) return;
             if (session == null) return;
             session.learnMetadata(track.key(), (learned, failure) -> {
                 if (destroyed || learned == null || learned.thumbnail.isEmpty()) return;
+                // Drop the answer when no row is still waiting for it: a fast scroll
+                // or rebind has already moved on, and painting it now would only
+                // resurrect a stale cover.
+                lists.clear();
+                collectLists(content, lists);
+                boolean wanted = false;
+                for (int i = 0; i < lists.size(); i++) {
+                    if (lists.get(i).wantsArtwork(identity)) { wanted = true; break; }
+                }
+                if (!wanted) {
+                    android.util.Log.d("TunefoldPerf", "event=artwork_callback_discarded");
+                    return;
+                }
                 loadRowArtwork(learned, identity, sidePx);
             });
             return;
@@ -1184,6 +1364,14 @@ public final class MainActivity extends Activity
             // has already been rebound to something else.
             lists.clear();
             collectLists(content, lists);
+            boolean wanted = false;
+            for (int i = 0; i < lists.size(); i++) {
+                if (lists.get(i).wantsArtwork(identity)) { wanted = true; break; }
+            }
+            if (!wanted) {
+                android.util.Log.d("TunefoldPerf", "event=artwork_callback_discarded");
+                return;
+            }
             for (int i = 0; i < lists.size(); i++) {
                 lists.get(i).onArtwork(identity, bitmap);
             }
@@ -1220,8 +1408,11 @@ public final class MainActivity extends Activity
         mini.expectArtwork(identity);
         providers.loadArtwork(track, nowPlaying.artworkSidePx(), (bitmap, error) -> {
             if (destroyed || bitmap == null) return;
+            // A track change in the meantime supersedes this decode: never
+            // let it repaint a cover the player has already moved past.
+            if (!identity.equals(playerCoverIdentity)) return;
             nowPlaying.setArtwork(identity, bitmap);
-            mini.setArtwork(bitmap);
+            mini.setArtwork(identity, bitmap);
         });
     }
 
@@ -1285,7 +1476,7 @@ public final class MainActivity extends Activity
 
     /** Observer entry point: the session can change for reasons the UI did not cause. */
     private void onSessionChanged() {
-        if (destroyed || session == null) return;
+        if (!started || destroyed || session == null) return;
         render();
         if (section == Section.DOWNLOADED
                 && session.downloadsRevision() != downloadsRenderedRevision) {
@@ -1308,7 +1499,7 @@ public final class MainActivity extends Activity
      * they schedule.
      */
     private void render() {
-        if (destroyed || session == null) return;
+        if (!started || destroyed || session == null) return;
         PlaybackSession.Snapshot snapshot = session.snapshot();
         mini.apply(snapshot);
         syncBottomBarRule();
@@ -1329,6 +1520,7 @@ public final class MainActivity extends Activity
         // nothing of its own and the player opens with the picture already there.
         if (snapshot.currentTrack != null) loadPlayerArtwork(snapshot.currentTrack);
         if (debugPanel.isVisible()) renderDiagnostics();
+        syncVisualTick();
     }
 
     /**
@@ -1425,18 +1617,17 @@ public final class MainActivity extends Activity
     }
 
     /**
-     * Position tick.
+     * Position tick at 5 Hz.
      *
-     * <p>The only periodic work left on the UI thread, and it reads through the cheap
-     * path: no snapshot, no queue copy, no allocation, and the control skips the
-     * {@code setText}/{@code setProgress} calls unless the second or the bar actually
-     * moved. When the player is closed there is nothing position-driven on screen,
-     * so the tick runs at the service cadence and only checks the downloader
-     * attach — waking five times a second to do nothing would be pure battery.
+     * <p>It reads through the cheap path — no snapshot, no queue copy, no
+     * allocation — and only while the screen is started. The bars have their own
+     * 20 Hz tick so a position change and a new audio window never force each
+     * other's cadence. When the player is closed there is nothing position-driven
+     * on screen, so the tick falls back to the service cadence.
      */
     private final Runnable poll = new Runnable() {
         @Override public void run() {
-            if (destroyed) return;
+            if (!UiCadence.uiPollEnabled(started, destroyed)) return;
             if (serviceBinder != null && downloader == null) {
                 // The store may have finished initializing after we bound.
                 TrackDownloader ready = serviceBinder.downloader();
@@ -1454,15 +1645,55 @@ public final class MainActivity extends Activity
                 // The only thing the tick animates: the working indicator, and only
                 // while something is actually being waited for.
                 nowPlaying.tick();
-                // The bars move at the pace of the sound, not at the pace of the
-                // clock: 20 Hz against the same consistent read the position uses.
-                nowPlaying.refreshSound();
                 mainHandler.postDelayed(this, DesignTokens.POSITION_INTERVAL_MS);
-            } else {
+            } else if (downloader == null) {
+                // Still waiting for the store to finish: keep the attach check alive.
                 mainHandler.postDelayed(this, DesignTokens.SESSION_REFRESH_INTERVAL_MS);
+            } else {
+                // Attached and nothing position-driven on screen: a liveness check
+                // is enough, not five wake-ups a second.
+                mainHandler.postDelayed(this, 2000L);
             }
         }
     };
+
+    /**
+     * Visual tick at 20 Hz, alive only while a visible player can hear new audio.
+     *
+     * <p>A paused or buffering player keeps its frozen frame; reading the engine
+     * there would only confirm that the generation has not moved. Both this tick
+     * and the position tick stop in {@link #onStop()}.
+     */
+    private final Runnable visualTick = new Runnable() {
+        @Override public void run() {
+            if (!UiCadence.visualTickEnabled(started, playerOpen,
+                    nowPlaying != null && nowPlaying.soundPlayable())) {
+                visualTickScheduled = false;
+                return;
+            }
+            nowPlaying.refreshSound();
+            if (visualTickScheduled) {
+                mainHandler.postDelayed(this, DesignTokens.VISUAL_INTERVAL_MS);
+            }
+        }
+    };
+
+    private void syncVisualTick() {
+        boolean wanted = nowPlaying != null && UiCadence.visualTickEnabled(
+                started, playerOpen, nowPlaying.soundPlayable());
+        if (!wanted) {
+            stopVisualTick();
+            return;
+        }
+        if (visualTickScheduled) return;
+        visualTickScheduled = true;
+        mainHandler.post(visualTick);
+    }
+
+    private void stopVisualTick() {
+        visualTickScheduled = false;
+        mainHandler.removeCallbacks(visualTick);
+    }
 
     // ------------------------------------------------------------ lifecycle
 
@@ -1506,22 +1737,36 @@ public final class MainActivity extends Activity
             }
             String title = root.optString("title", "Playlist");
             if (title.isEmpty()) title = "Playlist";
-            int count = root.optJSONArray("tracks") == null ? 0 : root.optJSONArray("tracks").length();
+            JSONArray tracks = root.optJSONArray("tracks");
+            int count = tracks == null ? 0 : tracks.length();
+            // One identity, one row. A remote playlist can repeat a video and
+            // can list an item whose metadata the provider no longer returns;
+            // neither should become a duplicate row or a crash on Play.
+            java.util.LinkedHashMap<String, MediaTrack> unique = new java.util.LinkedHashMap<>();
+            int unavailable = 0;
+            if (tracks != null) for (int i = 0; i < tracks.length(); i++) {
+                JSONObject o = tracks.optJSONObject(i);
+                if (o == null) { unavailable++; continue; }
+                MediaTrack track = MediaTrack.fromJson(o);
+                if (track.key() == null) { unavailable++; continue; }
+                unique.putIfAbsent(track.key().toString(), track);
+            }
+            int duplicates = Math.max(0, count - unavailable - unique.size());
             String owner = root.optString("owner", "");
             AlertDialog.Builder b = new AlertDialog.Builder(this);
             b.setTitle(title);
             StringBuilder msg = new StringBuilder();
             if (!owner.isEmpty()) msg.append(owner).append("\n");
-            msg.append(count).append(" pistas");
+            msg.append(unique.size()).append(" pistas");
+            if (duplicates > 0) msg.append(" · ").append(duplicates).append(" duplicadas");
+            if (unavailable > 0) msg.append(" · ").append(unavailable).append(" no disponibles");
             b.setMessage(msg.toString());
-            final JSONArray tracks = root.optJSONArray("tracks");
+            final java.util.List<MediaTrack> playable =
+                    new java.util.ArrayList<>(unique.values());
             b.setPositiveButton("Reproducir todo", (d, w) -> {
-                java.util.List<MediaTrack> list = new java.util.ArrayList<>();
-                if (tracks != null) for (int i = 0; i < tracks.length(); i++) {
-                    JSONObject o = tracks.optJSONObject(i);
-                    if (o != null) list.add(MediaTrack.fromJson(o));
+                if (!playable.isEmpty() && session != null) {
+                    session.playList(playable, playable.get(0));
                 }
-                if (!list.isEmpty() && session != null) session.playList(list, list.get(0));
             });
             b.setNegativeButton("Cerrar", null);
             b.show();
@@ -1765,7 +2010,9 @@ public final class MainActivity extends Activity
 
     @Override protected void onDestroy() {
         destroyed = true;
+        started = false;
         mainHandler.removeCallbacks(poll);
+        stopVisualTick();
         if (session != null) session.removeObserver(sessionObserver);
         // The card listens to the palette to decide how to compose, and a palette
         // listener that outlives its Activity keeps the whole window alive.

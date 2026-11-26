@@ -998,7 +998,8 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_readLiveWaveform(
     buffer: JFloatArray,
     bars: jint,
 ) -> jlong {
-    let bars = bars.max(0) as usize;
+    const MAX_VALUES: usize = 4 * 96;
+    let bars = (bars.max(0) as usize).min(MAX_VALUES / 4);
     if handle == 0 || bars == 0 {
         return 0;
     }
@@ -1006,18 +1007,20 @@ pub extern "system" fn Java_com_tunefold_app_TunefoldBridge_readLiveWaveform(
         Ok(length) => length as usize,
         Err(_) => return 0,
     };
-    let mut values = vec![0.0f32; length];
+    // Stack buffer: this JNI entry runs at 20 Hz and the previous heap
+    // allocation (one Vec per call) showed up in the Android GC profile.
+    // 384 floats = BAR_VALUES(4) * MAX_BARS(96), the largest array Java
+    // ever passes; anything larger is truncated to the cap.
+    let mut values = [0.0f32; MAX_VALUES];
+    let to_fill = length.min(MAX_VALUES);
     let generation = match unsafe { &*(handle as *const AndroidEngine) }
         .analysis
         .as_ref()
     {
-        Some(runtime) => runtime.read_live_waveform(&mut values, bars),
+        Some(runtime) => runtime.read_live_waveform(&mut values[..to_fill], bars),
         None => 0,
     };
-    if length == 0 {
-        return generation as jlong;
-    }
-    let _ = env.set_float_array_region(&buffer, 0, &values);
+    let _ = env.set_float_array_region(&buffer, 0, &values[..to_fill]);
     generation as jlong
 }
 

@@ -443,6 +443,21 @@ final class TrackDownloader implements AutoCloseable {
         });
     }
 
+    /**
+     * True while any download is queued, resolving or transferring.
+     *
+     * <p>The jobs map is the authoritative set of in-flight work; the registry
+     * covers a job that has already committed its first state but has not been
+     * added to the map yet. Either one means the playback service must not be
+     * released.
+     */
+    boolean hasActiveWork() {
+        synchronized (jobs) {
+            if (!jobs.isEmpty()) return true;
+        }
+        return registry.hasActiveWork();
+    }
+
     /** A short summary of the recovery budget, for the diagnostics panel. */
     String recoverySummary() { return recovery.describe(); }
 
